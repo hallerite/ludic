@@ -5,6 +5,7 @@ from typing import Dict, Optional, Tuple
 class Env(ABC):
 
     def __init__(self) -> None:
+        self.system_prompt: str = ""
         self.obs_as_history: bool = False
 
     @abstractmethod
@@ -14,3 +15,4 @@ class Env(ABC):
     @abstractmethod
     def step(self, action: Dict) -> Tuple:
         pass
+    

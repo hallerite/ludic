@@ -34,6 +34,11 @@ class TicTacToe(Env):
         - allow for self-play
     """
 
+    SUGGESTED_SYSPROMPT = (
+        'You are the Tic-Tac-Toe player using "{mark}". '
+        'Given the board, reply with your move in this format: <move>5</move>'
+    )
+
     # Winning triples, expressed once and reused
     WIN_LINES: Tuple[Tuple[int, int, int], ...] = (
         (0, 1, 2), (3, 4, 5), (6, 7, 8),           # rows
@@ -46,8 +51,10 @@ class TicTacToe(Env):
         self.action_space = Action
 
         self.board: List[Optional[str]] = [None] * 9
+
         self.agent_mark: str = 'X'                 # set in reset()
         self.opponent_mark: str = 'O'
+
         self.done: bool = False
 
     # ──────────────────────────────────────────────────────────────
@@ -63,6 +70,8 @@ class TicTacToe(Env):
         # Coin-flip for sides
         self.agent_mark, self.opponent_mark = random.choice([('X', 'O'),
                                                              ('O', 'X')])
+        
+        self.system_prompt = self.SUGGESTED_SYSPROMPT.format(mark=self.agent_mark)
 
         # If agent is O, let opponent (as X) open with a random legal move
         if self.agent_mark == 'O':
@@ -118,7 +127,7 @@ class TicTacToe(Env):
         to_char = lambda m: m if m is not None else '.'
         rows = ["".join(to_char(self.board[i + j]) for j in range(3))
                 for i in (0, 3, 6)]
-        return "\n".join(rows)
+        return "\n".join(rows) + "\nWhat will be your next move?"
 
     def _place(self, pos: int, mark: str) -> None:
         if not (0 <= pos < 9):

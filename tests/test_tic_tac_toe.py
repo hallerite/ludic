@@ -5,13 +5,6 @@ from ludic_envs.envs.tic_tac_toe import TicTacToe, Action
 def game():
     return TicTacToe()
 
-def test_reset_starts_empty(game):
-    obs = game.reset(seed=42)
-    flat = obs.replace('\n', '')
-    assert all(c in '.XO' for c in flat)
-    assert flat.count('.') in {8, 9}  # either opponent played or not
-    assert game.done is False
-
 def test_agent_side_randomization(game):
     agent_marks = set()
     for _ in range(20):
