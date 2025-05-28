@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.11.5",
+    "torch>=2.7.0",
+    "vllm>=0.8.5.post1",
 ]
 
 [project.optional-dependencies]
