@@ -16,6 +16,12 @@ import pytest
 #     RUN_REAL_VLLM_TESTS=1 pytest -q tests/test_sample_gpu.py
 # ---------------------------------------------------------------------------
 
+import os, multiprocessing as mp
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+mp.set_start_method("spawn", force=True)
+
+
+
 CUDA_AVAILABLE = False
 try:
     import torch
@@ -49,22 +55,28 @@ def test_sampling_with_qwen():
     #   * The test purposely uses `enforce_eager=True` so we don't need CUDA
     #     graph capture and the model fits on modest GPUs (4‑6 GB VRAM).
     # --------------------------------------------------------------------
-    model_id = "Qwen/Qwen2-0.5B"
+    model_id = "Qwen/Qwen2-0.5B-Instruct"
 
     model = LLM(
         model=model_id,
-        dtype="float16",  # Keeps memory under control
-        #enforce_eager=True,
-        gpu_memory_utilization=0.80,  # Leave headroom for test harness
+        dtype="float16",
+        enforce_eager=True,
+        gpu_memory_utilization=0.400,
     )
 
     # Compose a minimal chat prompt in RolloutGenerator format
     prompts = [
-        [{"system": "You are a concise assistant."}, {"user": "2+2?"}],
-        [{"system": "You are a bot."}, {"user": "Capital of France?"}],
+        [
+            {"role": "system", "content": "You are a concise assistant."},
+            {"role": "user", "content": "2+2?"}
+        ],
+        [
+            {"role": "system", "content": "You are a bot."},
+            {"role": "user", "content": "Capital of France?"}
+        ],
     ]
 
-    sampling_params = SamplingParams(max_tokens=4, temperature=0)
+    sampling_params = SamplingParams(max_tokens=100, temperature=0)
 
     replies_txt, replies_raw = sample(model, prompts, sampling_params)
 

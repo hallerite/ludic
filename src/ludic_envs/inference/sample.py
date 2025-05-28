@@ -43,26 +43,6 @@ def _ensure_sampling_params(sampling_params: Any) -> "SamplingParams":
         f"got {type(sampling_params).__name__}."
     )
 
-
-def _prompt_is_chat(prompt: Sequence[Dict[str, str]]) -> bool:
-    """Heuristically decide whether a prompt is in chat format."""
-    # The RolloutGenerator produces [{"system": ...}, {"user": ...}, ...]
-    # which we treat as chat.  Treat as chat if every element has exactly one
-    # key and that key is in the standard chat roles.
-    CHAT_ROLES = {"system", "user", "assistant"}
-    return all(len(m) == 1 and next(iter(m.keys())) in CHAT_ROLES for m in prompt)
-
-
-def _flatten_to_text(prompt: Sequence[Dict[str, str]]) -> str:
-    """Serialize a chat prompt to a *single* string (for non‑chat models)."""
-    parts = []
-    for message in prompt:
-        role, content = next(iter(message.items()))
-        parts.append(f"<{role}>: {content}")
-    # Double‑newline between turns keeps things readable but token‑agnostic.
-    return "\n\n".join(parts)
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -77,10 +57,14 @@ def sample(
     Parameters
     ----------
     model:
-        A **running** `vllm.LLM` instance (GPU‑backed) from which to sample.
+        A **running** `vllm.LLM` instance (GPU-backed) from which to sample.
     prompts:
-        One prompt *per environment*: each is a list of single‑key dicts, e.g.
-        `[{"system": "…"}, {"user": "…"}]`.
+        A list of chat-style prompts: each is a list of messages, where each
+        message is a dict with `{"role": ..., "content": ...}`. Example:
+            [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "What's 2+2?"}
+            ]
     sampling_params:
         Either a `vllm.SamplingParams` instance **or** a plain dict of kwargs
         forwarded to the constructor.
@@ -96,33 +80,23 @@ def sample(
 
     sp = _ensure_sampling_params(sampling_params)
 
-    # Decide whether we can keep the chat structure or need to flatten.
-    chat_mode = _prompt_is_chat(prompts[0])
+    # Validate prompt structure
+    for i, prompt in enumerate(prompts):
+        for msg in prompt:
+            if not (isinstance(msg, dict) and set(msg) == {"role", "content"}):
+                raise TypeError(
+                    f"Prompt {i} contains invalid message format: {msg}. "
+                    "Expected: {'role': ..., 'content': ...}"
+                )
 
-    if chat_mode:
-        # vLLM natively understands chat format → we can pass through directly
-        _inputs: List[List[Dict[str, str]]] = prompts  # type: ignore[assignment]
-    else:
-        # Fallback for plain‑text models: concatenate into a single string
-        _inputs = [_flatten_to_text(p) for p in prompts]  # type: ignore[assignment]
+    generations = model.chat(prompts, sampling_params=sp, use_tqdm=False)
 
-    # ------------------------------------------------------------------
-    # Call the model *once* for the entire batch.  vLLM will dispatch to the
-    # GPUs and stream results efficiently.
-    # ------------------------------------------------------------------
-    generations = model.generate(_inputs, sp, use_tqdm=False)
-
-    # vLLM guarantees `len(generations) == len(prompts)`.
     replies_txt: List[str] = []
     replies_raw: List[Any] = []
 
     for gen in generations:
-        # The `Generation` object may contain multiple candidates; trainers can
-        # decide whether they want top‑1 or something else.  Here we default to
-        # the first candidate for simplicity.
         if not gen.outputs:
-            raise RuntimeError("vLLM returned zero candidates for a prompt.")
-
+            raise RuntimeError("vLLM returned zero outputs for a prompt.")
         replies_txt.append(gen.outputs[0].text)
         replies_raw.append(gen)
 
