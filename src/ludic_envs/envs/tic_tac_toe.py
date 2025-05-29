@@ -2,6 +2,7 @@ from __future__ import annotations
 import random
 from typing import Dict, List, Tuple, Optional
 from ludic_envs.envs.env import Env
+from ludic_envs.parsers import extract_tag_value
 from pydantic import BaseModel, Field
 
 class Action(BaseModel):
@@ -57,6 +58,11 @@ class TicTacToe(Env):
 
         self.done: bool = False
 
+    def parse_action(self, action_str: str) -> Action:
+        pos = extract_tag_value(action_str, "move")
+        return Action(pos=pos)
+        
+
     # ──────────────────────────────────────────────────────────────
     # RL interface
     # ──────────────────────────────────────────────────────────────
@@ -79,11 +85,17 @@ class TicTacToe(Env):
 
         return self._obs()
 
-    def step(self, action: Dict) -> Tuple[str, int, bool, Dict]:
+    def step(self, action: str) -> Tuple[str, int, bool, Dict]:
         if self.done:
             raise RuntimeError("Game has ended. Call reset().")
         
-        act = Action(**action)
+        try:
+            act = self.parse_action(action)
+        except Exception as e:
+            # Don't end game, just return current obs + info
+            obs = "\nYour last move was illegal. Try again." + self._obs()
+            return obs, 0, False, {"illegal_move": True, "error": str(e)}
+
         pos_idx: int = act.pos - 1
 
         self._place(pos_idx, self.agent_mark)
