@@ -48,7 +48,7 @@ def _ensure_sampling_params(sampling_params: Any) -> "SamplingParams":
 # ---------------------------------------------------------------------------
 
 def sample(
-    model: "LLM",
+    model: "LLM", #FIXME: this only works when using trl v1.18's vllm_mode=colocate, but should also work with vllm_mode=server
     prompts: List[List[Dict[str, str]]],
     sampling_params: Any,
 ) -> Tuple[List[str], List[Any]]:
