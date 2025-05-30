@@ -16,7 +16,7 @@ and plain‑text models.
 """
 
 from typing import List, Dict, Any, Tuple, Sequence
-
+from ludic_envs.inference.vllm_client import VLLMClient
 try:
     from vllm import LLM, SamplingParams  # type: ignore
 except ImportError as e:  # pragma: no cover
@@ -48,7 +48,7 @@ def _ensure_sampling_params(sampling_params: Any) -> "SamplingParams":
 # ---------------------------------------------------------------------------
 
 def sample(
-    model: "LLM", #FIXME: this only works when using trl v1.18's vllm_mode=colocate, but should also work with vllm_mode=server
+    model: "LLM" | VLLMClient,
     prompts: List[List[Dict[str, str]]],
     sampling_params: Any,
 ) -> Tuple[List[str], List[Any]]:
