@@ -2,19 +2,22 @@
 
 import atexit
 import logging
+import sys
 import time
-from typing import Optional
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
 
 import requests
-from requests import ConnectionError
 from requests.adapters import HTTPAdapter
 from openai import OpenAI
 import torch
 from torch import nn
 from trl.import_utils import is_requests_available, is_vllm_available
 
-from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-from vllm.distributed.utils import StatelessProcessGroup
+if is_vllm_available():
+    from vllm import SamplingParams
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+    from vllm.distributed.utils import StatelessProcessGroup
 
 logger = logging.getLogger(__name__)
 
@@ -61,12 +64,29 @@ class VLLMClient(OpenAI):
         >>> client.update_model_params(model)
         ```
     """
+# --- Mock Data Classes to Emulate vLLM's Output Structure ---
+@dataclass
+class MockOutput:
+    text: str
+
+@dataclass
+class MockGeneration:
+    outputs: List[MockOutput]
+    raw_response: Dict[str, Any]
+
+
+class VLLMClient(OpenAI):
+    """
+    A client that interacts with a vLLM server, handles batch requests 
+    internally, and correctly processes SamplingParams objects.
+    """
 
     def __init__(
         self,
         host: str = "0.0.0.0",
         port: int = 8000,
-        group_port: int = 51216, connection_timeout: float = 0.0
+        group_port: int = 51216,
+        connection_timeout: float = 30.0
     ):
         if not is_requests_available():
             raise ImportError("requests is not installed. Please install it with `pip install requests`.")
@@ -75,49 +95,91 @@ class VLLMClient(OpenAI):
 
         super().__init__(base_url=f"http://{host}:{port}/v1", api_key="local")
         self.session = requests.Session()
-        # Configure connection pooling to handle rapid requests better
-        adapter = HTTPAdapter(
-            pool_connections=10,
-            pool_maxsize=10,
-            max_retries=3,
-            pool_block=False
-        )
+        adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=3)
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
         
         self.host = host
-        self.server_port = port # Renamed from server_port to port to match super init
+        self.server_port = port
         self.group_port = group_port
-        self.check_server(connection_timeout)  # check server and fail after timeout
+        self.check_server(connection_timeout)
 
-    def chat(self, messages, **kwargs):
-        """
-        Sends a chat-style conversation to the vLLM server using the OpenAI-compatible chat completion API.
-        """
-
+    def _send_single_chat_request(
+        self, messages: List[Dict[str, str]], **kwargs
+    ) -> Dict[str, Any]:
+        """Sends a single chat request and returns the JSON response."""
         url = f"http://{self.host}:{self.server_port}/v1/chat/completions"
 
-        # Intercept SamplingParams if passed
-        if "sampling_params" in kwargs:
-            sp = kwargs.pop("sampling_params")
-            breakpoint()
-
         payload = {
-            "model": "local",
+            "model": "vllm-model",
             "messages": messages,
-            **kwargs
         }
 
+        if "sampling_params" in kwargs:
+            sp = kwargs.pop("sampling_params")
+            if sp:
+                # =================== FIX STARTS HERE ===================
+                # Manually convert the SamplingParams object to a dict.
+                # This is more robust than `dict(sp)`.
+                try:
+                    sp_dict = {}
+                    for field in sp.__struct_fields__:
+                        # getattr() is used to retrieve the value of the field.
+                        value = getattr(sp, field)
+                        # We need to handle non-JSON serializable types, like Enums.
+                        if hasattr(value, "value"): # Check if it's an Enum-like object
+                            sp_dict[field] = value.value
+                        else:
+                            sp_dict[field] = value
+                    
+                    # Filter out any fields that were not set to avoid sending nulls
+                    # for everything. The OpenAI API prefers omitting default values.
+                    # We can achieve this by using the original object's __dict__
+                    # which for msgspec.Struct holds only the explicitly set values.
+                    final_sp_dict = {}
+                    for key, val in sp.__dict__.items():
+                        if hasattr(val, "value"):
+                             final_sp_dict[key] = val.value
+                        else:
+                            final_sp_dict[key] = val
+                    payload.update(final_sp_dict)
+
+                except Exception as e:
+                    logger.error(f"Failed to convert SamplingParams to dict: {e}")
+                # =================== FIX ENDS HERE =====================
+
+        payload.update(kwargs)
+
         try:
-            response = self.session.post(url, json=payload)
-        except Exception as e:
-            logger.error(f"[VLLM_CLIENT] Chat request failed: {e}")
+            response = self.session.post(url, json=payload, timeout=300.0)
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"[VLLM_CLIENT] Chat request failed for a prompt: {e}")
             raise
 
-        if response.status_code != 200:
-            raise Exception(f"Chat request failed: {response.status_code}, {response.text}")
-
         return response.json()
+
+    def chat(self, messages: List[List[Dict[str, str]]], **kwargs) -> List[MockGeneration]:
+        """
+        Accepts a BATCH of conversations, sends them sequentially to the server,
+        and returns a list of mock generation objects compatible with the trainer.
+        """
+        results: List[MockGeneration] = []
+        
+        for conversation_prompt in messages:
+            response_json = self._send_single_chat_request(conversation_prompt, **kwargs)
+
+            if not response_json.get("choices"):
+                logger.error(f"vLLM server returned invalid response: {response_json}")
+                content = ""
+            else:
+                content = response_json["choices"][0].get("message", {}).get("content", "")
+
+            mock_output = MockOutput(text=content)
+            mock_generation = MockGeneration(outputs=[mock_output], raw_response=response_json)
+            results.append(mock_generation)
+            
+        return results
 
 
 
@@ -361,3 +423,56 @@ class VLLMClient(OpenAI):
         else:
             if response.status_code != 200:
                 raise Exception(f"Request failed: {response.status_code}, {response.text}")
+# =================================================================
+#  Main block for interactive testing
+# =================================================================
+if __name__ == "__main__":
+    print("--- VLLMClient Interactive Test ---")
+    print("This script requires a running vLLM server compatible with the OpenAI API.")
+    print(
+        "You can start one with your `vllm_server.py` script or:\n"
+        "  python -m vllm.entrypoints.openai.api_server --model <your_model_name>"
+    )
+    print("-" * 55)
+
+    try:
+        # Initialize client, but don't wait forever if server isn't running.
+        client = VLLMClient(connection_timeout=5.0)
+    except ConnectionError as e:
+        print(f"\nERROR: Could not connect to vLLM server.", file=sys.stderr)
+        print(f"Please ensure the server is running on http://0.0.0.0:8000.", file=sys.stderr)
+        sys.exit(1)
+
+    print("\nClient initialized successfully. Connected to server.")
+
+    # 1. Prepare the chat message.
+    # The client's chat method expects a *batch* of conversations,
+    # so we wrap our single conversation `[...` in another list `[[...]]`.
+    conversation = [{"role": "user", "content": "What is the capital of France?"}]
+    batch_of_conversations = [conversation]
+
+    # 2. Prepare sampling parameters using vLLM's class.
+    sampling_params = SamplingParams(temperature=0, max_tokens=50)
+
+    print(f"\nSending prompt: '{conversation[0]['content']}'")
+
+    # 3. Call the chat method.
+    try:
+        responses = client.chat(
+            messages=batch_of_conversations, sampling_params=sampling_params
+        )
+
+        # 4. Process and print the result.
+        if responses and responses[0].outputs:
+            reply_text = responses[0].outputs[0].text
+            print("\nAssistant's Reply:")
+            print("--------------------")
+            print(reply_text.strip())
+            print("--------------------")
+        else:
+            print("\nReceived an empty or invalid response from the server.")
+            if responses:
+                print(f"Raw response object: {responses[0].raw_response}")
+
+    except Exception as e:
+        print(f"\nAn error occurred during the chat request: {e}", file=sys.stderr)
