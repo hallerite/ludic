@@ -18,7 +18,7 @@ mp.set_start_method("spawn", force=True)
 # Under‑test plumbing ----------------------------------------------------------
 # -----------------------------------------------------------------------------
 from ludic_envs.envs.env import Env
-from ludic_envs.inference.rollout_generator import RolloutGenerator
+from ludic_envs.inference.rollout_generator import RolloutGenerator, HistoryManagement
 from ludic_envs.parsers import extract_tag_value
 
 # -----------------------------------------------------------------------------
@@ -147,44 +147,83 @@ class NumberGuessEnv(Env):
 # Deterministic stub sampler (unit‑tests) --------------------------------------
 # -----------------------------------------------------------------------------
 
-def _echo_number_sampler(model, prompts: List[List[Dict]], sampling_params):  # noqa: D401
-    """Return the digit embedded in the latest observation as <move>n</move>."""
-
-    def _latest_obs(chat: List[Dict]) -> str:  # noqa: D401
+def _echo_number_sampler_for_tests(model, prompts: List[List[Dict]], sampling_params, current_strategy: HistoryManagement):
+    """
+    Mock sampler modified for testing.
+    If SCRATCHPAD, produces <scratchpad> and <action> tags.
+    Otherwise, produces only the content expected by NumberGuessEnv (<move>N</move>).
+    """
+    def _latest_obs(chat: List[Dict]) -> str:
         return chat[-1]["content"]
 
     replies: List[str] = []
     for chat in prompts:
-        m = re.search(r"(\d)", _latest_obs(chat))
+        m = re.search(r"Hidden digit is: (\d)", _latest_obs(chat)) # More specific regex
         digit = m.group(1) if m else "?"
-        replies.append(f"<move>{digit}</move>")
+        
+        action_content = f"<move>{digit}</move>"
+
+        if current_strategy == HistoryManagement.SCRATCHPAD:
+            # For SCRATCHPAD, the RolloutGenerator expects both tags.
+            # The inner <action> tag will contain what NumberGuessEnv.parse_action expects.
+            replies.append(f"<scratchpad>Mock scratchpad content for digit {digit}.</scratchpad><action>{action_content}</action>")
+        else:
+            # For NO_HISTORY or FULL_HISTORY, RolloutGenerator passes the full reply to env.parse_action.
+            # So, the reply should be directly what NumberGuessEnv.parse_action expects.
+            replies.append(action_content)
+            
     return replies, [None] * len(replies)
 
 
-# -----------------------------------------------------------------------------
-# Autouse monkey‑patch: route to echo‑sampler in CPU tests ---------------------
-# -----------------------------------------------------------------------------
+# Store the original sample function to restore it
+_original_sample_func = None
 
 @pytest.fixture(autouse=True)
-def _patch_sampler(monkeypatch, request):  # noqa: D401
-    """Patch both sample references unless the test is GPU‑enabled."""
+def _patch_sampler(monkeypatch, request):
+    """
+    Patches the 'sample' function. The mock sampler's behavior now depends
+    on the history_strategy of the RolloutGenerator instance being tested.
+    This is tricky because the fixture doesn't directly know the rg instance.
+    We'll patch it globally and make the mock adaptable or specific per test if needed.
+    For now, we'll make it adaptable if we can access the strategy.
+    However, a simpler way for this fixture is to assume a default mock behavior
+    and let specific tests re-patch if they need different mock behavior.
+    
+    Let's make the default mock work for NO_HISTORY and FULL_HISTORY.
+    Tests for SCRATCHPAD will need a specialized mock or re-patch.
+    """
+    global _original_sample_func
+    if _original_sample_func is None: # Ensure we only store it once
+        import ludic_envs.inference.sample as sample_module
+        _original_sample_func = sample_module.sample
 
     if request.node.get_closest_marker("requires_gpu"):
-        # GPU tests want the real `sample`.
         yield
         return
 
-    monkeypatch.setattr(
-        "ludic_envs.inference.sample.sample",
-        _echo_number_sampler,
-        raising=True,
-    )
-    monkeypatch.setattr(
-        "ludic_envs.inference.rollout_generator.sample",
-        _echo_number_sampler,
-        raising=True,
-    )
+    # This default mock is for NO_HISTORY and FULL_HISTORY
+    # The NumberGuessEnv.parse_action expects "<move>N</move>" directly.
+    # The RolloutGenerator, for these strategies, passes the full assistant_reply
+    # to env.parse_action.
+    def mock_sampler_default(model, prompts: List[List[Dict]], sampling_params):
+        def _latest_obs(chat: List[Dict]) -> str:
+            return chat[-1]["content"]
+        replies_list: List[str] = []
+        for chat_prompt in prompts:
+            m = re.search(r"Hidden digit is: (\d)", _latest_obs(chat_prompt))
+            digit = m.group(1) if m else "?"
+            replies_list.append(f"<move>{digit}</move>")
+        return replies_list, [None] * len(replies_list)
+
+    monkeypatch.setattr("ludic_envs.inference.sample.sample", mock_sampler_default)
+    monkeypatch.setattr("ludic_envs.inference.rollout_generator.sample", mock_sampler_default)
+    
     yield
+    
+    # Restore original sample function after test run
+    if _original_sample_func is not None:
+        monkeypatch.setattr("ludic_envs.inference.sample.sample", _original_sample_func)
+        monkeypatch.setattr("ludic_envs.inference.rollout_generator.sample", _original_sample_func)
 
 
 # -----------------------------------------------------------------------------
@@ -192,56 +231,118 @@ def _patch_sampler(monkeypatch, request):  # noqa: D401
 # -----------------------------------------------------------------------------
 
 @pytest.mark.parametrize("batch,groups", [(3, 1), (2, 2)])
-def test_collect_basic(batch: int, groups: int):  # noqa: D401
-    """Smoke‑test: echo‑sampler should solve on first or later try."""
-
+def test_collect_basic_no_history(batch: int, groups: int):
+    """Test with NO_HISTORY (default)."""
+    # Uses default history_strategy = HistoryManagement.NO_HISTORY
     rg = RolloutGenerator(NumberGuessEnv, max_steps=3, group_size=groups)
     trajs = rg.collect(batch, model=None, sampling_params={})
 
     assert len(trajs) == batch * groups
     for t in trajs:
         assert 1 <= len(t["steps"]) <= 3
-        last = t["steps"][-1]
-        assert last["reward"] in (0.0, 1.0)
-        assert extract_tag_value(last["assistant"], "move").isdigit()
+        last_step = t["steps"][-1]
+        # For NO_HISTORY/FULL_HISTORY, assistant_reply is "<move>N</move>"
+        # and NumberGuessEnv.parse_action directly parses that.
+        assert extract_tag_value(last_step["assistant"], "move").isdigit() 
+        assert last_step["reward"] in (0.0, 1.0)
 
 
-def test_remember_history(monkeypatch):  # noqa: D401
-    """Validate `remember_history=True` actually threads conversation."""
+def test_full_history(monkeypatch):
+    """Validate FULL_HISTORY strategy."""
 
     class FixedNumberEnv(NumberGuessEnv):
-        """Env with digit fixed to 5 so sampler is always wrong."""
-
-        def reset(self, seed: int | None = None) -> str:  # noqa: D401
-            self._number = 5
+        def reset(self, seed: int | None = None) -> str:
+            self._number = 5 # Always 5
             self._attempt = 0
             return self._obs()
 
-    def _always_wrong_sampler(model, prompts, params):  # noqa: D401
+    # This specialized mock is for _always_wrong_sampler with FULL_HISTORY
+    def _always_wrong_sampler_for_full_history(model, prompts, params):
+        # NumberGuessEnv.parse_action needs "<move>N</move>"
         return ["<move>0</move>"] * len(prompts), [None] * len(prompts)
+    
+    monkeypatch.setattr("ludic_envs.inference.sample.sample", _always_wrong_sampler_for_full_history)
+    monkeypatch.setattr("ludic_envs.inference.rollout_generator.sample", _always_wrong_sampler_for_full_history)
 
-    monkeypatch.setattr(
-        "ludic_envs.inference.sample.sample",
-        _always_wrong_sampler,
-        raising=True,
-    )
-    monkeypatch.setattr(
-        "ludic_envs.inference.rollout_generator.sample",
-        _always_wrong_sampler,
-        raising=True,
-    )
-
-    rg = RolloutGenerator(FixedNumberEnv, max_steps=3, remember_history=True)
+    rg = RolloutGenerator(FixedNumberEnv, max_steps=3, history_strategy=HistoryManagement.FULL_HISTORY)
     trajs = rg.collect(batch_size=1, model=None, sampling_params={})
 
     steps = trajs[0]["steps"]
-    assert len(steps) == 3  # exhausted all attempts
+    assert len(steps) == 3
 
-    expected_lengths = [2, 4, 6]  # system+user, then +2 history etc.
+    # System prompt + user obs, then +2 (user, assistant) for each subsequent turn
+    # First prompt: System + User_Obs (length 2)
+    # Second prompt: System + User_Obs + Assistant_Reply_1 + User_Obs_2 (length 4)
+    # Third prompt: System + User_Obs + Assistant_Reply_1 + User_Obs_2 + Assistant_Reply_2 + User_Obs_3 (length 6)
+    expected_lengths = [2, 4, 6]
     for step, exp_len in zip(steps, expected_lengths):
         assert len(step["prompt"]) == exp_len
+        # Check that system prompt is the first message
+        assert step["prompt"][0]["role"] == "system"
+        if exp_len > 2: # For prompts with history
+             # Check alternating roles after system prompt
+            roles = [msg["role"] for msg in step["prompt"][1:]]
+            for i in range(len(roles) - 1):
+                 assert roles[i] != roles[i+1]
 
-    assert steps[1]["prompt"][0]["role"] != steps[1]["prompt"][1]["role"]
+
+def test_scratchpad_history(monkeypatch):
+    """Validate SCRATCHPAD strategy."""
+
+    class ScratchpadTestEnv(NumberGuessEnv): # Can reuse NumberGuess for simplicity
+        def __init__(self):
+            super().__init__()
+            # System prompt for NumberGuessEnv is fine, RolloutGenerator appends SCRATCHPAD instructions
+    
+    # Mock sampler specifically for SCRATCHPAD mode
+    def _scratchpad_aware_sampler(model, prompts: List[List[Dict]], sampling_params):
+        replies_list: List[str] = []
+        for chat_prompt in prompts:
+            def _latest_obs(chat: List[Dict]) -> str: # Helper to get current observation
+                for msg in reversed(chat):
+                    if msg["role"] == "user":
+                        return msg["content"]
+                return "" # Should not happen
+
+            current_obs = _latest_obs(chat_prompt)
+            m = re.search(r"Hidden digit is: (\d)", current_obs)
+            digit = m.group(1) if m else "0" # Default to 0 if not found
+
+            # Reply format for SCRATCHPAD mode
+            scratchpad_content = f"My guess for {digit} based on obs."
+            action_content = f"<move>{digit}</move>" 
+            replies_list.append(f"<scratchpad>{scratchpad_content}</scratchpad><action>{action_content}</action>")
+        return replies_list, [None] * len(replies_list)
+
+    monkeypatch.setattr("ludic_envs.inference.sample.sample", _scratchpad_aware_sampler)
+    monkeypatch.setattr("ludic_envs.inference.rollout_generator.sample", _scratchpad_aware_sampler)
+
+    rg = RolloutGenerator(ScratchpadTestEnv, max_steps=1, history_strategy=HistoryManagement.SCRATCHPAD)
+    trajs = rg.collect(batch_size=1, model=None, sampling_params={})
+    
+    assert len(trajs) == 1
+    assert len(trajs[0]["steps"]) == 1
+    step1 = trajs[0]["steps"][0]
+
+    # Check prompt structure for scratchpad
+    prompt1 = step1["prompt"]
+    assert prompt1[0]["role"] == "system"
+    assert "## Your Current Memory/Scratchpad:" not in prompt1[0]["content"] # No scratchpad on first turn
+    assert "<scratchpad>" in prompt1[0]["content"] # Instructions should be there
+    assert "<action>" in prompt1[0]["content"]
+    assert prompt1[1]["role"] == "user"
+
+    # Check assistant reply parsing
+    assert "My guess for" in step1["assistant"]
+    
+    # Test with a second step to see if scratchpad is used
+    rg_multistep = RolloutGenerator(ScratchpadTestEnv, max_steps=2, history_strategy=HistoryManagement.SCRATCHPAD)
+    trajs_multistep = rg_multistep.collect(batch_size=1, model=None, sampling_params={})
+    
+    assert len(trajs_multistep[0]["steps"]) == 2 # Should have 2 steps
+    step2_prompt = trajs_multistep[0]["steps"][1]["prompt"]
+    assert step2_prompt[0]["role"] == "system"
+    assert "## Your Current Memory/Scratchpad:\nMy guess for" in step2_prompt[0]["content"]
 
 
 # -----------------------------------------------------------------------------
@@ -249,8 +350,7 @@ def test_remember_history(monkeypatch):  # noqa: D401
 # -----------------------------------------------------------------------------
 CUDA_AVAILABLE = False
 try:
-    import torch  # noqa: WPS433
-
+    import torch
     CUDA_AVAILABLE = torch.cuda.is_available()
 except Exception:
     pass
@@ -262,26 +362,72 @@ requires_gpu = pytest.mark.skipif(
     reason="CUDA not available or RUN_REAL_VLLM_TESTS not set",
 )
 
-@requires_gpu  # type: ignore[misc]
-def test_collect_with_qwen():  # noqa: D401
-    """Exercise RolloutGenerator.collect (≤3 steps) with Qwen‑2 on GPU."""
-
-    from vllm import LLM, SamplingParams  # noqa: WPS433, WPS440
+@requires_gpu
+def test_collect_with_qwen_no_history():
+    """Exercise RolloutGenerator with Qwen‑2 on GPU (NO_HISTORY)."""
+    from vllm import LLM, SamplingParams
 
     llm = LLM(
-        model="Qwen/Qwen2.5-0.5B-Instruct",
+        model="Qwen/Qwen2-0.5B-Instruct",
         dtype="float16",
-        enforce_eager=True,
-        gpu_memory_utilization=0.40,
+        enforce_eager=True, # Easier for small tests
+        gpu_memory_utilization=0.50, # Increased slightly
     )
+    # Default is NO_HISTORY
+    rg = RolloutGenerator(NumberGuessEnv, max_steps=3, history_strategy=HistoryManagement.NO_HISTORY)
+    # Temperature 0 for deterministic output from LLM, max_tokens increased for safety
+    sampling_params = SamplingParams(max_tokens=20, temperature=0) 
 
-    rg = RolloutGenerator(NumberGuessEnv, max_steps=3)
-    sampling_params = SamplingParams(max_tokens=8, temperature=0)
+    trajs = rg.collect(batch_size=1, model=llm, sampling_params=sampling_params)
 
-    trajs = rg.collect(batch_size=3, model=llm, sampling_params=sampling_params)
+    assert len(trajs) == 1
+    tr = trajs[0]
+    steps = tr["steps"]
+    assert 1 <= len(steps) <= 3
+    
+    # NumberGuessEnv.parse_action expects <move>N</move>
+    # For NO_HISTORY, RolloutGenerator passes full assistant_reply to parse_action
+    # LLM for NumberGuessEnv should ideally output *only* <move>N</move>
+    # If it outputs more, parse_action in NumberGuessEnv might fail or misinterpret
+    # This tests if the LLM follows the simple instruction format
+    parsed_action_content = extract_tag_value(steps[-1]["assistant"], "move")
+    assert parsed_action_content.isdigit()
+    assert steps[-1]["reward"] in (0.0, 1.0)
 
-    assert len(trajs) == 3
-    for tr in trajs:
-        steps = tr["steps"]
-        assert 1 <= len(steps) <= 3
-        assert steps[-1]["reward"] in (0.0, 1.0)
+@requires_gpu
+def test_collect_with_qwen_scratchpad():
+    """Exercise RolloutGenerator with Qwen-2.5-7B-Instruct on GPU (SCRATCHPAD)."""
+    from vllm import LLM, SamplingParams
+    from ludic_envs.envs.pomdp.key_door import KeyDoorEnv
+
+    llm = LLM(
+        model="Qwen/Qwen2.5-7B-Instruct",
+        dtype="bfloat16",
+        enforce_eager=True,
+        gpu_memory_utilization=0.50,
+    )
+    
+    # KeyDoorEnv's system prompt doesn't include scratchpad/action format instructions.
+    # RolloutGenerator._build_prompt for SCRATCHPAD mode adds these instructions.
+    rg = RolloutGenerator(KeyDoorEnv, max_steps=5, history_strategy=HistoryManagement.SCRATCHPAD, seed=42)
+    sampling_params = SamplingParams(max_tokens=60, temperature=0.1, top_p=0.9) # Allow more diverse output
+
+    trajs = rg.collect(batch_size=1, model=llm, sampling_params=sampling_params)
+
+    assert len(trajs) == 1
+    tr = trajs[0]
+    steps = tr["steps"]
+    assert len(steps) > 0 # Should take at least one step
+
+    # For SCRATCHPAD, assistant_reply should contain <scratchpad> and <action>
+    # The RolloutGenerator extracts content of <action> and passes to KeyDoorEnv.parse_action
+    # KeyDoorEnv.parse_action expects the inner content of <action> to be one of its VALID_ACTIONS
+    
+    first_step_reply = steps[0]["assistant"]
+    assert "<scratchpad>" in first_step_reply
+    assert "</scratchpad>" in first_step_reply
+    assert "<action>" in first_step_reply
+    assert "</action>" in first_step_reply
+    
+    action_tag_content = extract_tag_value(first_step_reply, "action")
+    assert action_tag_content.strip() in KeyDoorEnv.VALID_ACTIONS
