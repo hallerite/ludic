@@ -1,9 +1,37 @@
 from __future__ import annotations
 import random
+import textwrap
 from typing import Dict, Tuple, Any
 
 from ludic_envs.envs.env import Env
 from ludic_envs.parsers import extract_tag_value
+
+SYSTEM_PROMPT = "You are an agent in a grid-world maze. Your goal is to find the key, use it to unlock the door, and exit."
+
+
+SCRATCHPAD_INSTR = textwrap.dedent("""
+
+    ## Your Task & Memory Instructions:
+    You are an agent solving a maze. You have a short-term observation and a long-term memory scratchpad.
+
+    ### How to Use Your Memory Scratchpad:
+    1.  **Purpose:** Your scratchpad is for storing critical FACTS you discover, not your immediate plans.
+    2.  **What to Store (Examples):**
+        - Location of the key once you find it.
+        - Location of the door once you find it.
+        - Your status (e.g., `Status: I have the key`).
+    3.  **What NOT to Store (CRITICAL):
+        - DO NOT store your current position. It is always in the 'Current Observation'.
+        - DO NOT store your plan for the next move (e.g., 'I will move north').
+    4.  **Behavior:** Your new scratchpad output will COMPLETELY REPLACE the old one.
+
+    ### Response Format:
+    First, think in a `<scratchpad>` tag, updating your memory with new facts. Then, output your final action in an `<action>` tag.
+
+    ### Good Example:
+    <scratchpad>Fact: Key is at (0,1). Fact: Door is at (2,2). Status: I have the key. Goal: Get to door at (2,2).</scratchpad>
+    <action>move south</action>
+""")
 
 class KeyDoorEnv(Env):
     """
@@ -30,10 +58,8 @@ class KeyDoorEnv(Env):
         self.size = size
         self.max_steps = max_steps
 
-        self.system_prompt = (
-            "You are an agent in a grid-world maze. Your goal is to find the "
-            "key, use it to unlock the door, and exit."
-        )
+        self.system_prompt = SYSTEM_PROMPT
+        self.scratchpad_instr = SCRATCHPAD_INSTR
 
         # --- State variables are initialized with placeholder values ---
         # These are immediately overwritten by reset(), but this satisfies the
@@ -60,17 +86,109 @@ class KeyDoorEnv(Env):
         return self._get_obs()
 
     def _get_obs(self) -> str:
-        if self.done:
-            return "The game is over. Call reset()."
-        obs = f"You are at position {self.agent_pos} in a {self.size}x{self.size} grid. "
-        obs += f"You are {'carrying the key' if self.has_key else 'not carrying a key'}. "
+        """
+        Generates the observation string for the agent based on the current state.
+        This method now focuses solely on describing the state.
+        """
+        # This method is called when the game is NOT done.
+        # If self.done is True, the step method will handle the final message.
+
+        obs_parts = []
+        obs_parts.append(f"You are at position {self.agent_pos} in a {self.size}x{self.size} grid. ")
+        obs_parts.append(f"You are {'carrying the key' if self.has_key else 'not carrying a key'}. ")
+        
+        # Describe what's in the current cell
         if self.agent_pos == self.key_pos and not self.has_key:
-            obs += "You see a key on the floor. "
+            obs_parts.append("You see a key on the floor. ")
         elif self.agent_pos == self.door_pos:
-            obs += "You see a large, locked door. "
+            obs_parts.append("You see a large, locked door. ")
         else:
-            obs += "The room is empty. "
-        return obs + "What is your next move?"
+            obs_parts.append("The room is empty. There is no locked door here. ")
+            
+        current_observation = "".join(obs_parts)
+        return current_observation + "What is your next move?"
+
+
+    def step(self, action: str) -> Tuple[str, float, bool, Dict[str, Any]]:
+        if self.done:
+            # This should ideally not be reached if the game loop stops on done,
+            # but it's good practice to keep it.
+            return "The game has already ended. Please call reset().", 0.0, True, {"event": "action_after_done"}
+
+        self.current_step += 1
+        reward = 0.0
+        info: Dict[str, Any] = {"action_taken": action}
+        
+        action_feedback = "" # To store messages like "You bumped into a wall."
+
+        if action.startswith("move"):
+            direction = action.split(" ")[1]
+            r_old, c_old = self.agent_pos # Store position before moving
+            r, c = self.agent_pos
+
+            # Update based on your chosen action space (north/south or up/down)
+            # Assuming "north", "south", "east", "west" for now as per your latest code.
+            # If you switched to "up", "down", "left", "right", adjust these conditions.
+            if direction == "north": r = max(0, r - 1)
+            elif direction == "south": r = min(self.size - 1, r + 1)
+            elif direction == "west": c = max(0, c - 1)
+            elif direction == "east": c = min(self.size - 1, c + 1)
+            
+            self.agent_pos = (r, c)
+            info["new_pos"] = self.agent_pos
+
+            # Check if the agent tried to move but its position didn't change (hit a wall)
+            if (r_old, c_old) == self.agent_pos:
+                action_feedback = f"You tried to move {direction} but bumped into a wall. "
+            else:
+                action_feedback = f"You moved {direction}. "
+
+        elif action == "interact":
+            action_feedback = "You chose to interact. " # Base feedback for interact
+            if self.agent_pos == self.key_pos and not self.has_key:
+                self.has_key = True
+                reward = 0.1 # Small reward for picking up the key
+                info["event"] = "key_picked_up"
+                action_feedback += "You picked up the key! "
+            elif self.agent_pos == self.door_pos and self.has_key:
+                self.done = True
+                reward = 1.0 # Max reward for unlocking the door
+                info["event"] = "door_unlocked"
+                action_feedback += "You unlocked the door! "
+            elif self.agent_pos == self.door_pos and not self.has_key:
+                info["event"] = "interact_locked_door_fail"
+                action_feedback += "The door is locked, and you don't have the key. "
+            else:
+                info["event"] = "interact_nothing"
+                action_feedback += "There was nothing to interact with here. "
+        else:
+            # This case should ideally be caught by parse_action, but as a fallback:
+            action_feedback = f"The action '{action}' is not recognized. "
+            info["event"] = "unknown_action"
+
+
+        # Check for game end due to max steps
+        if not self.done and self.current_step >= self.max_steps:
+            self.done = True
+            reward = -0.5 # Negative reward for running out of time without solving
+            info["event"] = "max_steps_reached"
+            action_feedback += "You ran out of time. "
+
+
+        # Construct the final observation message
+        if self.done:
+            if info.get("event") == "door_unlocked":
+                final_message = "Congratulations, you escaped the maze!"
+            elif info.get("event") == "max_steps_reached":
+                final_message = "Game over."
+            else: # Generic failure if done for other reasons (should not happen with current logic)
+                final_message = "The game has ended."
+            obs = action_feedback + final_message
+        else:
+            # Prepend the action feedback to the standard observation
+            obs = action_feedback + self._get_obs()
+
+        return obs, reward, self.done, info
 
     def parse_action(self, action_str: str) -> str:
         try:
@@ -82,49 +200,6 @@ class KeyDoorEnv(Env):
             raise ValueError(f"Invalid action '{action}'. Choose from: {self.VALID_ACTIONS}")
             
         return action
-
-    def step(self, action: str) -> Tuple[str, float, bool, Dict[str, Any]]:
-        if self.done:
-            raise RuntimeError("Game has ended. Call reset().")
-
-        self.current_step += 1
-        reward = 0.0
-        info: Dict[str, Any] = {"action_taken": action}
-
-        if action.startswith("move"):
-            direction = action.split(" ")[1]
-            r, c = self.agent_pos
-            if direction == "north": r = max(0, r - 1)
-            elif direction == "south": r = min(self.size - 1, r + 1)
-            elif direction == "west": c = max(0, c - 1)
-            elif direction == "east": c = min(self.size - 1, c + 1)
-            self.agent_pos = (r, c)
-            info["new_pos"] = self.agent_pos
-        elif action == "interact":
-            if self.agent_pos == self.key_pos and not self.has_key:
-                self.has_key = True
-                reward = 0.1
-                info["event"] = "key_picked_up"
-            elif self.agent_pos == self.door_pos and self.has_key:
-                self.done = True
-                reward = 1.0
-                info["event"] = "door_unlocked"
-            elif self.agent_pos == self.door_pos and not self.has_key:
-                info["event"] = "interact_locked_door_fail"
-            else:
-                info["event"] = "interact_nothing"
-
-        if self.current_step >= self.max_steps and not self.done:
-            self.done = True
-            reward = -1.0
-            info["event"] = "max_steps_reached"
-
-        if self.done:
-            obs = "Congratulations! You unlocked the door." if reward == 1.0 else "You failed to escape."
-        else:
-            obs = self._get_obs()
-
-        return obs, reward, self.done, info
 
 # --- Interactive Test Block ---
 if __name__ == "__main__":

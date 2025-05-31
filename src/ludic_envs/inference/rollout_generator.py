@@ -140,38 +140,31 @@ class RolloutGenerator:
                 raw_reply_data = active_replies_raw[reply_idx_counter]
                 reply_idx_counter += 1
 
-                # The prompt that led to this assistant_reply
-                # It's active_prompts[index_within_active_batch]
-                # We can find index_within_active_batch using env_indices_for_active_prompts.index(original_env_idx)
                 prompt_this_turn = active_prompts[env_indices_for_active_prompts.index(original_env_idx)]
                 current_obs_text = obs_text[original_env_idx]
 
                 try:
-                    # Default action_content is the full reply (for NO_HISTORY, FULL_HISTORY)
+                    # The environment's parse_action will receive the full assistant_reply.
                     action_content_for_env = assistant_reply 
 
                     if self.history_strategy == HistoryManagement.SCRATCHPAD:
-                        # Extract scratchpad first
+                        # For SCRATCHPAD, extract and update the scratchpad memory.
+                        # The full assistant_reply is still passed to env.parse_action.
                         try:
                             scratchpads[original_env_idx] = extract_tag_value(assistant_reply, "scratchpad")
                         except ValueError:
-                            # If scratchpad tag is missing, assume empty scratchpad for this turn
-                            scratchpads[original_env_idx] = "" 
-                            logger.debug(f"Scratchpad tag missing for env {original_env_idx}, using empty scratchpad.")
-                        
-                        # Then extract the content of the <action> tag for the environment
-                        try:
-                            action_content_for_env = extract_tag_value(assistant_reply, "action")
-                        except ValueError as e_action:
-                            # If <action> tag is missing in SCRATCHPAD mode, this is an LLM formatting error.
-                            raise ValueError(f"<action> tag missing in LLM response when SCRATCHPAD mode is active. Full reply: '{assistant_reply}'") from e_action
-
-                    # Now, the environment's parse_action gets the appropriate content
+                            # If the tag is missing, preserve the last known scratchpad.
+                            logger.warning(f"Scratchpad tag missing for env {original_env_idx}. Preserving last memory.")
+                            pass
+                        # The environment is now solely responsible for extracting the <action> tag
+                        # from the full assistant_reply (action_content_for_env).
+                    
+                    # env.parse_action receives the full assistant_reply and extracts the action.
                     action_to_step = envs[original_env_idx].parse_action(action_content_for_env)
                     
                     next_obs, reward, current_env_done_flag, info = envs[original_env_idx].step(action_to_step)
 
-                except ValueError as e: # This catches errors from env.parse_action or missing <action> tag
+                except ValueError as e: # Catches errors from env.parse_action or env.step
                     error_message = f"Your last response was invalid or badly formatted: {e}. Try again."
                     next_obs, reward, current_env_done_flag, info = (current_obs_text + "\n" + error_message), 0, False, {"illegal_move": True, "error": str(e)}
 
@@ -189,7 +182,7 @@ class RolloutGenerator:
                     "prompt": prompt_this_turn,
                     "assistant": assistant_reply,
                     "reward": reward,
-                    "raw": raw_reply_data,
+                    "raw": raw_reply_data.raw_response,
                 })
                 obs_text[original_env_idx] = next_obs
 
@@ -201,35 +194,38 @@ class RolloutGenerator:
              logger.info("Rollout finished due to max_steps (%d), not all environments were done.", self.max_steps)
 
         return trajectories
-
-    def _build_prompt(
-        self,
-        env: Env,
-        obs: str,
-        history: List[Dict[str, str]],
-        scratchpad: str,
-    ) -> List[Dict[str, str]]:
-        """Return a fresh prompt list, using the HistoryManagement enum."""
         
+    def _build_prompt(self, env: Env, obs: str, history: List[Dict[str, str]], scratchpad: str) -> List[Dict[str, str]]:
+        """
+        Builds the prompt by composing pieces from the environment based on the strategy.
+        """
         prompt: List[Dict[str, str]] = []
-        system_prompt = env.system_prompt
         
+        # Start with the environment's base system prompt.
+        system_prompt_content = env.system_prompt
+        
+        # If the strategy is SCRATCHPAD, compose the final system prompt.
         if self.history_strategy == HistoryManagement.SCRATCHPAD:
-            system_prompt += (
-                "\n\nFirst, you MUST write a thought process and plan to a <scratchpad> tag. "
-                "Then, you MUST output your chosen action in an <action> tag."
-            )
+            # Append the specific scratchpad instructions, if the env provides them.
+            if hasattr(env, 'scratchpad_instr') and env.scratchpad_instr:
+                system_prompt_content += env.scratchpad_instr
+            else:
+                raise ValueError("Your env does not have a scratchpad instruction..")
+            
+            # Append the current memory content for this turn.
             if scratchpad:
-                system_prompt += f"\n\n## Your Current Memory/Scratchpad:\n{scratchpad}"
-            prompt.append({"role": "system", "content": system_prompt})
+                system_prompt_content += f"\n\n## Your Current Memory (from previous turn):\n{scratchpad}"
 
-        elif self.history_strategy == HistoryManagement.FULL_HISTORY:
+        # --- Assemble the final prompt list ---
+        if self.history_strategy == HistoryManagement.FULL_HISTORY:
             prompt.extend(history)
             if not prompt:
-                prompt.append({"role": "system", "content": system_prompt})
-        
-        else: # HistoryManagement.NO_HISTORY
-            prompt.append({"role": "system", "content": system_prompt})
+                prompt.append({"role": "system", "content": system_prompt_content})
+        else:
+            # For SCRATCHPAD and NO_HISTORY, the prompt starts with the system message.
+            # For SCRATCHPAD, system_prompt_content has been composed above.
+            # For NO_HISTORY, it's just the base env.system_prompt.
+            prompt.append({"role": "system", "content": system_prompt_content})
         
         prompt.append({"role": "user", "content": obs})
         return prompt
