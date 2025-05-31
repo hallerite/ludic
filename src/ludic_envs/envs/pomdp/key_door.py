@@ -6,6 +6,9 @@ from typing import Dict, Tuple, Any
 from ludic_envs.envs.env import Env
 from ludic_envs.parsers import extract_tag_value
 
+import tkinter as tk
+from functools import partial
+
 SYSTEM_PROMPT = "You are an agent in a grid-world maze. Your goal is to find the key, use it to unlock the door, and exit."
 
 
@@ -29,7 +32,7 @@ SCRATCHPAD_INSTR = textwrap.dedent("""
     First, think in a `<scratchpad>` tag, updating your memory with new facts. Then, output your final action in an `<action>` tag.
 
     ### Good Example:
-    <scratchpad>Fact: Key is at (0,1). Fact: Door is at (2,2). Status: I have the key. Goal: Get to door at (2,2).</scratchpad>
+    <scratchpad>Fact: Key is at (x1,y1). Fact: Door is at (x2,y2). Status: I have the key. Goal: Get to door at (2,2).</scratchpad>
     <action>move south</action>
 """)
 
@@ -201,33 +204,118 @@ class KeyDoorEnv(Env):
             
         return action
 
+    def render(self):
+        """
+        Renders the current state of the grid to the console.
+        - 'A' for Agent
+        - 'K' for Key
+        - 'D' for Door
+        - '.' for empty space
+        """
+        grid = [["." for _ in range(self.size)] for _ in range(self.size)]
+        
+        # Place the door
+        grid[self.door_pos[0]][self.door_pos[1]] = "D"
+        
+        # Place the key if it hasn't been picked up
+        if not self.has_key:
+            grid[self.key_pos[0]][self.key_pos[1]] = "K"
+        
+        # Place the agent
+        grid[self.agent_pos[0]][self.agent_pos[1]] = "A"
+
+        # Print the grid
+        print("\n--- Grid View ---")
+        for row in grid:
+            print(" ".join(row))
+        print("-----------------\n")
+
+def _graphical_render_patch(env):
+    """The new render function that will replace the old one."""
+    if not hasattr(env, 'window') or env.window is None:
+        return  # Do nothing if the window isn't initialized
+
+    # Helper to convert grid coords to pixel coords
+    def get_canvas_coords(pos: Tuple[int, int]):
+        r, c = pos
+        return (c * env.cell_size + env.cell_size // 2, 
+                r * env.cell_size + env.cell_size // 2)
+
+    # Place door and key
+    env.canvas.coords(env.door_obj, get_canvas_coords(env.door_pos))
+    env.canvas.coords(env.key_obj, get_canvas_coords(env.key_pos))
+    
+    # Show/hide key based on state
+    env.canvas.itemconfig(env.key_obj, state='hidden' if env.has_key else 'normal')
+    
+    # Move agent
+    x, y = get_canvas_coords(env.agent_pos)
+    radius = env.cell_size // 3
+    env.canvas.coords(env.agent_obj, x - radius, y - radius, x + radius, y + radius)
+    
+    env.window.update()
+
+def _close_window_patch(env):
+    """The new close function to manage the window's lifecycle."""
+    if hasattr(env, 'window') and env.window:
+        print("\nGame Over. Close the graphical window to exit.")
+        env.window.mainloop()
+
+def patch_in_renderer(env: KeyDoorEnv):
+    """
+    Dynamically adds tkinter rendering capabilities to an existing KeyDoorEnv instance.
+    This is the core of the "patching" logic.
+    """
+    env.cell_size = 60
+    env.window = tk.Tk()
+    env.window.title("Key-Door Maze (Patched)")
+    canvas_size = env.size * env.cell_size
+    env.canvas = tk.Canvas(env.window, width=canvas_size, height=canvas_size, bg='white')
+    env.canvas.pack()
+
+    for i in range(1, env.size):
+        env.canvas.create_line(i * env.cell_size, 0, i * env.cell_size, canvas_size, fill='gray')
+        env.canvas.create_line(0, i * env.cell_size, canvas_size, i * env.cell_size, fill='gray')
+
+    env.agent_obj = env.canvas.create_oval(0, 0, 0, 0, fill='blue', outline='blue')
+    env.key_obj = env.canvas.create_text(0, 0, text="🔑", font=("Arial", 24))
+    env.door_obj = env.canvas.create_text(0, 0, text="🚪", font=("Arial", 24))
+    
+    # Replace the instance's original render and add a close method
+    env.render = partial(_graphical_render_patch, env)
+    env.close = partial(_close_window_patch, env)
+
+
 # --- Interactive Test Block ---
 if __name__ == "__main__":
-    env = KeyDoorEnv(size=3, max_steps=20)
+    # 1. Create the environment as usual
+    env = KeyDoorEnv(size=4, max_steps=25)
+    
+    # 2. Patch the graphical renderer into the instance
+    patch_in_renderer(env)
+    
+    # 3. Reset the environment and render the initial state
     obs = env.reset(seed=42)
+    env.render() # This now calls the patched graphical renderer
     
     print("--- Key-Door Maze Interactive Test ---")
     print("This tests the pure environment logic.")
     print(f"DEBUG: Key is at {env.key_pos}, Door is at {env.door_pos}")
     print("-" * 20)
-    
     print(f"INITIAL OBSERVATION: {obs}")
 
     while not env.done:
         try:
-            # 1. Get a clean action from the user
             action_input = input(f"Enter action ({', '.join(env.VALID_ACTIONS)}): ").lower().strip()
+            if not action_input:
+                continue
             
-            # 2. Simulate the raw LLM output that the RolloutGenerator will process
-            #    (The environment itself doesn't use the scratchpad tag, but this
-            #    tests that the parser can ignore it correctly).
             simulated_llm_output = f"<scratchpad>This is a test thought.</scratchpad><action>{action_input}</action>"
-
-            # 3. Parse the action using the environment's method
             parsed_action = env.parse_action(simulated_llm_output)
-
-            # 4. Step the environment with the clean, parsed action
             obs, reward, done, info = env.step(parsed_action)
+
+            # 4. The render call now updates the GUI
+            env.render()
             
             print("\n" + "="*20)
             print(f"ACTION TAKEN: '{info.get('action_taken')}'")
@@ -245,3 +333,7 @@ if __name__ == "__main__":
         print("You won!")
     else:
         print("You lost or ran out of steps.")
+    
+    # 5. Call the new close method to keep the window open until the user closes it
+    if hasattr(env, 'close'):
+        env.close()

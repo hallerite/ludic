@@ -5,7 +5,6 @@ import logging
 import sys
 
 # --- Assumed Imports from your project structure ---
-# Make sure these paths are correct relative to where you run the script.
 from ludic_envs.envs.pomdp.key_door import KeyDoorEnv
 from ludic_envs.inference.rollout_generator import HistoryManagement, RolloutGenerator
 from ludic_envs.inference.vllm_client import VLLMClient
@@ -71,8 +70,36 @@ if __name__ == "__main__":
 
             logger.info(f"✅ Trajectory saved to '{output_filename}'")
 
-            # Log the final outcome for quick inspection.
-            final_reward = trajectory['steps'][-1]['reward']
+            # --- TOKEN STATISTICS CALCULATION ---
+            total_prompt_tokens = 0
+            total_completion_tokens = 0
+            num_steps = 0
+
+            if 'steps' in trajectory and isinstance(trajectory['steps'], list):
+                num_steps = len(trajectory['steps'])
+                for step in trajectory['steps']:
+                    if isinstance(step, dict):
+                        raw_data = step.get('raw')
+                        # The 'raw' field should contain the JSON response from the server
+                        if raw_data and isinstance(raw_data, dict):
+                            usage_data = raw_data.get('usage')
+                            if usage_data and isinstance(usage_data, dict):
+                                total_prompt_tokens += usage_data.get('prompt_tokens', 0)
+                                total_completion_tokens += usage_data.get('completion_tokens', 0)
+                            else:
+                                logger.warning(f"Missing or invalid 'usage' data in step raw response for {strategy.name}")
+                        else:
+                            logger.warning(f"Missing or invalid 'raw' data in step for {strategy.name}")
+            
+            logger.info(
+                f"Token Stats for {strategy.name} ({num_steps} steps): "
+                f"Input Tokens = {total_prompt_tokens}, "
+                f"Output Tokens = {total_completion_tokens}, "
+                f"Total Tokens = {total_prompt_tokens + total_completion_tokens}"
+            )
+            # --- END TOKEN STATISTICS CALCULATION ---
+
+            final_reward = trajectory['steps'][-1]['reward'] if num_steps > 0 else 0
             if final_reward == 1.0:
                 logger.info(f"Outcome: Success! 🚪 Agent unlocked the door.")
             else:
