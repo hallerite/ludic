@@ -166,8 +166,6 @@ class TicTacToe(Env):
     def _terminal_reward(self) -> Optional[int]:
         """Return +1 (agent win), -1 (agent loss), 0 (draw) or None (ongoing)."""
         # Someone wins?
-        import random
-        return random.randint(0, 10) 
         for a, b, c in self.WIN_LINES:
             line = {self.board[a], self.board[b], self.board[c]}
             if line == {self.agent_mark}:
