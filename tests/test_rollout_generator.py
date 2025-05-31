@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import os
 import random
 import re
 import multiprocessing as mp
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple, Optional, Any
 
 import pytest
 
@@ -22,49 +24,122 @@ from ludic_envs.parsers import extract_tag_value
 # -----------------------------------------------------------------------------
 # Environment: three‑attempt digit guesser -------------------------------------
 # -----------------------------------------------------------------------------
+from ludic_envs.envs.env import Env # Assuming this is the correct path to your Env ABC
+from ludic_envs.parsers import extract_tag_value # Assuming this is available
+
 class NumberGuessEnv(Env):
-    """Guess a hidden single digit in ≤ 3 tries using <move>N</move>."""
+    """
+    Guess a hidden single digit in up to `max_attempts` tries.
+    The agent should reply with <move>N</move>, where N is its guess.
+    The observation explicitly reveals the hidden digit to test instruction following.
+    """
 
     max_attempts: int = 3
-    system_prompt: str = (
-        "You are playing a guessing game. You have up to 3 attempts. "
-        "Reply **only** with <move>N</move> where N is the hidden digit shown "
-        "in the user's last message."
-    )
+    
+    # system_prompt is now set in __init__ to conform to the Env ABC,
+    # though it could remain a class variable if preferred and super().__init__() is called.
+    # For this game, the system prompt is static.
 
-    def __init__(self) -> None:  # noqa: D401
-        self._number: int | None = None
+    def __init__(self) -> None:
+        super().__init__() # Call the parent class's __init__
+        self.system_prompt: str = (
+            f"You are playing a guessing game. I have a hidden digit. "
+            f"You have up to {self.max_attempts} attempts to guess it. "
+            "The hidden digit will be shown in my message. "
+            "Reply **only** with your guess in the format <move>N</move> where N is the digit."
+        )
+        self._number: Optional[int] = None
         self._attempt: int = 0
 
-    # Gym‑style API -----------------------------------------------------------
-    def reset(self, seed: int | None = None) -> str:  # noqa: D401
+    def reset(self, seed: Optional[int] = None) -> str:
         if seed is not None:
             random.seed(seed)
         self._number = random.randint(0, 9)
         self._attempt = 0
+        # The system_prompt is already set in __init__
         return self._obs()
 
-    def step(self, action: Dict) -> Tuple[str, float, bool, Dict]:  # noqa: D401
+    def parse_action(self, action_str: str) -> int:
+        """
+        Parses the LLM's string output (e.g., "<move>7</move>") into an integer guess.
+        Raises ValueError if parsing fails or the guess is invalid.
+        """
+        try:
+            guess_str = extract_tag_value(action_str, "move")
+            if guess_str is None:
+                raise ValueError("The <move> tag was not found in your response.")
+            
+            guess = int(guess_str)
+            if not (0 <= guess <= 9):
+                raise ValueError("Your guess must be a single digit between 0 and 9.")
+            return guess
+        except ValueError as e: # Catches int conversion errors or specific ValueErrors raised
+            raise ValueError(f"Invalid move. {e}")
+        except Exception as e: # Catch other potential errors from extract_tag_value
+            # This helps debug unexpected issues with the parser or action string
+            raise ValueError(f"Error parsing action string '{action_str}': {e}")
+
+    def step(self, action_str: str) -> Tuple[str, float, bool, Dict[str, Any]]:
+        """
+        Processes the agent's action string, updates the game state, and returns the outcome.
+        """
         self._attempt += 1
-        guess = action.get("pos")
+        
+        try:
+            guess = self.parse_action(action_str)
+        except ValueError as e:
+            # If parsing fails, penalize slightly or give specific feedback.
+            # An attempt is still counted.
+            error_message = f"⚠️ Your action was invalid: {e}."
+            if self._attempt >= self.max_attempts:
+                obs = f"{error_message} You have no more attempts. The number was {self._number}."
+                return obs, 0.0, True, {"error": str(e), "final_state": "invalid_action_loss"}
+            else:
+                obs = f"{error_message} Try again. {self._obs()}"
+                return obs, 0.0, False, {"error": str(e)}
+
+        # Proceed with a valid guess
         correct = (guess == self._number)
+        done = False
+        info: Dict[str, Any] = {}
 
         if correct:
-            reward, done, obs = 1.0, True, "⭐ Correct — well done!"
+            reward = 1.0
+            done = True
+            obs = f"⭐ Correct! The number was {self._number}. Well done!"
+            info["final_state"] = "win"
         elif self._attempt >= self.max_attempts:
-            reward, done, obs = 0.0, True, "❌ Wrong. Out of attempts."
-        else:
-            reward, done, obs = 0.0, False, "❌ Wrong. Try again."
-
+            reward = 0.0
+            done = True
+            obs = f"❌ Wrong. That was your last attempt. The number was {self._number}."
+            info["final_state"] = "loss_attempts"
+        else: # Wrong, but still have attempts
+            reward = 0.0
+            done = False
+            obs = f"❌ Wrong guess. Try again."
+        
+        # If the game is not done, append the standard observation prompt
         if not done:
             obs = f"{obs} {self._obs()}"
-        return obs, reward, done, {}
+            
+        return obs, reward, done, info
 
-    # Helper ------------------------------------------------------------------
-    def _obs(self) -> str:  # noqa: D401
+    def _obs(self) -> str:
+        """
+        Generates the observation string for the agent.
+        This version explicitly tells the agent the hidden number, making it a test
+        of instruction following and extraction rather than pure guessing.
+        """
+        # Ensure _number is not None; it should be set by reset()
+        if self._number is None:
+            # This case should ideally not be reached if reset() is always called first.
+            # Handle it defensively, perhaps by calling reset or raising an error.
+            # For now, we'll make a placeholder, but this indicates a state issue.
+            return "Error: Game not initialized. Call reset()." 
+            
         return (
-            f"Hidden digit: {self._number}. Attempt {self._attempt+1}/"
-            f"{self.max_attempts}. What is your move?"
+            f"I'm thinking of a digit. Hidden digit is: {self._number}. "
+            f"Attempt {self._attempt + 1}/{self.max_attempts}. What is your move?"
         )
 
 
@@ -162,7 +237,7 @@ def test_remember_history(monkeypatch):  # noqa: D401
     steps = trajs[0]["steps"]
     assert len(steps) == 3  # exhausted all attempts
 
-    expected_lengths = [2, 3, 5]  # system+user, then +2 history etc.
+    expected_lengths = [2, 4, 6]  # system+user, then +2 history etc.
     for step, exp_len in zip(steps, expected_lengths):
         assert len(step["prompt"]) == exp_len
 
