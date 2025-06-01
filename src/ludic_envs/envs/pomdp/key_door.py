@@ -306,8 +306,8 @@ class PygameRenderer:
     def add_log_entry(self, prompt_str: str, completion_str: str):
         max_text_width = self.log_width - 2 * self.log_padding
         
-        self.conversation_log_lines.extend(self._wrap_text(f"P: {prompt_str}", self.log_font, max_text_width))
-        self.conversation_log_lines.extend(self._wrap_text(f"C: {completion_str}", self.log_font, max_text_width))
+        self.conversation_log_lines.extend(self._wrap_text(f"{prompt_str}", self.log_font, max_text_width))
+        self.conversation_log_lines.extend(self._wrap_text(f"{completion_str}", self.log_font, max_text_width))
         separator_line = "─" * (max_text_width // self.log_font.size("─")[0] if self.log_font.size("─")[0] > 0 else 20)
         self.conversation_log_lines.append(separator_line)
 
@@ -432,7 +432,6 @@ if __name__ == "__main__":
     print("-" * 20)
     print(f"INITIAL OBSERVATION: {obs}")
 
-    # Main game loop
     while not env.done:
         # Pygame windows must process events to prevent freezing
         for event in pygame.event.get():
