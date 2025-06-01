@@ -54,6 +54,7 @@ class RolloutGenerator:
         max_steps: int,
         *,
         history_strategy: HistoryManagement = HistoryManagement.NO_HISTORY,
+        env_kwargs: Dict[str, Any] | None = None,
         group_size: int = 1,
         seed: int | None = None,
     ) -> None:
@@ -62,6 +63,7 @@ class RolloutGenerator:
         self.history_strategy = history_strategy
         self.group_size = group_size # FIXME: assumes GRPO!
         self.rng = random.Random(seed)
+        self.env_kwargs = env_kwargs or {}
 
     def collect(self, batch_size: int, model: Any, sampling_params: Any) -> List[Dict[str, Any]]:
         """
@@ -78,7 +80,7 @@ class RolloutGenerator:
             seed = self.rng.randint(0, 2**32 - 1)
             logger.debug("Seed for GRPO group %d: %s", g_idx, seed)
             for _ in range(self.group_size): # Create `group_size` clones for this seed
-                env = self.env_cls()
+                env = self.env_cls(**self.env_kwargs)
                 envs.append(env)
                 obs_text.append(env.reset(seed=seed))
                 group_ids.append(g_idx)
@@ -194,7 +196,7 @@ class RolloutGenerator:
              logger.info("Rollout finished due to max_steps (%d), not all environments were done.", self.max_steps)
 
         return trajectories
-        
+
     def _build_prompt(self, env: Env, obs: str, history: List[Dict[str, str]], scratchpad: str) -> List[Dict[str, str]]:
         """
         Builds the prompt by composing pieces from the environment based on the strategy.

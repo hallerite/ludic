@@ -1,38 +1,43 @@
 from __future__ import annotations
 import random
 import textwrap
+import os
+import pygame
 from typing import Dict, Tuple, Any
 
 from ludic_envs.envs.env import Env
 from ludic_envs.parsers import extract_tag_value
 
-import tkinter as tk
 from functools import partial
 
 SYSTEM_PROMPT = "You are an agent in a grid-world maze. Your goal is to find the key, use it to unlock the door, and exit."
 
 
 SCRATCHPAD_INSTR = textwrap.dedent("""
-
     ## Your Task & Memory Instructions:
     You are an agent solving a maze. You have a short-term observation and a long-term memory scratchpad.
 
+    ### Your Strategy:
+    1.  **Explore Systematically:** Your primary goal is to explore the maze cell by cell to find the key and the door. A good strategy is to explore row by row or column by column.
+    2.  **Build a Map:** Use your scratchpad to build a map of the world as you explore. Record what you find in each room. This is the most important part of your memory.
+
     ### How to Use Your Memory Scratchpad:
-    1.  **Purpose:** Your scratchpad is for storing critical FACTS you discover, not your immediate plans.
+    1.  **Purpose:** Your scratchpad is for storing critical FACTS you discover, not your immediate plans or current position.
     2.  **What to Store (Examples):**
-        - Location of the key once you find it.
-        - Location of the door once you find it.
-        - Your status (e.g., `Status: I have the key`).
-    3.  **What NOT to Store (CRITICAL):
-        - DO NOT store your current position. It is always in the 'Current Observation'.
-        - DO NOT store your plan for the next move (e.g., 'I will move north').
-    4.  **Behavior:** Your new scratchpad output will COMPLETELY REPLACE the old one.
+        - Your status: `Status: I do not have the key.`
+        - The location of the key, once found: `Key is at (x1, y1).`
+        - The location of the door, once found: `Door is at (x2, y2).`
+        - Your map of explored rooms: `Already visited empty rooms: (x1,y2), (x2,y1)\n.`
+    3.  **What NOT to Store (CRITICAL):**
+        - **DO NOT** store your current position (e.g., `I am at (0,0)`). It is always provided in the 'Current Observation'.
+        - **DO NOT** store your plans or intentions (e.g., `I will move north next`). Your final decision goes in the <action> tag.
+    4.  **Behavior:** Your new scratchpad output will **COMPLETELY REPLACE** the old one. You must re-state all known facts, including your updated map, on every turn.
 
     ### Response Format:
-    First, think in a `<scratchpad>` tag, updating your memory with new facts. Then, output your final action in an `<action>` tag.
+    First, update your memory of the world in a `<scratchpad>` tag. Then, output your final action in an `<action>` tag.
 
-    ### Good Example:
-    <scratchpad>Fact: Key is at (x1,y1). Fact: Door is at (x2,y2). Status: I have the key. Goal: Get to door at (2,2).</scratchpad>
+    ### Good Example of a turn:
+    <scratchpad>Status: I do not have the key. Empty Rooms: (x1,y1), (x2,y2) Room with door:(x1,y2).</scratchpad>
     <action>move south</action>
 """)
 
@@ -53,7 +58,7 @@ class KeyDoorEnv(Env):
     key_pos: Tuple[int, int]
     door_pos: Tuple[int, int]
     
-    def __init__(self, size: int = 3, max_steps: int = 15):
+    def __init__(self, size: int = 4, max_steps: int = 35):
         super().__init__()
         if not isinstance(size, int) or size < 2:
             raise ValueError("Size must be an integer of at least 2.")
@@ -204,124 +209,113 @@ class KeyDoorEnv(Env):
             
         return action
 
-    def render(self):
-        """
-        Renders the current state of the grid to the console.
-        - 'A' for Agent
-        - 'K' for Key
-        - 'D' for Door
-        - '.' for empty space
-        """
-        grid = [["." for _ in range(self.size)] for _ in range(self.size)]
-        
-        # Place the door
-        grid[self.door_pos[0]][self.door_pos[1]] = "D"
-        
-        # Place the key if it hasn't been picked up
-        if not self.has_key:
-            grid[self.key_pos[0]][self.key_pos[1]] = "K"
-        
-        # Place the agent
-        grid[self.agent_pos[0]][self.agent_pos[1]] = "A"
+class PygameRenderer:
+    def __init__(self, size: int, cell_size: int = 60):
+        pygame.init()
+        self.cell_size = cell_size
+        self.screen_size = size * cell_size
+        self.screen = pygame.display.set_mode((self.screen_size, self.screen_size))
+        pygame.display.set_caption("Key-Door Maze (Pygame)")
 
-        # Print the grid
-        print("\n--- Grid View ---")
-        for row in grid:
-            print(" ".join(row))
-        print("-----------------\n")
+        # Load sprites
+        res_dir = "res"
+        sprite_size = int(self.cell_size * 0.8)
+        try:
+            self.font = pygame.font.SysFont("Arial", 24)
+        except pygame.error:
+            print("Default font 'Arial' not found, using pygame's default.")
+            self.font = pygame.font.Font(None, 24) # Fallback to default font
 
-def _graphical_render_patch(env):
-    """The new render function that will replace the old one."""
-    if not hasattr(env, 'window') or env.window is None:
-        return  # Do nothing if the window isn't initialized
+        # Load sprites (logic is unchanged)
+        res_dir = "res"
+        sprite_size = int(self.cell_size * 0.8)
+        try:
+            agent_img = pygame.image.load(os.path.join(res_dir, "robot_face.png")).convert_alpha()
+            key_img = pygame.image.load(os.path.join(res_dir, "key.png")).convert_alpha()
+            door_img = pygame.image.load(os.path.join(res_dir, "door.png")).convert_alpha()
 
-    # Helper to convert grid coords to pixel coords
-    def get_canvas_coords(pos: Tuple[int, int]):
+            self.agent_sprite = pygame.transform.scale(agent_img, (sprite_size, sprite_size))
+            self.key_sprite = pygame.transform.scale(key_img, (sprite_size, sprite_size))
+            self.door_sprite = pygame.transform.scale(door_img, (sprite_size, sprite_size))
+        except pygame.error as e:
+            print(f"Error loading sprites: {e}")
+            print("Creating fallback shapes.")
+            self.agent_sprite = self.key_sprite = self.door_sprite = None
+
+
+    def render(self, env: KeyDoorEnv):
+        self.screen.fill(pygame.Color("white")) # Clear screen
+        self._draw_grid()
+
+        # Get sprite rectangles and blit (draw) them (logic is unchanged)
+        if self.agent_sprite:
+            key_rect = self.key_sprite.get_rect(center=self._get_pixel_coords(env.key_pos))
+            door_rect = self.door_sprite.get_rect(center=self._get_pixel_coords(env.door_pos))
+            agent_rect = self.agent_sprite.get_rect(center=self._get_pixel_coords(env.agent_pos))
+
+            if not env.has_key:
+                self.screen.blit(self.key_sprite, key_rect)
+            self.screen.blit(self.door_sprite, door_rect)
+            self.screen.blit(self.agent_sprite, agent_rect)
+
+        # --- NEW: Render and draw the turn counter ---
+        turn_text = f"Turn: {env.current_step}/{env.max_steps}"
+        text_surface = self.font.render(turn_text, True, pygame.Color("black"))
+        # Position text in the top-right corner with a 10px margin
+        text_rect = text_surface.get_rect(topright=(self.screen_size - 10, 10))
+        self.screen.blit(text_surface, text_rect)
+        # --- End of new code ---
+
+        pygame.display.flip() # Update the full display
+
+    def _draw_grid(self):
+        for i in range(1, self.screen_size // self.cell_size):
+            pygame.draw.line(self.screen, pygame.Color("gray"), (i * self.cell_size, 0), (i * self.cell_size, self.screen_size))
+            pygame.draw.line(self.screen, pygame.Color("gray"), (0, i * self.cell_size), (self.screen_size, i * self.cell_size))
+
+    def _get_pixel_coords(self, pos: Tuple[int, int]) -> Tuple[int, int]:
         r, c = pos
-        return (c * env.cell_size + env.cell_size // 2, 
-                r * env.cell_size + env.cell_size // 2)
+        return (c * self.cell_size + self.cell_size // 2, r * self.cell_size + self.cell_size // 2)
 
-    # Place door and key
-    env.canvas.coords(env.door_obj, get_canvas_coords(env.door_pos))
-    env.canvas.coords(env.key_obj, get_canvas_coords(env.key_pos))
-    
-    # Show/hide key based on state
-    env.canvas.itemconfig(env.key_obj, state='hidden' if env.has_key else 'normal')
-    
-    # Move agent
-    x, y = get_canvas_coords(env.agent_pos)
-    radius = env.cell_size // 3
-    env.canvas.coords(env.agent_obj, x - radius, y - radius, x + radius, y + radius)
-    
-    env.window.update()
-
-def _close_window_patch(env):
-    """The new close function to manage the window's lifecycle."""
-    if hasattr(env, 'window') and env.window:
-        print("\nGame Over. Close the graphical window to exit.")
-        env.window.mainloop()
-
-def patch_in_renderer(env: KeyDoorEnv):
-    """
-    Dynamically adds tkinter rendering capabilities to an existing KeyDoorEnv instance.
-    This is the core of the "patching" logic.
-    """
-    env.cell_size = 60
-    env.window = tk.Tk()
-    env.window.title("Key-Door Maze (Patched)")
-    canvas_size = env.size * env.cell_size
-    env.canvas = tk.Canvas(env.window, width=canvas_size, height=canvas_size, bg='white')
-    env.canvas.pack()
-
-    for i in range(1, env.size):
-        env.canvas.create_line(i * env.cell_size, 0, i * env.cell_size, canvas_size, fill='gray')
-        env.canvas.create_line(0, i * env.cell_size, canvas_size, i * env.cell_size, fill='gray')
-
-    env.agent_obj = env.canvas.create_oval(0, 0, 0, 0, fill='blue', outline='blue')
-    env.key_obj = env.canvas.create_text(0, 0, text="🔑", font=("Arial", 24))
-    env.door_obj = env.canvas.create_text(0, 0, text="🚪", font=("Arial", 24))
-    
-    # Replace the instance's original render and add a close method
-    env.render = partial(_graphical_render_patch, env)
-    env.close = partial(_close_window_patch, env)
-
+    def close(self):
+        pygame.quit()
 
 # --- Interactive Test Block ---
 if __name__ == "__main__":
-    # 1. Create the environment as usual
     env = KeyDoorEnv(size=4, max_steps=25)
-    
-    # 2. Patch the graphical renderer into the instance
-    patch_in_renderer(env)
-    
-    # 3. Reset the environment and render the initial state
+    renderer = PygameRenderer(size=env.size) # Initialize renderer
+
     obs = env.reset(seed=42)
-    env.render() # This now calls the patched graphical renderer
-    
-    print("--- Key-Door Maze Interactive Test ---")
-    print("This tests the pure environment logic.")
+    renderer.render(env) # Initial render
+
+    print("--- Key-Door Maze Interactive Test (Pygame) ---")
     print(f"DEBUG: Key is at {env.key_pos}, Door is at {env.door_pos}")
     print("-" * 20)
     print(f"INITIAL OBSERVATION: {obs}")
 
+    # Main game loop
     while not env.done:
+        # Pygame windows must process events to prevent freezing
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                env.done = True # Exit the loop if window is closed
+
+        if env.done:
+            continue
+
         try:
             action_input = input(f"Enter action ({', '.join(env.VALID_ACTIONS)}): ").lower().strip()
-            if not action_input:
-                continue
+            if not action_input: continue
             
-            simulated_llm_output = f"<scratchpad>This is a test thought.</scratchpad><action>{action_input}</action>"
+            simulated_llm_output = f"<action>{action_input}</action>"
             parsed_action = env.parse_action(simulated_llm_output)
             obs, reward, done, info = env.step(parsed_action)
 
-            # 4. The render call now updates the GUI
-            env.render()
+            renderer.render(env) # Re-render the screen after every move
             
             print("\n" + "="*20)
-            print(f"ACTION TAKEN: '{info.get('action_taken')}'")
-            print(f"INFO: {info}")
-            print(f"REWARD: {reward}")
-            print(f"OBSERVATION: {obs}")
+            print(f"ACTION TAKEN: '{info.get('action_taken')}'"); print(f"INFO: {info}")
+            print(f"REWARD: {reward}"); print(f"OBSERVATION: {obs}")
             print("="*20 + "\n")
         
         except ValueError as e:
@@ -329,11 +323,4 @@ if __name__ == "__main__":
             continue
 
     print("\n--- GAME OVER ---")
-    if reward == 1.0:
-        print("You won!")
-    else:
-        print("You lost or ran out of steps.")
-    
-    # 5. Call the new close method to keep the window open until the user closes it
-    if hasattr(env, 'close'):
-        env.close()
+    renderer.close()
