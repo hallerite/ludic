@@ -67,8 +67,8 @@ class RolloutGenerator:
 
     def collect(self, batch_size: int, model: Any, sampling_params: Any) -> List[Dict[str, Any]]:
         """
-        Roll out scenarios and return trajectories. Enum to show how context is managed
-        Total environments = batch_size * group_size.
+        Roll out scenarios and return trajectories.
+        Total number of environments = batch_size * group_size.
         """
         envs: List[Env] = []
         obs_text: List[str] = []
@@ -78,18 +78,22 @@ class RolloutGenerator:
         # Each scenario (group g) will have self.group_size environment instances.
         for g_idx in range(batch_size): # g_idx is the GRPO group index
             seed = self.rng.randint(0, 2**32 - 1)
-            logger.debug("Seed for GRPO group %d: %s", g_idx, seed)
-            for _ in range(self.group_size): # Create `group_size` clones for this seed
+            logger.debug(f"Seed for GRPO group {g_idx}: {seed}")
+            for i_clone in range(self.group_size): 
                 env = self.env_cls(**self.env_kwargs)
                 envs.append(env)
-                obs_text.append(env.reset(seed=seed))
+                obs_text.append(env.reset(seed=seed)) # All clones in a group use the same seed
                 group_ids.append(g_idx)
+                logger.debug(f"Initialized env instance {len(envs)-1} for group {g_idx}, clone {i_clone} with seed {seed}")
+
 
         n_total_envs = len(envs)
         done = [False] * n_total_envs
         histories: List[List[Dict[str, str]]] = [[] for _ in range(n_total_envs)]
-        scratchpads: List[str] = ["" for _ in range(n_total_envs)]
+        scratchpads: List[str] = ["" for _ in range(n_total_envs)] # Holds the latest scratchpad content for each env
         trajectories = [{"group": group_ids[i], "steps": []} for i in range(n_total_envs)]
+
+        logger.info(f"Starting rollout collection for {batch_size} groups, {self.group_size} clones/group, total {n_total_envs} environments.")
 
         for step_idx in range(self.max_steps):
             active_env_indices = [i for i, d_flag in enumerate(done) if not d_flag]
@@ -97,30 +101,32 @@ class RolloutGenerator:
             if not active_env_indices:
                 logger.info("All %d environments completed. Ending rollout early at step %d.", n_total_envs, step_idx)
                 break
+            
+            logger.debug(f"Step {step_idx + 1}/{self.max_steps}. Active environments: {len(active_env_indices)} / {n_total_envs}")
 
             active_prompts: List[List[Dict[str, str]]] = []
-            env_indices_for_active_prompts: List[int] = []
+            # Store mapping to original env index to correctly update states later
+            env_indices_for_active_prompts: List[int] = [] 
 
-            for env_idx in active_env_indices:
+            for original_env_idx in active_env_indices:
                 prompt = self._build_prompt(
-                    envs[env_idx],
-                    obs_text[env_idx],
-                    histories[env_idx],
-                    scratchpads[env_idx]
+                    envs[original_env_idx],
+                    obs_text[original_env_idx],
+                    histories[original_env_idx],
+                    scratchpads[original_env_idx] # Pass current scratchpad for this env
                 )
                 active_prompts.append(prompt)
-                env_indices_for_active_prompts.append(env_idx)
+                env_indices_for_active_prompts.append(original_env_idx)
             
-            if not active_prompts: # Should only happen if all envs were done
+            if not active_prompts: # Should only happen if all envs were done at the start of the loop
                 continue
 
             active_replies_txt, active_replies_raw = sample(model, active_prompts, sampling_params)
 
-            # --- Log generations to dedicated file ---
-            for i, original_env_idx in enumerate(env_indices_for_active_prompts):
-                # i is the index within the 'active_prompts' and 'active_replies_txt' lists
-                prompt_for_log = active_prompts[i]
-                reply_for_log = active_replies_txt[i]
+            # Log generations to dedicated file
+            for i, original_idx_in_active_list in enumerate(env_indices_for_active_prompts):
+                prompt_for_log = active_prompts[i] # `i` is index in active_prompts
+                reply_for_log = active_replies_txt[i] # `i` is index in active_replies_txt
                 
                 try:
                     prompt_str_for_log = json.dumps(prompt_for_log, indent=2)
@@ -128,72 +134,81 @@ class RolloutGenerator:
                     prompt_str_for_log = str(prompt_for_log)
 
                 log_message = (
-                    f"STEP {step_idx + 1} - Overall EnvID {original_env_idx} (GRPO Group {group_ids[original_env_idx]})\n"
+                    f"STEP {step_idx + 1} - EnvID (Overall) {original_idx_in_active_list} (GRPO Group {group_ids[original_idx_in_active_list]})\n"
                     f"PROMPT:\n{prompt_str_for_log}\n"
                     f"REPLY:\n{reply_for_log}"
                 )
                 gen_detail_logger.info(log_message)
-            # --- End File Logging ---
 
             # Process replies and step environments
-            reply_idx_counter = 0 # Counter for iterating through active_replies_txt
-            for original_env_idx in active_env_indices: # Iterate based on the original env indices that were active
-                assistant_reply = active_replies_txt[reply_idx_counter]
-                raw_reply_data = active_replies_raw[reply_idx_counter]
-                reply_idx_counter += 1
-
-                prompt_this_turn = active_prompts[env_indices_for_active_prompts.index(original_env_idx)]
-                current_obs_text = obs_text[original_env_idx]
+            # Iterate based on env_indices_for_active_prompts to ensure correct mapping
+            for i, original_env_idx in enumerate(env_indices_for_active_prompts):
+                assistant_reply = active_replies_txt[i] # Raw LLM string output
+                raw_reply_data = active_replies_raw[i]  # Raw generation object from vLLM/sample
+                prompt_this_turn = active_prompts[i]    # The prompt that led to this reply
 
                 try:
-                    # The environment's parse_action will receive the full assistant_reply.
-                    action_content_for_env = assistant_reply 
-
                     if self.history_strategy == HistoryManagement.SCRATCHPAD:
-                        # For SCRATCHPAD, extract and update the scratchpad memory.
-                        # The full assistant_reply is still passed to env.parse_action.
                         try:
+                            # Update scratchpad memory for this specific environment
                             scratchpads[original_env_idx] = extract_tag_value(assistant_reply, "scratchpad")
+                            logger.debug(f"Env {original_env_idx} updated scratchpad: \"{scratchpads[original_env_idx][:50]}...\"")
                         except ValueError:
-                            # If the tag is missing, preserve the last known scratchpad.
-                            logger.warning(f"Scratchpad tag missing for env {original_env_idx}. Preserving last memory.")
-                            pass
-                        # The environment is now solely responsible for extracting the <action> tag
-                        # from the full assistant_reply (action_content_for_env).
+                            logger.warning(f"Scratchpad tag missing/malformed for env {original_env_idx} (Group {group_ids[original_env_idx]}). Last scratchpad preserved. Reply: \"{assistant_reply[:100].replace(os.linesep, ' ')}...\"")
+                            # No 'pass' needed, scratchpads[original_env_idx] remains unchanged.
                     
-                    # env.parse_action receives the full assistant_reply and extracts the action.
-                    action_to_step = envs[original_env_idx].parse_action(action_content_for_env)
-                    
-                    next_obs, reward, current_env_done_flag, info = envs[original_env_idx].step(action_to_step)
+                    # Pass the raw assistant_reply directly to the environment's step method.
+                    # The environment is now responsible for parsing and handling parsing errors.
+                    next_obs, reward, current_env_done_flag, info = envs[original_env_idx].step(assistant_reply)
 
-                except ValueError as e: # Catches errors from env.parse_action or env.step
-                    error_message = f"Your last response was invalid or badly formatted: {e}. Try again."
-                    next_obs, reward, current_env_done_flag, info = (current_obs_text + "\n" + error_message), 0, False, {"illegal_move": True, "error": str(e)}
-
+                except Exception as e: 
+                    # This catch block is for *UNEXPECTED* errors from env.step().
+                    # Parsing errors (ValueErrors) should be handled *within* env.step(),
+                    # which should then return a valid 4-tuple (obs, rew, done, info)
+                    # with an error message in the observation.
+                    # If an exception reaches here, it means env.step() itself crashed.
+                    logger.error(
+                        f"UNEXPECTED CRITICAL ERROR in env.step() for env {original_env_idx} (Group {group_ids[original_env_idx]}) "
+                        f"with raw LLM input: \"{assistant_reply[:200].replace(os.linesep, ' ')}...\". "
+                        f"This likely indicates a bug in the environment's step() method that needs to be fixed.",
+                        exc_info=True # This will log the full traceback of the exception 'e'
+                    )
+                    # Re-raise the original exception to halt the collect process,
+                    # making bugs in environment implementations immediately visible.
+                    raise 
+                
                 done[original_env_idx] = current_env_done_flag
                 
+                # Update history for FULL_HISTORY strategy
                 if self.history_strategy == HistoryManagement.FULL_HISTORY:
-                    if not histories[original_env_idx]:
+                    if not histories[original_env_idx]: # Initialize with system prompt if first entry
                          histories[original_env_idx].append({"role": "system", "content": envs[original_env_idx].system_prompt})
                     histories[original_env_idx].extend([
-                        {"role": "user", "content": current_obs_text},
-                        {"role": "assistant", "content": assistant_reply},
+                        {"role": "user", "content": obs_text[original_env_idx]}, # Observation that led to this action
+                        {"role": "assistant", "content": assistant_reply},      # Raw LLM reply
                     ])
                 
                 trajectories[original_env_idx]["steps"].append({
-                    "prompt": prompt_this_turn,
-                    "assistant": assistant_reply,
+                    "prompt": prompt_this_turn,    # The full prompt list of dicts sent to LLM
+                    "assistant": assistant_reply, # The raw string reply from LLM
                     "reward": reward,
-                    "raw": raw_reply_data.raw_response,
+                    "raw": raw_reply_data.raw_response if hasattr(raw_reply_data, 'raw_response') else raw_reply_data,
+                    "info_from_env": info if info else {} # Store info dict from environment
                 })
-                obs_text[original_env_idx] = next_obs
+                obs_text[original_env_idx] = next_obs # Update observation for the next turn
 
             if all(done):
-                logger.info("All %d environments completed within max_steps (after step %d processing).", n_total_envs, step_idx)
+                logger.info("All %d environments completed within max_steps (after step %d processing).", n_total_envs, step_idx + 1)
                 break
         
+        # Check if loop finished due to max_steps but not all envs were done
+        # step_idx is 0-indexed. If loop completes fully, step_idx will be self.max_steps - 1.
         if step_idx == self.max_steps - 1 and not all(done):
-             logger.info("Rollout finished due to max_steps (%d), not all environments were done.", self.max_steps)
+             active_after_max = [i for i, d_flag in enumerate(done) if not d_flag]
+             logger.info(
+                 f"Rollout finished due to max_steps ({self.max_steps}). "
+                 f"{len(active_after_max)} environments were still active: {active_after_max}."
+            )
 
         return trajectories
 
