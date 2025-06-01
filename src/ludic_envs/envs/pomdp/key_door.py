@@ -10,7 +10,7 @@ from ludic_envs.parsers import extract_tag_value
 
 from functools import partial
 
-SYSTEM_PROMPT = "You are an agent in a grid-world maze. Your goal is to find the key, use it to unlock the door, and exit."
+SYSTEM_PROMPT = "You are an agent in a grid-world maze. Your goal is to find the key, pick it up, find the door and use the key to unlock the door."
 
 
 SCRATCHPAD_INSTR = textwrap.dedent("""
