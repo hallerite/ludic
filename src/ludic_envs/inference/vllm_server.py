@@ -951,7 +951,7 @@ async def batch_processing_loop(
                             for req_state in processed_states:
                                 if req_state.completed_and_signaled:
                                     continue
-                                breakpoint()
+                                #breakpoint()
                                 request_output = llm_results[real_idx]
                                 real_idx += 1
                                 if not request_output.outputs or len(request_output.outputs) == 0:
