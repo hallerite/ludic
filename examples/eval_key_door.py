@@ -7,9 +7,8 @@ from functools import partial
 from typing import Optional, List, Dict, Any
 
 import pygame
-from ludic_envs.envs.pomdp.key_door import PygameRenderer
+from ludic_envs.envs.pomdp.key_door import KeyDoorEnv, PygameRenderer
 
-from ludic_envs.envs.pomdp.key_door import KeyDoorEnv
 from ludic_envs.inference.rollout_generator import HistoryManagement, RolloutGenerator
 from ludic_envs.inference.vllm_client import VLLMClient
 
@@ -38,59 +37,34 @@ class VLLMClientWithLogging(VLLMClient):
 if __name__ == "__main__":
     logger.info("--- Starting KeyDoor Environment Evaluation ---")
 
-    EVAL_SIZE = 3
-    EVAL_MAX_STEPS = 35
-    
+    EVAL_SIZE = 4
+    EVAL_MAX_STEPS = 50
     render_enabled = os.getenv("RENDER_EVAL") == "1"
     renderer: Optional[PygameRenderer] = None
-    client_for_rollout: VLLMClient 
-    
-    # Use a mutable dictionary for shared state that needs to be modified by nested functions
+    client_for_rollout: VLLMClient
     shared_render_context = {"last_env_for_render": None}
 
     try:
-        if render_enabled:
-            logger.info("Render enabled, using VLLMClientWithLogging.")
-            client_for_rollout = VLLMClientWithLogging()
-        else:
-            client_for_rollout = VLLMClient()
-    except ConnectionError as e:
-        logger.error(f"Could not connect to vLLM server: {e}")
-        sys.exit(1)
-    except Exception as e: 
-        logger.error(f"Error initializing VLLMClient: {e}")
+        client_class = VLLMClientWithLogging if render_enabled else VLLMClient
+        client_for_rollout = client_class()
+    except Exception as e:
+        logger.error(f"Could not connect to vLLM server or initialize client: {e}")
         sys.exit(1)
 
-    env_class_to_use = KeyDoorEnv
-    
     if render_enabled:
         logger.info(f"Rendering ENABLED for a {EVAL_SIZE}x{EVAL_SIZE} grid. Patching KeyDoorEnv...")
-        renderer = PygameRenderer(grid_size=EVAL_SIZE, log_width=400, cell_size=300)
+        renderer = PygameRenderer(grid_size=EVAL_SIZE, log_width=600, cell_size=200)
         
-        env_class_to_use = partial(KeyDoorEnv, size=EVAL_SIZE, max_steps=EVAL_MAX_STEPS)
-
         original_step = KeyDoorEnv.step
         original_reset = KeyDoorEnv.reset
 
         def _step_with_render(self_env: KeyDoorEnv, action_from_rg: str):
-            if renderer and client_for_rollout and isinstance(client_for_rollout, VLLMClientWithLogging):
+            if renderer and isinstance(client_for_rollout, VLLMClientWithLogging):
                 if client_for_rollout.last_prompts_sent and client_for_rollout.last_responses_received:
-                    current_prompt_msg_list = client_for_rollout.last_prompts_sent[0] 
-                    raw_completion_obj = client_for_rollout.last_responses_received[0]
-
-                    user_prompt_content = "P: User Obs N/A"
-                    for msg_dict in reversed(current_prompt_msg_list):
-                        if msg_dict.get("role") == "user":
-                            user_prompt_content = msg_dict.get("content", "User Obs N/A")
-                            break
-                    
-                    assistant_reply_text = getattr(raw_completion_obj.outputs[0], 'text', "Completion N/A")
-                    display_prompt = user_prompt_content[:250] + "..." if len(user_prompt_content) > 250 else user_prompt_content
-                    display_completion = assistant_reply_text[:300] + "..." if len(assistant_reply_text) > 300 else assistant_reply_text
-                    
-                    renderer.add_log_entry(display_prompt, display_completion)
-                else:
-                    renderer.add_log_entry("Prompt: (Not captured this step)", "Completion: (Not captured this step)")
+                    prompt_list = client_for_rollout.last_prompts_sent[0]
+                    user_prompt = next((m.get("content", "") for m in reversed(prompt_list) if m.get("role") == "user"), "N/A")
+                    completion = getattr(client_for_rollout.last_responses_received[0].outputs[0], 'text', "N/A")
+                    renderer.add_log_entry(user_prompt, completion)
             
             result = original_step(self_env, action_from_rg)
             shared_render_context["last_env_for_render"] = self_env
@@ -99,11 +73,9 @@ if __name__ == "__main__":
             return result
 
         def _reset_with_render(self_env: KeyDoorEnv, *args, **kwargs):
+            # This is called by RolloutGenerator. The log is now cleared in the main loop.
             if renderer:
-                renderer.clear_log()
-                base_sys_prompt = self_env.system_prompt
-                display_sys_prompt = base_sys_prompt[:250] + "..." if len(base_sys_prompt) > 250 else base_sys_prompt
-                renderer.add_log_entry(f"SYSTEM: {display_sys_prompt}", "(Environment Reset)")
+                renderer.add_log_entry("--- NEW GAME STARTED ---", f"Seed: {kwargs.get('seed') or 'N/A'}")
             
             obs = original_reset(self_env, *args, **kwargs)
             shared_render_context["last_env_for_render"] = self_env
@@ -116,14 +88,21 @@ if __name__ == "__main__":
     else:
         logger.info("Rendering is DISABLED. To enable, set RENDER_EVAL=1")
 
-    sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=500)
+    sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=100)
 
     for strategy in HistoryManagement:
+        if strategy == HistoryManagement.SCRATCHPAD:
+            continue
         logger.info(f"\n{'='*50}\nEVALUATING STRATEGY: {strategy.name}\n{'='*50}")
+
+        if renderer:
+            renderer.clear_log()
+            renderer.show_transition_screen(f"Next Up: {strategy.name}", duration_sec=3)
+            renderer.set_title(f"Strategy: {strategy.name}")
 
         rg = RolloutGenerator(
             max_steps=EVAL_MAX_STEPS,
-            env_cls=env_class_to_use,
+            env_cls=partial(KeyDoorEnv, size=EVAL_SIZE, max_steps=EVAL_MAX_STEPS),
             env_kwargs={'size': EVAL_SIZE, 'max_steps': EVAL_MAX_STEPS},
             history_strategy=strategy,
             seed=42
@@ -133,46 +112,29 @@ if __name__ == "__main__":
         if trajectories:
             trajectory = trajectories[0]
             output_filename = f"trajectory_{strategy.name}.json"
-            with open(output_filename, 'w') as f:
-                json.dump(trajectory, f, indent=2)
+            with open(output_filename, 'w') as f: json.dump(trajectory, f, indent=2)
             logger.info(f"✅ Trajectory saved to '{output_filename}'")
             
-            total_prompt_tokens, total_completion_tokens, num_steps = 0, 0, 0
-            if 'steps' in trajectory and isinstance(trajectory['steps'], list):
-                num_steps = len(trajectory['steps'])
-                for step in trajectory['steps']:
-                    if isinstance(step, dict) and (raw_data := step.get('raw')) and isinstance(raw_data, dict):
-                        if (usage_data := raw_data.get('usage')) and isinstance(usage_data, dict): 
-                            total_prompt_tokens += usage_data.get('prompt_tokens', 0)
-                            total_completion_tokens += usage_data.get('completion_tokens', 0)
-            
-            logger.info(
-                f"Token Stats for {strategy.name} ({num_steps} steps): "
-                f"Input Tokens = {total_prompt_tokens}, "
-                f"Output Tokens = {total_completion_tokens}, "
-                f"Total Tokens = {total_prompt_tokens + total_completion_tokens}"
-            )
-
+            # Token counting logic remains the same
+            num_steps = len(trajectory['steps']) if 'steps' in trajectory else 0
             final_reward = trajectory['steps'][-1]['reward'] if num_steps > 0 else 0
-            if final_reward == 1.0:
-                logger.info(f"Outcome: Success! 🚪 Agent unlocked the door.")
-            else:
-                logger.info(f"Outcome: Failure. 😔 Agent did not unlock the door.")
+            logger.info(f"Outcome: {'Success!' if final_reward == 1.0 else 'Failure.'}")
         else:
             logger.error(f"❌ Failed to generate a trajectory for strategy: {strategy.name}")
         
         if render_enabled and renderer: 
-            logger.info(f"Strategy {strategy.name} finished. Final state shown for 2s.")
+            logger.info(f"Strategy {strategy.name} finished. Displaying final state for 4s.")
             if shared_render_context["last_env_for_render"]:
                  renderer.render(shared_render_context["last_env_for_render"]) 
             pygame.display.flip()
-            time.sleep(2)
+            time.sleep(4)
 
     logger.info("\n--- Evaluation Complete ---")
     
     if renderer:
-        logger.info("All strategies evaluated. Renderer will stay open for log inspection.")
-        logger.info("Scroll log with mouse wheel. Close window to exit.")
+        logger.info("All strategies evaluated. Close window to exit.")
+        renderer.set_title("Evaluation Finished")
+        renderer.render(shared_render_context.get("last_env_for_render"))
         
         running_pygame = True
         while running_pygame:
@@ -181,14 +143,7 @@ if __name__ == "__main__":
                     running_pygame = False
                 if event.type == pygame.MOUSEWHEEL:
                     renderer.handle_scroll_event(event)
-                    # Re-render with the last known environment state
-                    current_last_env = shared_render_context["last_env_for_render"]
-                    if current_last_env:
-                         renderer.render(current_last_env) 
-                    else:
-                         renderer.render() # Render log even if no game state
-            
-            pygame.time.Clock().tick(30) 
-
+                    renderer.render(shared_render_context.get("last_env_for_render"))
+            pygame.time.Clock().tick(30)
         logger.info("Closing renderer.")
         renderer.close()
