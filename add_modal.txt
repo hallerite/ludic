@@ -1,0 +1,673 @@
+# Modal Apps Plan for ludic_envs
+
+## 1. Training Modal App (`modal_training.py`)
+
+### Overview
+A Modal app that provisions GPU resources and runs distributed GRPO training on RL environments using the EnvGRPOTrainer.
+
+### Key Features
+- **Multi-GPU Training**: Support for tensor parallel and data parallel training
+- **Environment Flexibility**: Support for both MDP (TicTacToe) and POMDP (KeyDoor) environments
+- **vLLM Integration**: Uses vLLM for efficient inference during rollout collection
+- **Distributed Setup**: Handles multi-node training with proper communication setup
+- **Model Checkpointing**: Automatic model saving and resumption capabilities
+- **Weights & Biases Integration**: Training monitoring and logging
+
+### Modal App Structure with Authentication
+```python
+# Import Modal and set up image with dependencies
+import modal
+from modal import Image, App, gpu, method, Secret, web_endpoint
+import os
+from argon2 import PasswordHasher
+from fastapi import HTTPException, Request, Depends
+from pydantic import BaseModel
+
+# Create training image with all dependencies  
+training_image = (
+    Image.debian_slim(python_version="3.11")
+    .pip_install([
+        "torch>=2.7.0",
+        "vllm>=0.8.5.post1", 
+        "trl",
+        "transformers",
+        "datasets",
+        "wandb",
+        "accelerate",
+        "deepspeed",
+        "fastapi",
+        "pydantic",
+        "argon2-cffi"
+    ])
+    .apt_install(["git"])
+    .pip_install("git+https://github.com/your-repo/ludic-envs.git")  # Install ludic_envs
+)
+
+app = App("ludic-training")
+
+# Authentication models
+class TrainingRequest(BaseModel):
+    password: str
+    model_name: str
+    env_type: str  # "key_door" or "tic_tac_toe"
+    output_dir: str
+    # Training hyperparameters
+    learning_rate: float = 1e-5
+    batch_size: int = 32
+    max_steps: int = 1000
+    # Environment parameters
+    env_size: int = 4
+    rollout_max_steps: int = 50
+    # vLLM parameters
+    tensor_parallel_size: int = 2
+    # Monitoring
+    wandb_project: str = "ludic-training"
+
+ph = PasswordHasher()
+
+def verify_password(provided_password: str) -> bool:
+    """Verify password against stored Argon2 hash"""
+    expected_hash = os.environ.get("LUDIC_PASSWORD_HASH")
+    if not expected_hash:
+        raise HTTPException(status_code=500, detail="Password not configured")
+    try:
+        ph.verify(expected_hash, provided_password)
+        return True
+    except Exception:
+        return False
+
+def require_https(request: Request):
+    if request.url.scheme != "https":
+        raise HTTPException(status_code=400, detail="HTTPS required")
+    return True
+
+@app.cls(
+    image=training_image,
+    gpu=gpu.A100(count=4),  # 4x A100 for training
+    timeout=3600 * 4,       # 4 hour timeout
+    secrets=[
+        Secret.from_name("huggingface-secret"), 
+        Secret.from_name("wandb-secret"),
+        Secret.from_name("ludic-auth-secret")  # Contains LUDIC_PASSWORD_HASH
+    ]
+)
+class GRPOTrainer:
+    def __init__(self):
+        # Initialize distributed training setup
+        pass
+    
+    @web_endpoint(method="POST", docs=True)
+    def start_training(self, request: TrainingRequest, _=Depends(require_https)):
+        """Start a training job with password authentication"""
+        # Verify password first
+        if not verify_password(request.password):
+            raise HTTPException(status_code=401, detail="Invalid password")
+        
+        # Start training job
+        job_id = f"training_{hash(str(request.dict()))}"
+        
+        # Spawn training in background
+        training_result = self.train.spawn(
+            model_name=request.model_name,
+            env_type=request.env_type,
+            output_dir=request.output_dir,
+            learning_rate=request.learning_rate,
+            batch_size=request.batch_size,
+            max_steps=request.max_steps,
+            env_size=request.env_size,
+            rollout_max_steps=request.rollout_max_steps,
+            tensor_parallel_size=request.tensor_parallel_size,
+            wandb_project=request.wandb_project
+        )
+        
+        return {
+            "job_id": job_id,
+            "status": "started",
+            "message": f"Training job started for {request.model_name} on {request.env_type}",
+            "modal_call_id": training_result.object_id
+        }
+    
+    @method()
+    def train(
+        self,
+        model_name: str,
+        env_type: str,
+        output_dir: str,
+        learning_rate: float = 1e-5,
+        batch_size: int = 32,
+        max_steps: int = 1000,
+        env_size: int = 4,
+        rollout_max_steps: int = 50,
+        tensor_parallel_size: int = 2,
+        wandb_project: str = "ludic-training"
+    ):
+        # Main training logic using EnvGRPOTrainer
+        print(f"Starting training: {model_name} on {env_type}")
+        
+        # Import training components
+        from ludic_envs.trainers.trl.grpo import EnvGRPOTrainer
+        from ludic_envs.envs.pomdp.key_door import KeyDoorEnv
+        from ludic_envs.envs.mdp.tic_tac_toe import TicTacToeEnv
+        from trl import GRPOConfig
+        
+        # Set up environment class
+        env_cls = KeyDoorEnv if env_type == "key_door" else TicTacToeEnv
+        
+        # Configure training
+        config = GRPOConfig(
+            model_name=model_name,
+            learning_rate=learning_rate,
+            per_device_train_batch_size=batch_size,
+            max_steps=max_steps,
+            use_vllm=True,
+            vllm_mode="colocate",
+            tensor_parallel_size=tensor_parallel_size,
+            output_dir=output_dir,
+            logging_steps=10,
+            save_steps=100,
+            report_to="wandb",
+            run_name=f"{model_name}_{env_type}_{wandb_project}"
+        )
+        
+        # Initialize trainer
+        trainer = EnvGRPOTrainer(
+            env_cls=env_cls,
+            model=model_name,
+            args=config,
+            rollout_max_steps=rollout_max_steps,
+            env_kwargs={"size": env_size} if env_type == "key_door" else {}
+        )
+        
+        # Run training
+        trainer.train()
+        
+        # Save final model
+        trainer.save_model(output_dir)
+        
+        return {
+            "status": "completed",
+            "output_dir": output_dir,
+            "final_step": max_steps
+        }
+```
+
+### Training Workflow
+1. **Environment Setup**: Initialize the specified environment (KeyDoor/TicTacToe) with provided parameters
+2. **Model Loading**: Load the base model and set up for GRPO training
+3. **vLLM Server**: Start colocated vLLM engine for rollout generation
+4. **Distributed Training**: Configure multi-GPU training with proper NCCL setup
+5. **Training Loop**: Run GRPO training with environment rollouts and policy updates
+6. **Checkpointing**: Save model checkpoints to Modal volumes/cloud storage
+7. **Monitoring**: Log metrics to Weights & Biases
+
+### Configuration Options
+- **Environment Parameters**: Grid size, max steps, difficulty settings
+- **Training Parameters**: Learning rate, batch size, optimization settings
+- **vLLM Parameters**: Model parallelism, memory utilization, sampling parameters
+- **Infrastructure**: GPU type/count, timeout, storage options
+
+---
+
+## 2. Inference Modal App (`modal_inference.py`)
+
+### Overview
+A Modal app that provides scalable inference services for trained models, supporting both single-shot evaluation and interactive rollout generation.
+
+### Key Features
+- **Scalable vLLM Server**: Auto-scaling inference server with load balancing
+- **Environment Evaluation**: Run policy evaluation on environments with different strategies
+- **Interactive Rollouts**: Generate trajectories for analysis and debugging
+- **Multiple History Strategies**: Support for NO_HISTORY, FULL_HISTORY, SCRATCHPAD modes
+- **Real-time Monitoring**: Performance metrics and request tracking
+- **API Endpoints**: RESTful API for various inference tasks
+
+### Modal App Structure with Authentication
+```python
+import modal
+from modal import Image, App, gpu, web_endpoint, method, Secret
+import os
+from argon2 import PasswordHasher
+from fastapi import HTTPException, Depends, status, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
+
+# Create inference image
+inference_image = (
+    Image.debian_slim(python_version="3.11")
+    .pip_install([
+        "torch>=2.7.0",
+        "vllm>=0.8.5.post1",
+        "fastapi",
+        "uvicorn",
+        "pydantic",
+        "argon2-cffi"
+    ])
+    .pip_install("git+https://github.com/your-repo/ludic-envs.git")
+)
+
+app = App("ludic-inference")
+
+# Authentication models
+security = HTTPBearer()
+
+class EvaluationRequest(BaseModel):
+    password: str
+    model_path: str
+    env_type: str
+    env_config: dict = {}
+    eval_episodes: int = 10
+    history_strategy: str = "NO_HISTORY"
+
+class RolloutRequest(BaseModel):
+    password: str
+    model_path: str
+    env_type: str
+    env_config: dict = {}
+    max_steps: int = 50
+    sampling_params: Optional[dict] = None
+
+ph = PasswordHasher()
+
+def require_https(request: Request):
+    if request.url.scheme != "https":
+        raise HTTPException(status_code=400, detail="HTTPS required")
+    return True
+
+def verify_password(provided_password: str) -> bool:
+    """Verify password against stored Argon2 hash"""
+    expected_hash = os.environ.get("LUDIC_PASSWORD_HASH")
+    if not expected_hash:
+        raise HTTPException(status_code=500, detail="Password not configured")
+    try:
+        ph.verify(expected_hash, provided_password)
+        return True
+    except Exception:
+        return False
+
+@app.cls(
+    image=inference_image,
+    gpu=gpu.A100(count=2),
+    container_idle_timeout=300,
+    allow_concurrent_inputs=10,
+    secrets=[Secret.from_name("ludic-auth-secret")]  # Contains LUDIC_PASSWORD_HASH
+)
+class InferenceService:
+    def __init__(self):
+        # Initialize vLLM server and rollout generator
+        from ludic_envs.inference.vllm_client import VLLMClient
+        from ludic_envs.inference.rollout_generator import RolloutGenerator, HistoryManagement
+        
+        self.client = None  # Initialize lazily
+        self.rollout_generators = {}  # Cache generators by env type
+    
+    def _get_client(self):
+        """Lazy initialization of vLLM client"""
+        if self.client is None:
+            from ludic_envs.inference.vllm_client import VLLMClient
+            self.client = VLLMClient()
+        return self.client
+    
+    def _get_rollout_generator(self, env_type: str, env_config: dict, max_steps: int, history_strategy: str):
+        """Get or create rollout generator for environment"""
+        from ludic_envs.envs.pomdp.key_door import KeyDoorEnv
+        from ludic_envs.envs.mdp.tic_tac_toe import TicTacToeEnv
+        from ludic_envs.inference.rollout_generator import RolloutGenerator, HistoryManagement
+        
+        env_cls = KeyDoorEnv if env_type == "key_door" else TicTacToeEnv
+        history_enum = getattr(HistoryManagement, history_strategy)
+        
+        key = f"{env_type}_{max_steps}_{history_strategy}_{hash(str(env_config))}"
+        
+        if key not in self.rollout_generators:
+            self.rollout_generators[key] = RolloutGenerator(
+                env_cls=env_cls,
+                max_steps=max_steps,
+                history_strategy=history_enum,
+                env_kwargs=env_config
+            )
+        
+        return self.rollout_generators[key]
+    
+    @web_endpoint(method="POST", docs=True)
+    def evaluate_policy(self, request: EvaluationRequest, _=Depends(require_https)):
+        """Run policy evaluation with password authentication"""
+        # Verify password
+        if not verify_password(request.password):
+            raise HTTPException(status_code=401, detail="Invalid password")
+        
+        try:
+            client = self._get_client()
+            rollout_gen = self._get_rollout_generator(
+                request.env_type, 
+                request.env_config, 
+                50,  # max_steps for evaluation
+                request.history_strategy
+            )
+            
+            # Run evaluation episodes
+            all_trajectories = []
+            total_reward = 0
+            success_count = 0
+            
+            from vllm import SamplingParams
+            sampling_params = SamplingParams(temperature=0.1, max_tokens=100)
+            
+            for episode in range(request.eval_episodes):
+                trajectories = rollout_gen.collect(
+                    batch_size=1, 
+                    model=client, 
+                    sampling_params=sampling_params
+                )
+                
+                if trajectories:
+                    traj = trajectories[0]
+                    episode_reward = sum(step["reward"] for step in traj["steps"])
+                    total_reward += episode_reward
+                    
+                    # Count success (assuming reward > 0.5 indicates success)
+                    if episode_reward > 0.5:
+                        success_count += 1
+                    
+                    all_trajectories.append({
+                        "episode": episode,
+                        "reward": episode_reward,
+                        "steps": len(traj["steps"]),
+                        "trajectory": traj
+                    })
+            
+            return {
+                "model_path": request.model_path,
+                "env_type": request.env_type,
+                "eval_episodes": request.eval_episodes,
+                "history_strategy": request.history_strategy,
+                "results": {
+                    "mean_reward": total_reward / request.eval_episodes,
+                    "success_rate": success_count / request.eval_episodes,
+                    "total_episodes": request.eval_episodes
+                },
+                "trajectories": all_trajectories
+            }
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Evaluation failed: {str(e)}")
+    
+    @web_endpoint(method="POST", docs=True) 
+    def generate_rollout(self, request: RolloutRequest, _=Depends(require_https)):
+        """Generate single rollout trajectory with password authentication"""
+        # Verify password
+        if not verify_password(request.password):
+            raise HTTPException(status_code=401, detail="Invalid password")
+        
+        try:
+            client = self._get_client()
+            rollout_gen = self._get_rollout_generator(
+                request.env_type,
+                request.env_config, 
+                request.max_steps,
+                "NO_HISTORY"  # Default for single rollouts
+            )
+            
+            # Set up sampling parameters
+            from vllm import SamplingParams
+            if request.sampling_params:
+                sampling_params = SamplingParams(**request.sampling_params)
+            else:
+                sampling_params = SamplingParams(temperature=0.7, max_tokens=100)
+            
+            # Generate trajectory
+            trajectories = rollout_gen.collect(
+                batch_size=1,
+                model=client,
+                sampling_params=sampling_params
+            )
+            
+            if not trajectories:
+                raise HTTPException(status_code=500, detail="Failed to generate trajectory")
+            
+            trajectory = trajectories[0]
+            episode_reward = sum(step["reward"] for step in trajectory["steps"])
+            
+            return {
+                "model_path": request.model_path,
+                "env_type": request.env_type,
+                "max_steps": request.max_steps,
+                "trajectory": trajectory,
+                "summary": {
+                    "total_reward": episode_reward,
+                    "steps_taken": len(trajectory["steps"]),
+                    "final_reward": trajectory["steps"][-1]["reward"] if trajectory["steps"] else 0
+                }
+            }
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Rollout generation failed: {str(e)}")
+    
+    @web_endpoint(method="GET", docs=True)
+    def health_check(self):
+        """Health check endpoint (no authentication required)"""
+        return {
+            "status": "healthy",
+            "service": "ludic-inference",
+            "gpu_available": True  # Could check actual GPU status
+        }
+```
+
+### Inference Services
+1. **Policy Evaluation**: 
+   - Run multiple episodes with different history strategies
+   - Compute success rates, average rewards, step counts
+   - Support for both MDP and POMDP environments
+
+2. **Rollout Generation**:
+   - Generate single or batch trajectories
+   - Configurable sampling parameters
+   - Return detailed step-by-step information
+
+3. **Model Comparison**:
+   - Compare multiple models on same environments
+   - A/B testing capabilities
+   - Performance benchmarking
+
+4. **Interactive Debugging**:
+   - Step-by-step execution with pausing
+   - Intermediate state inspection
+   - Custom intervention capabilities
+
+### API Endpoints
+- `POST /evaluate` - Run policy evaluation
+- `POST /rollout` - Generate rollouts
+- `POST /compare` - Compare multiple models
+- `GET /models` - List available models
+- `GET /environments` - List available environments
+- `GET /health` - Health check
+
+### Auto-scaling Configuration
+- **Cold Start Optimization**: Pre-warm containers with common models
+- **Dynamic Scaling**: Scale based on request volume and latency
+- **Resource Management**: Efficient GPU memory usage with model caching
+- **Load Balancing**: Distribute requests across multiple instances
+
+---
+
+## Authentication Setup & Usage
+
+### Setting Up Password Authentication
+
+1. **Create Password Hash**:
+```bash
+# Generate Argon2 password hash (replace 'your_secret_password' with actual password)
+python -c "from argon2 import PasswordHasher; ph = PasswordHasher(); print(ph.hash('your_secret_password'))"
+```
+
+2. **Create Modal Secret**:
+```bash
+# Create secret containing the password hash
+modal secret create ludic-auth-secret LUDIC_PASSWORD_HASH=<your_hash_from_step_1>
+```
+
+3. **Deploy Apps**:
+```bash
+# Deploy training app
+modal deploy modal_training.py
+
+# Deploy inference app  
+modal deploy modal_inference.py
+```
+
+### Usage Examples
+
+#### Training a Model
+```python
+import requests
+
+# Your friend uses this to start training
+training_request = {
+    "password": "your_secret_password",
+    "model_name": "microsoft/DialoGPT-medium", 
+    "env_type": "key_door",
+    "output_dir": "/tmp/trained_model",
+    "learning_rate": 1e-5,
+    "batch_size": 16,
+    "max_steps": 500,
+    "env_size": 4,
+    "rollout_max_steps": 50,
+    "wandb_project": "my_ludic_experiment"
+}
+
+response = requests.post(
+    "https://your-username--ludic-training-grpotrainer-start-training.modal.run",
+    json=training_request
+)
+print(response.json())
+```
+
+#### Running Inference/Evaluation
+```python
+import requests
+
+# Evaluate a trained model
+eval_request = {
+    "password": "your_secret_password",
+    "model_path": "/path/to/trained/model",
+    "env_type": "key_door", 
+    "env_config": {"size": 4},
+    "eval_episodes": 10,
+    "history_strategy": "NO_HISTORY"
+}
+
+response = requests.post(
+    "https://your-username--ludic-inference-inferenceservice-evaluate-policy.modal.run",
+    json=eval_request
+)
+results = response.json()
+print(f"Success rate: {results['results']['success_rate']}")
+print(f"Mean reward: {results['results']['mean_reward']}")
+```
+
+#### Generate Single Rollout
+```python
+# Generate a single trajectory
+rollout_request = {
+    "password": "your_secret_password",
+    "model_path": "/path/to/model",
+    "env_type": "tic_tac_toe",
+    "max_steps": 20,
+    "sampling_params": {"temperature": 0.8, "max_tokens": 50}
+}
+
+response = requests.post(
+    "https://your-username--ludic-inference-inferenceservice-generate-rollout.modal.run", 
+    json=rollout_request
+)
+trajectory = response.json()
+print(f"Total reward: {trajectory['summary']['total_reward']}")
+```
+
+### Security Features
+
+- **Argon2 Password Hashing**: Passwords are hashed with Argon2id (secure, memory-hard algorithm)
+- **HTTPS Enforcement**: All authenticated endpoints require HTTPS connections
+- **Modal Secrets**: Passwords stored securely in Modal's secret management
+- **No Logs**: Passwords are not logged in application output
+- **Individual Endpoints**: Each endpoint requires password authentication
+
+### Sharing Access
+
+To give your friend access:
+
+1. Share the password you set up
+2. Share the Modal endpoint URLs (visible in Modal dashboard after deployment)
+3. Provide example code above with your specific URLs
+
+Your friend can then:
+- Start training jobs on your infrastructure
+- Run evaluations and generate rollouts  
+- Monitor job status and results
+- Access the auto-generated API documentation at the `/docs` endpoint
+
+### Cost Control
+
+- **GPU Auto-shutdown**: Containers automatically shut down when idle
+- **Request Limits**: Configure `allow_concurrent_inputs` to limit parallel requests
+- **Timeout Controls**: Set maximum job duration to prevent runaway costs
+- **Usage Monitoring**: Track usage in Modal dashboard
+
+---
+
+## Implementation Priorities
+
+### Phase 1: Basic Training App
+1. Single-GPU GRPO training on KeyDoor environment
+2. Basic checkpointing and logging
+3. Simple configuration management
+
+### Phase 2: Enhanced Training App  
+1. Multi-GPU distributed training
+2. Support for multiple environments
+3. Advanced hyperparameter tuning
+4. Weights & Biases integration
+
+### Phase 3: Basic Inference App
+1. vLLM server with OpenAI-compatible API
+2. Simple rollout generation
+3. Basic evaluation metrics
+
+### Phase 4: Advanced Inference App
+1. Auto-scaling inference service
+2. Multiple history strategies
+3. Model comparison tools
+4. Real-time monitoring dashboard
+
+### Phase 5: Integration & Optimization
+1. Seamless training-to-inference pipeline
+2. Advanced caching and optimization
+3. Cost optimization strategies
+4. Production-ready monitoring and alerting
+
+---
+
+## Technical Considerations
+
+### Resource Management
+- **GPU Memory**: Efficient vLLM memory management for large models
+- **CPU Resources**: Proper allocation for environment simulation
+- **Storage**: Modal volumes for model checkpoints and data
+
+### Security & Access Control
+- **API Authentication**: Secure access to inference endpoints
+- **Model Access**: Controlled access to trained models
+- **Data Privacy**: Secure handling of training data and trajectories
+
+### Monitoring & Observability
+- **Training Metrics**: Loss, reward, convergence tracking
+- **Inference Metrics**: Latency, throughput, error rates
+- **Resource Usage**: GPU utilization, memory consumption, cost tracking
+
+### Integration Points
+- **Hugging Face Hub**: Model loading and saving
+- **Weights & Biases**: Experiment tracking
+- **Cloud Storage**: Checkpoint and data persistence
+- **Notification Systems**: Training completion alerts
+
+This plan provides a comprehensive framework for deploying ludic_envs training and inference capabilities on Modal, with scalability, monitoring, and production-readiness as key design principles.
