@@ -123,6 +123,8 @@ class EnvGRPOTrainer(GRPOTrainer):
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Any]]
     ) -> dict[str, Any]:
+        device = self.accelerator.device
+        #breakpoint()
         rollout_sampling_params = self._get_rollout_sampling_params()
         
         trajectories = self.rollout_gen.collect(
@@ -145,8 +147,17 @@ class EnvGRPOTrainer(GRPOTrainer):
         grp_mean = grp_sum / grp_cnt.clamp(min=1)
         adv_env = env_returns_t - grp_mean[env_gids_t]
 
+        # ----------------------------------------------------------------
+        mode = "train" if self.model.training else "eval"
+        self._metrics[mode]["env/reward_mean"].append(env_returns_t.mean().item())
+        self._metrics[mode]["env/reward_std"].append(env_returns_t.std().item())
+        self._metrics[mode]["env/advantage_mean"].append(adv_env.mean().item())
+        self._metrics[mode]["env/advantage_std"].append(adv_env.std().item())
+        # ----------------------------------------------------------------
+
         prompts_for_policy_model = []
         completions_from_rollout = []
+        
         advantages_for_policy_model = []
 
         for env_idx, traj in enumerate(trajectories):
@@ -156,6 +167,8 @@ class EnvGRPOTrainer(GRPOTrainer):
                 advantages_for_policy_model.append(adv_env[env_idx])
 
         advantages_tensor = torch.tensor(advantages_for_policy_model, dtype=torch.float32, device=device)
+
+        grp_mean = grp_sum / grp_cnt.clamp(min=1)
         
         prompt_texts_for_policy = [
             self.processing_class.apply_chat_template(
@@ -185,12 +198,12 @@ class EnvGRPOTrainer(GRPOTrainer):
             max_length=self.max_completion_length, # From GRPOConfig
             add_special_tokens=False, 
         ).to(device)
-        
+
         return {
             "prompt_ids": tok_prompt.input_ids,
             "prompt_mask": tok_prompt.attention_mask,
             "completion_ids": tok_comp.input_ids,
-            "completion_mask": tok_comp.attention_mask,
-            "advantages": advantages_tensor,
+            "completion_mask": tok_comp.attention_mask.int(), # turn into int32 to match TRL,
+            "advantages": advantages_tensor.to(device),
             "old_per_token_logps": None,
         }
