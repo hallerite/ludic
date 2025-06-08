@@ -15,6 +15,6 @@ class Env(ABC):
     def step(self, action: str) -> Tuple:
         pass
     
-    @abstractmethod
-    def parse_action(self, action_str: str) -> Any:
-        pass
+    #@abstractmethod
+    #def parse_action(self, action_str: str) -> Any:
+    #    pass
