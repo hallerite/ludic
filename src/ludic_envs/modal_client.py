@@ -172,6 +172,6 @@ if __name__ == "__main__":
 
 # Example usage:
 # python -m ludic_envs.modal_client --base-url your-username --password your_password --action health
-# python -m ludic_envs.modal_client --base-url your-username --password your_password --action train --model-name microsoft/DialoGPT-medium --env-type key_door --output-dir /tmp/model
+# python -m ludic_envs.modal_client --base-url your-username --password your_password --action train --model-name Qwen/Qwen2.5-1.5B-Instruct --env-type key_door --output-dir /tmp/model
 # python -m ludic_envs.modal_client --base-url your-username --password your_password --action evaluate --model-path /tmp/model --env-type key_door
 # python -m ludic_envs.modal_client --base-url your-username --password your_password --action rollout --model-path /tmp/model --env-type tic_tac_toe

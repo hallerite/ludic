@@ -25,7 +25,7 @@ training_image = (
         "argon2-cffi"
     ])
     .apt_install(["git"])
-    .run_commands("cd /tmp && git clone https://github.com/joshuapurtell/ludic.git && cd ludic && pip install -e .")
+    .run_commands("cd /tmp && git clone https://github.com/hallerite/ludic.git && cd ludic && pip install -e .")
 )
 
 app = App("ludic-training")

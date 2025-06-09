@@ -20,7 +20,7 @@ inference_image = (
         "pydantic",
         "argon2-cffi"
     ])
-    .run_commands("cd /tmp && git clone https://github.com/joshuapurtell/ludic.git && cd ludic && pip install -e .")
+    .run_commands("cd /tmp && git clone https://github.com/hallerite/ludic.git && cd ludic && pip install -e .")
 )
 
 app = App("ludic-inference")
