@@ -5,10 +5,14 @@ description = "an llm-rl environments framework for the era of experience"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "datasets>=3.6.0",
+    "huggingface>=0.0.1",
     "pydantic>=2.11.5",
     "pygame>=2.6.1",
     "torch>=2.7.0",
+    "trl>=0.18.0",
     "vllm>=0.8.5.post1",
+    "wandb>=0.20.1",
 ]
 
 [project.optional-dependencies]
@@ -18,11 +22,6 @@ dev = [
     "ruff",
 ]
 
-hf = [
-    "huggingface",
-    "datasets",
-    "trl"
-]
 
 
 [build-system]
