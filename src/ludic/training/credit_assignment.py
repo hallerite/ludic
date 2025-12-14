@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Callable, Hashable, TYPE_CHECKING
 
 import torch
 from ludic.types import Rollout
 from ludic.training.types import RolloutStepKey
+
+if TYPE_CHECKING:
+    from ludic.training.value_tracker import ValueTracker
+
+PromptKeyFn = Callable[[Rollout], Hashable]
 
 
 # ---- Credit Assigners ----
@@ -176,5 +181,118 @@ class EpisodicReturn:
             for step in r.steps:
                 key: RolloutStepKey = (r.id, step.index)
                 out[key] = R_ep
+
+        return out
+
+
+# ---- Helper for SPO prompt key extraction ----
+
+
+def default_prompt_key_fn(r: Rollout) -> Hashable:
+    """
+    Default prompt key extraction for SPO.
+
+    Priority:
+    1. prompt_id from request_meta (if provided)
+    2. First step's prev_obs (the prompt string)
+    """
+    request_meta = r.meta.get("request_meta", {})
+    if "prompt_id" in request_meta:
+        return request_meta["prompt_id"]
+    if r.steps:
+        return r.steps[0].prev_obs
+    return r.id  # fallback to rollout id
+
+
+class SPOReturn:
+    """
+    Single-stream Policy Optimization (SPO) credit assignment.
+
+    Computes advantages using a persistent value tracker instead of group baselines:
+
+        A(x, y) = R(x, y) - v̂(x)
+
+    where v̂(x) is a Bayesian estimate of the prompt's success probability,
+    maintained across batches.
+
+    Key differences from GRPO:
+    - No grouping: each rollout is independent
+    - Global normalization across entire batch
+    - Persistent baseline via ValueTracker
+    - Naturally handles variable-time rollouts (no sync barrier)
+
+    Reference: "Single-stream Policy Optimization" (Xu & Ding, 2025)
+
+    Args:
+        tracker: ValueTracker instance (persistent, shared across batches).
+        normalize_adv: Whether to normalize advantages globally (recommended).
+        prompt_key_fn: Function to extract prompt key from rollout.
+            Default looks for prompt_id in request_meta, falls back to prev_obs.
+        update_tracker: Whether to update tracker after computing advantages.
+    """
+
+    def __init__(
+        self,
+        tracker: "ValueTracker",
+        normalize_adv: bool = True,
+        prompt_key_fn: Optional[PromptKeyFn] = None,
+        update_tracker: bool = True,
+    ):
+        self.tracker = tracker
+        self.normalize_adv = normalize_adv
+        self.prompt_key_fn = prompt_key_fn or default_prompt_key_fn
+        self.update_tracker = update_tracker
+
+    def compute(
+        self,
+        rollouts: List[Rollout],
+    ) -> Dict[RolloutStepKey, float]:
+        """
+        Compute SPO advantages for a batch of rollouts.
+
+        Steps:
+        1. Extract prompt key and reward for each rollout
+        2. Compute raw advantage: A = R - v̂_prev (using pre-update baseline)
+        3. (Optional) Update tracker with new observations
+        4. (Optional) Normalize advantages globally
+        5. Assign advantage to all steps in each rollout
+        """
+        if not rollouts:
+            return {}
+
+        out: Dict[RolloutStepKey, float] = {}
+
+        # 1. Compute raw advantages using pre-update baselines
+        raw_advantages: List[float] = []
+        rollout_rewards: List[tuple] = []  # (rollout, prompt_key, reward)
+
+        for r in rollouts:
+            prompt_key = self.prompt_key_fn(r)
+            reward = float(r.total_reward)
+            baseline = self.tracker.get_baseline(prompt_key)
+            raw_adv = reward - baseline
+            raw_advantages.append(raw_adv)
+            rollout_rewards.append((r, prompt_key, reward))
+
+        # 2. Update tracker with new observations (after getting baselines)
+        if self.update_tracker:
+            for r, prompt_key, reward in rollout_rewards:
+                # For now, use kl=0 (no KL tracking yet)
+                # TODO: integrate KL computation from model if available
+                self.tracker.update(prompt_key, reward, kl=0.0)
+
+        # 3. Global normalization
+        advantages = torch.tensor(raw_advantages, dtype=torch.float32)
+        if self.normalize_adv and len(advantages) > 1:
+            mean = advantages.mean()
+            std = advantages.std(unbiased=False)
+            advantages = (advantages - mean) / (std + 1e-8)
+
+        # 4. Assign to all steps
+        for i, (r, _, _) in enumerate(rollout_rewards):
+            adv = advantages[i].item()
+            for step in r.steps:
+                key: RolloutStepKey = (r.id, step.index)
+                out[key] = adv
 
         return out

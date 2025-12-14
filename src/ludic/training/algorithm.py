@@ -14,7 +14,8 @@ from ludic.training.loss import (
     ClippedSurrogateLoss,
     selective_log_softmax,
 )
-from ludic.training.credit_assignment import MonteCarloReturn, GroupNormalizedReturn
+from ludic.training.credit_assignment import MonteCarloReturn, GroupNormalizedReturn, SPOReturn
+from ludic.training.value_tracker import ValueTracker
 
 
 Batch = Mapping[str, Tensor]
@@ -322,3 +323,60 @@ def make_grpo(
         loss=loss,
         preprocess=preprocess,
     )
+
+
+def make_spo(
+    *,
+    tracker: Optional[ValueTracker] = None,
+    normalize_adv: bool = True,
+    clip_eps: float = 0.2,
+    length_normalize: bool = False,
+    name: str = "spo",
+    backfill_chunk_size: Optional[int] = None,
+) -> tuple[RLAlgorithm, ValueTracker]:
+    """
+    Single-stream Policy Optimization (SPO) preset.
+
+    SPO replaces GRPO's group-based baselines with a persistent per-prompt
+    value tracker, eliminating:
+    - Degenerate groups (all-correct or all-incorrect → zero gradient)
+    - Synchronization barriers (no waiting for slowest group member)
+
+    Reference: "Single-stream Policy Optimization" (Xu & Ding, 2025)
+
+    Args:
+        tracker: Optional ValueTracker instance. If None, creates a new one.
+            Pass an existing tracker to maintain state across training runs.
+        normalize_adv: Whether to normalize advantages globally across batch.
+        clip_eps: PPO clipping epsilon for the surrogate objective.
+        length_normalize: Whether to normalize log-probs by action length.
+        name: Algorithm name for logging/metrics.
+        backfill_chunk_size: Chunk size for teacher-forced logprob backfill.
+
+    Returns:
+        Tuple of (RLAlgorithm, ValueTracker). The tracker is returned so you
+        can persist it across training sessions or inspect its state.
+
+    Example:
+        algo, tracker = make_spo()
+        # tracker maintains per-prompt value estimates across batches
+        # no grouping needed - each rollout is independent
+    """
+    if tracker is None:
+        tracker = ValueTracker()
+
+    credit_assigner = SPOReturn(
+        tracker=tracker,
+        normalize_adv=normalize_adv,
+    )
+    loss: Loss = ClippedSurrogateLoss(clip_eps=clip_eps, length_normalize=length_normalize)
+    preprocess = make_old_logprob_preprocessor(backfill_chunk_size=backfill_chunk_size)
+
+    algo = RLAlgorithm(
+        name=name,
+        credit_assigner=credit_assigner,
+        loss=loss,
+        preprocess=preprocess,
+    )
+
+    return algo, tracker

@@ -21,13 +21,16 @@ from .algorithm import (
     make_reinforce,
     make_reinforce_baseline,
     make_grpo,
+    make_spo,
 )
 from .credit_assignment import (
     GroupNormalizedReturn,
     MonteCarloReturn,
     PerStepReward,
     EpisodicReturn,
+    SPOReturn,
 )
+from .value_tracker import ValueTracker
 from .loss import (
     Loss,
     ReinforceLoss,
@@ -69,11 +72,14 @@ __all__ = [
     "make_reinforce",
     "make_reinforce_baseline",
     "make_grpo",
+    "make_spo",
     # Credit assignment
     "GroupNormalizedReturn",
     "MonteCarloReturn",
     "PerStepReward",
     "EpisodicReturn",
+    "SPOReturn",
+    "ValueTracker",
     # Losses
     "Loss",
     "ReinforceLoss",
