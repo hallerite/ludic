@@ -12,6 +12,7 @@ from .intra_batch_control import (
     IdentityStrategy,
     GRPORequestStrategy
 )
+from .teacher_annotated import TeacherAnnotatedBatchSource, annotate_teacher_logprobs
 from .requests_from_dataset import (
     RequestsExhausted,
     make_requests_fn_from_queue,
@@ -28,6 +29,8 @@ __all__ = [
     "RequestStrategy",
     "IdentityStrategy",
     "GRPORequestStrategy",
+    "TeacherAnnotatedBatchSource",
+    "annotate_teacher_logprobs",
     "RequestsExhausted",
     "make_requests_fn_from_queue",
     "make_dataset_queue_requests_fn",

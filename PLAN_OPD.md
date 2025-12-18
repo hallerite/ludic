@@ -12,9 +12,11 @@ On-Policy Distillation (OPD) combines the benefits of on-policy RL (learning fro
 ### Key Equation
 
 ```
+
 reverse_kl_t = log π_θ(x_t | x_{<t}) - log π_teacher(x_t | x_{<t})
 advantage_t = -reverse_kl_t = log π_teacher - log π_student
 loss = -E[advantage_t * log π_θ(x_t | x_{<t})]
+
 ```
 
 This is equivalent to minimizing `E[(log π_student - log π_teacher)²]` in gradient direction.
@@ -56,32 +58,130 @@ Ludic's `RLAlgorithm = (CreditAssigner, Loss, optional Preprocess)` pattern is w
 
 **Philosophy**: Teacher logprobs are computed in preprocess (like `old_token_logprobs`), loss consumes them.
 
+**vLLM 0.11.0 specifics (THIS IS THE IMPORTANT PART)**
+
+We’ll treat the teacher as a **remote vLLM 0.11.0 OpenAI-compatible server** and use a true “prefill-only logprobs” call:
+
+- Endpoint: `POST /v1/completions`
+- Key params (teacher-side):
+  - `max_tokens: 0`  → *prefill only; no generation*
+  - `prompt_logprobs: K` → return per-prompt-token logprobs (K=0 if you only want the chosen token logprob)
+  - `return_token_ids: true` → avoid retokenization drift (token IDs returned by server)
+  - `echo: true` → ensure returned token arrays include the prompt
+  - `stream: false` → prompt_logprobs is not available for streaming anyway
+
+**Critical operational requirement** for prompt logprobs:
+- Start the teacher server with prefix caching disabled, e.g. `--no-enable-prefix-caching` (otherwise prompt_logprobs won’t be supported / won’t be reliable for full-prompt logprobs depending on config).
+
+**Teacher response semantics you should expect**
+- Prompt token logprobs are returned as *prompt-side* fields (vLLM’s `prompt_logprobs`), and token IDs are included when `return_token_ids=true`.
+- First prompt token logprob can be `None` / missing depending on how the server represents “no previous context” (so align shifts carefully).
+
+---
+
 **Changes**:
 
 1. **New preprocess function** in `algorithm.py`:
    ```python
-   def _compute_teacher_logprobs(
+   def _compute_teacher_logprobs_vllm(
        saw_batch: SAWBatch,
        *,
-       teacher_model: nn.Module,  # or ChatClient
-       pad_token_id: int,
+       teacher_base_url: str,
+       teacher_model_name: str,
+       api_key: str | None,
+       prompt_logprobs_k: int = 0,
+       timeout_s: float = 60.0,
    ) -> SAWBatch:
-       """Compute teacher logprobs for each item, store in meta."""
+       """
+       Compute teacher *prompt* token logprobs via vLLM 0.11.0 OpenAI-compatible server.
+
+       Uses /v1/completions with max_tokens=0 (prefill-only) so the teacher
+       does exactly: forward pass over provided tokens -> prompt logprobs.
+
+       Stores:
+         - item.meta["teacher_prompt_token_ids"]       : list[int]
+         - item.meta["teacher_prompt_token_logprobs"]  : list[float|None]
+           (aligned to prompt_token_ids; handle first token / shift carefully)
+       """
+       import requests
+
+       headers = {"Content-Type": "application/json"}
+       if api_key:
+           headers["Authorization"] = f"Bearer {api_key}"
+
        for item in saw_batch.items:
-           # Run teacher forward pass (no grad)
-           teacher_logprobs = teacher_forward(teacher_model, item.input_ids)
-           item.meta["teacher_token_logprobs"] = teacher_logprobs
+           # NOTE: item.input_ids may include both prompt + completion depending on your pipeline.
+           # For OPD you typically want teacher logprobs on the *student trajectory tokens* too.
+           # That means: send the full prefix+sampled-tokens sequence as "prompt".
+           #
+           # If your item stores raw text instead of ids, send "prompt": <string>.
+           # If you store ids and want to avoid re-tokenization, prefer:
+           #   - configure teacher server with --return-tokens-as-token-ids (server flag)
+           #   - still send text, and read teacher-returned token_ids
+           #
+           # If you already have the exact tokens as IDs and need "no retokenization, ever",
+           # you’ll want a custom endpoint that accepts token IDs directly; OpenAI compat
+           # endpoints are text-first.
+           payload = {
+               "model": teacher_model_name,
+               "prompt": item.prompt_text,  # <- wire this to your actual stored prompt/trajectory text
+               "max_tokens": 0,             # <- vLLM 0.11.0: prefill-only
+               "temperature": 0.0,
+               "echo": True,
+               "stream": False,
+               "prompt_logprobs": prompt_logprobs_k,
+               "logprobs": 0,
+               "return_token_ids": True,
+           }
+
+           r = requests.post(
+               f"{teacher_base_url}/v1/completions",
+               headers=headers,
+               json=payload,
+               timeout=timeout_s,
+           )
+           r.raise_for_status()
+           resp = r.json()
+
+           choice = resp["choices"][0]
+
+           # vLLM may include prompt token IDs when return_token_ids=true.
+           # Field names can differ between completions vs chat; keep it simple:
+           teacher_prompt_token_ids = choice.get("prompt_token_ids") or choice.get("token_ids")
+           teacher_prompt_logprobs = choice.get("prompt_logprobs") or choice.get("logprobs", {}).get("token_logprobs")
+
+           item.meta["teacher_prompt_token_ids"] = teacher_prompt_token_ids
+           item.meta["teacher_prompt_token_logprobs"] = teacher_prompt_logprobs
+
        return saw_batch
-   ```
+````
 
 2. **Extend collation** in `trainer.py`:
+
    ```python
    # In _collate_saw_items, after old_logp_action handling:
-   if "teacher_token_logprobs" in items[0].meta:
-       batch["teacher_token_logprobs"] = padded_tensor(...)  # [B, T]
+
+   if items and "teacher_prompt_token_logprobs" in items[0].meta:
+       # Pad to max_len (or max_len-1 depending on your shift convention).
+       # Pick ONE convention and stick to it across student/teacher:
+       #   - Either store "logprob of token t given <t>" aligned to input_ids[t]
+       #   - Or store shifted alignment to targets input_ids[t+1]
+       teacher_lp_list = []
+       teacher_tid_list = []
+       for item in items:
+           lp = item.meta.get("teacher_prompt_token_logprobs", [])
+           tid = item.meta.get("teacher_prompt_token_ids", [])
+
+           teacher_lp_list.append(lp)
+           teacher_tid_list.append(tid)
+
+       # You likely already have a pad helper; the point is just "make it [B,T]"
+       batch["teacher_token_logprobs"] = padded_float_tensor(teacher_lp_list)  # [B, T]
+       batch["teacher_token_ids"] = padded_long_tensor(teacher_tid_list)       # [B, T]
    ```
 
 3. **New loss** in `loss.py`:
+
    ```python
    @dataclass
    class ReverseKLLoss(Loss):
@@ -91,43 +191,55 @@ Ludic's `RLAlgorithm = (CreditAssigner, Loss, optional Preprocess)` pattern is w
            # Student log probs from current forward pass
            student_logp = selective_log_softmax(logits, batch["input_ids"])
 
-           # Teacher log probs from preprocess
+           # Teacher log probs from preprocess (vLLM prefill-only)
            teacher_logp = batch["teacher_token_logprobs"]
 
-           # Per-token reverse KL (student's perspective)
-           reverse_kl = student_logp - teacher_logp  # minimize this
-
-           # Masked mean over action tokens
+           # IMPORTANT: Align masking + shifts consistently.
+           # If teacher_logp has None at the first position, mask it out.
            action_mask = batch["action_mask"]
-           loss = (reverse_kl * action_mask).sum() / action_mask.sum()
+           valid_mask = action_mask & teacher_logp.isfinite()  # or explicit None-handling if stored as float32 with sentinel
+
+           reverse_kl = student_logp - teacher_logp  # minimize this
+           loss = (reverse_kl * valid_mask).sum() / valid_mask.sum().clamp(min=1)
 
            return loss, {"reverse_kl": loss.item()}
    ```
 
 4. **Algorithm preset** in `algorithm.py`:
+
    ```python
    def make_opd(
-       teacher_model: nn.Module,
-       pad_token_id: int,
+       teacher_base_url: str,
+       teacher_model_name: str,
+       teacher_api_key: str | None,
+       *,
+       prompt_logprobs_k: int = 0,
        credit_assigner: Optional[CreditAssigner] = None,  # default: ConstantCredit
    ) -> RLAlgorithm:
        credit = credit_assigner or ConstantCredit(1.0)
        loss = ReverseKLLoss()
-       preprocess = partial(_compute_teacher_logprobs,
-                            teacher_model=teacher_model,
-                            pad_token_id=pad_token_id)
+       preprocess = partial(
+           _compute_teacher_logprobs_vllm,
+           teacher_base_url=teacher_base_url,
+           teacher_model_name=teacher_model_name,
+           api_key=teacher_api_key,
+           prompt_logprobs_k=prompt_logprobs_k,
+       )
        return RLAlgorithm("opd", credit, loss, preprocess)
    ```
 
 **Pros**:
-- Follows existing patterns (`_ensure_old_token_logprobs`)
-- Clean separation: preprocess computes, loss consumes
-- Teacher model can be swapped easily
-- Credit assigner still usable for hybrid OPD+RL
+
+* Follows existing patterns (`_ensure_old_token_logprobs`)
+* Clean separation: preprocess computes, loss consumes
+* Teacher model can be swapped easily (just point to another vLLM server)
+* Credit assigner still usable for hybrid OPD+RL
 
 **Cons**:
-- Teacher forward pass in preprocess (CPU→GPU transfer per batch)
-- Need to handle teacher model device placement
+
+* Teacher forward pass in preprocess adds network+compute overhead
+* You must manage exact alignment / shifts across student vs teacher logprobs
+* OpenAI-compat endpoints are text-first; token-id exactness depends on server settings + returned token IDs
 
 ---
 
@@ -135,53 +247,12 @@ Ludic's `RLAlgorithm = (CreditAssigner, Loss, optional Preprocess)` pattern is w
 
 **Philosophy**: Loss owns the teacher model and computes everything internally.
 
-**Changes**:
+**Update for vLLM 0.11.0**: you can still do this, but replace `teacher_model(...)` with a **teacher HTTP call** (same payload as Option A). This is almost always worse than Option A because you’re now mixing “RPC + inference” inside the backward pass.
 
-1. **New loss** in `loss.py`:
-   ```python
-   @dataclass
-   class OnPolicyDistillationLoss(Loss):
-       teacher_model: nn.Module
+**Changes** (only the teacher part differs):
 
-       def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict]:
-           # Student logprobs from logits
-           student_logp = selective_log_softmax(logits, batch["input_ids"])
-
-           # Teacher logprobs (no grad)
-           with torch.no_grad():
-               teacher_logits = self.teacher_model(
-                   input_ids=batch["input_ids"],
-                   attention_mask=batch["attention_mask"]
-               ).logits
-               teacher_logp = selective_log_softmax(teacher_logits, batch["input_ids"])
-
-           # Reverse KL
-           reverse_kl = student_logp - teacher_logp
-           action_mask = batch["action_mask"]
-           loss = (reverse_kl * action_mask).sum() / action_mask.sum()
-
-           return loss, {"reverse_kl": loss.item()}
-   ```
-
-2. **Algorithm preset**:
-   ```python
-   def make_opd(teacher_model: nn.Module) -> RLAlgorithm:
-       return RLAlgorithm(
-           name="opd",
-           credit_assigner=ConstantCredit(1.0),
-           loss=OnPolicyDistillationLoss(teacher_model),
-       )
-   ```
-
-**Pros**:
-- Minimal changes (just one new loss class)
-- Self-contained, easy to understand
-- No changes to collation or preprocess
-
-**Cons**:
-- Teacher forward pass during backward (memory pressure)
-- Loss has side effects (model inference)
-- Harder to extend (e.g., caching teacher logprobs)
+* In `compute(...)`, do `requests.post(/v1/completions, max_tokens=0, prompt_logprobs=K, ...)` under `torch.no_grad()` (conceptually).
+* Everything else stays the same.
 
 ---
 
@@ -189,39 +260,26 @@ Ludic's `RLAlgorithm = (CreditAssigner, Loss, optional Preprocess)` pattern is w
 
 **Philosophy**: Compute teacher logprobs alongside student during rollout generation.
 
-**Changes**:
+**Update for vLLM 0.11.0**:
 
-1. **Extend RolloutEngine** to accept optional `teacher_client`:
-   ```python
-   class RolloutEngine:
-       def __init__(self, ..., teacher_client: Optional[ChatClient] = None):
-           self.teacher_client = teacher_client
-   ```
+* Call the teacher’s `/v1/completions` with:
 
-2. **After each step**, compute teacher logprobs:
-   ```python
-   # In interaction protocol or RolloutEngine post-processing
-   if self.teacher_client:
-       teacher_resp = self.teacher_client.compute_logprobs(
-           messages=step.info["chat_prompt_messages"],
-           completion=step.action,
-       )
-       step.info["teacher_completion_logprobs"] = teacher_resp.logprobs
-   ```
-
-3. **SAWItem creation** preserves teacher logprobs in `meta`
-
-4. **Simple loss** reads from `batch["teacher_token_logprobs"]`
+  * `prompt = (prompt_prefix + student_generated_so_far)` (full trajectory prefix)
+  * `max_tokens = 0`
+  * `prompt_logprobs = 0 or K`
+  * `return_token_ids = true`
+* Extract the teacher logprob for the *newly appended token* (or segment) and store it per-step.
+* This lets you compute `reverse_kl_t` online.
 
 **Pros**:
-- Teacher computation happens during rollout (can overlap with env)
-- Clean data flow
-- Enables filtering based on teacher score before training
+
+* Teacher computation can overlap with env / rollout plumbing
+* You can early-filter bad rollouts cheaply (teacher KL too high, etc.)
 
 **Cons**:
-- Changes core RolloutEngine interface
-- Teacher inference latency added to rollout
-- Less flexible (teacher must be available at rollout time)
+
+* Many small teacher calls unless you batch aggressively
+* You have to be careful about “prompt_logprobs not available when stream=True”
 
 ---
 
@@ -272,13 +330,14 @@ class HybridOPDLoss(Loss):
 
 ### Implementation Order
 
-1. Add `ReverseKLLoss` to `loss.py` (~30 lines)
-2. Add `_compute_teacher_logprobs` preprocess to `algorithm.py` (~40 lines)
-3. Add collation support for `teacher_token_logprobs` in `trainer.py` (~10 lines)
-4. Add `make_opd()` preset to `algorithm.py` (~15 lines)
-5. Add example script `examples/opd/train_opd.py`
+In Ludic, the canonical placement for teacher calls is **upstream of the Trainer**:
 
-**Total**: ~100 lines of library code + example.
+1. Annotate each `SAWItem` with `meta["teacher_token_logprobs"]` (one float per action token).
+   - Synchronous training: wrap your batch source with `TeacherAnnotatedBatchSource`.
+   - Pipeline RL: attach teacher logprobs in the actor before pushing to Redis.
+2. Use `make_opd()` which computes OPD weights from existing metadata and **never calls the teacher**.
+
+**Total**: ~120 lines of library code + example.
 
 ---
 
@@ -286,172 +345,34 @@ class HybridOPDLoss(Loss):
 
 ### `src/ludic/training/loss.py`
 
-```python
-# Add after ReinforceLoss
+Implemented token-level OPD as `OnPolicyDistillationLoss`:
 
-@dataclass
-class ReverseKLLoss(Loss):
-    """
-    On-Policy Distillation loss using per-token reverse KL.
-
-    Minimizes KL(π_student || π_teacher) by training on student samples
-    with teacher logprobs as targets.
-
-    Requires batch["teacher_token_logprobs"] from preprocessing.
-    """
-    length_normalize: bool = False
-
-    def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
-        input_ids = batch["input_ids"]
-        action_mask = batch["action_mask"]
-        teacher_logp = batch["teacher_token_logprobs"]  # [B, T]
-
-        # Current policy logprobs
-        student_logp = compute_token_logprobs(logits, input_ids)  # [B, T]
-
-        # Per-token reverse KL (student - teacher), masked to actions
-        reverse_kl = (student_logp - teacher_logp) * action_mask
-
-        if self.length_normalize:
-            lengths = action_mask.sum(dim=-1, keepdim=True).clamp(min=1)
-            reverse_kl = reverse_kl / lengths
-
-        # Mean over batch
-        loss = reverse_kl.sum() / action_mask.sum().clamp(min=1)
-
-        stats = {
-            "reverse_kl": loss.item(),
-            "mean_student_logp": (student_logp * action_mask).sum().item() / action_mask.sum().item(),
-            "mean_teacher_logp": (teacher_logp * action_mask).sum().item() / action_mask.sum().item(),
-        }
-
-        return loss, stats
-```
+- Advantage per action token: `A_t = logp_teacher_t - logp_old_student_t`
+- Loss: `-mean_t( A_t.detach() * logp_student_current_t )` over action tokens (discount=0)
+- Expects `batch["teacher_token_logprobs"]` and `batch["old_token_logprobs"]` as `[B, T-1]` tensors aligned to `targets=input_ids[:, 1:]` (zeros on non-action positions).
 
 ### `src/ludic/training/algorithm.py`
 
-```python
-# Add teacher logprob computation
+Implemented `make_opd()` to:
 
-def _compute_teacher_logprobs(
-    saw_batch: SAWBatch,
-    *,
-    teacher_model: nn.Module,
-    pad_token_id: int,
-    chunk_size: int = 8,
-) -> SAWBatch:
-    """
-    Compute teacher model logprobs for OPD.
+- Never call the teacher (teacher scoring is upstream by design).
+- Install a preprocess that ensures `meta["old_token_logprobs"]` exists (copied from rollout-time `completion_logprobs` when available; async/pipeline batches must ship them) and validates that `meta["teacher_token_logprobs"]` exists and has the correct length.
+- Use `OnPolicyDistillationLoss` for the actual reverse-KL OPD update.
 
-    Similar to _ensure_old_token_logprobs but uses external teacher.
-    """
-    import torch
+### Teacher Scoring (Upstream, Required)
 
-    items = saw_batch.items
-    device = next(teacher_model.parameters()).device
+Teacher scoring is intentionally kept out of the Trainer/algorithm:
 
-    # Process in chunks to manage memory
-    for chunk_start in range(0, len(items), chunk_size):
-        chunk = items[chunk_start : chunk_start + chunk_size]
-
-        # Collate chunk
-        max_len = max(len(item.input_ids) for item in chunk)
-        input_ids = torch.full((len(chunk), max_len), pad_token_id, device=device)
-        attention_mask = torch.zeros((len(chunk), max_len), device=device)
-
-        for i, item in enumerate(chunk):
-            seq_len = len(item.input_ids)
-            input_ids[i, :seq_len] = torch.tensor(item.input_ids, device=device)
-            attention_mask[i, :seq_len] = 1
-
-        # Teacher forward (no grad)
-        with torch.no_grad():
-            outputs = teacher_model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs.logits  # [B, T, V]
-
-        # Extract per-token logprobs
-        log_probs = torch.log_softmax(logits, dim=-1)
-
-        # Shift for next-token prediction
-        shift_logprobs = log_probs[:, :-1, :]  # [B, T-1, V]
-        shift_targets = input_ids[:, 1:]        # [B, T-1]
-
-        # Gather logprobs for actual tokens
-        token_logprobs = shift_logprobs.gather(
-            dim=-1, index=shift_targets.unsqueeze(-1)
-        ).squeeze(-1)  # [B, T-1]
-
-        # Store back in items
-        for i, item in enumerate(chunk):
-            seq_len = len(item.input_ids) - 1  # -1 for shift
-            item.meta["teacher_token_logprobs"] = token_logprobs[i, :seq_len].cpu().tolist()
-
-    return saw_batch
-
-
-def make_opd_preprocessor(
-    teacher_model: nn.Module,
-    pad_token_id: int,
-    chunk_size: int = 8,
-) -> PreprocessFn:
-    """Create OPD preprocessor that computes teacher logprobs."""
-    from functools import partial
-    return partial(
-        _compute_teacher_logprobs,
-        teacher_model=teacher_model,
-        pad_token_id=pad_token_id,
-        chunk_size=chunk_size,
-    )
-
-
-def make_opd(
-    teacher_model: nn.Module,
-    pad_token_id: int,
-    *,
-    length_normalize: bool = False,
-    chunk_size: int = 8,
-) -> RLAlgorithm:
-    """
-    Create On-Policy Distillation algorithm.
-
-    Trains student to match teacher's per-token distribution on student's
-    own trajectories. Combines on-policy sampling with dense supervision.
-
-    Args:
-        teacher_model: Model to distill from (must be on same device)
-        pad_token_id: Tokenizer pad token ID
-        length_normalize: Normalize KL by sequence length
-        chunk_size: Batch size for teacher inference
-
-    Returns:
-        RLAlgorithm configured for on-policy distillation
-    """
-    return RLAlgorithm(
-        name="opd",
-        credit_assigner=ConstantCredit(1.0),  # Weight handled by KL
-        loss=ReverseKLLoss(length_normalize=length_normalize),
-        preprocess=make_opd_preprocessor(teacher_model, pad_token_id, chunk_size),
-    )
-```
+- `TeacherLogprobScorer` / `AsyncTeacherLogprobScorer`: `src/ludic/training/teacher.py`
+- `TeacherAnnotatedBatchSource` / `annotate_teacher_logprobs`: `src/ludic/training/batching/teacher_annotated.py`
+- Pipeline RL: `run_pipeline_actor(..., teacher_scorer=...)` annotates before pushing to Redis.
 
 ### `src/ludic/training/trainer.py`
 
-```python
-# In _collate_saw_items, add after old_logp_action handling (~line 95):
+`_collate_saw_items()` collates per-token logprobs for token-level objectives like OPD:
 
-    # Teacher token logprobs for OPD
-    if items and "teacher_token_logprobs" in items[0].meta:
-        teacher_logprobs_list = []
-        for item in items:
-            logprobs = item.meta.get("teacher_token_logprobs", [])
-            # Pad to max_len - 1 (shifted)
-            padded = logprobs + [0.0] * (max_len - 1 - len(logprobs))
-            teacher_logprobs_list.append(padded[:max_len - 1])
-
-        batch["teacher_token_logprobs"] = torch.tensor(
-            teacher_logprobs_list, dtype=torch.float32, device=device
-        )
-```
+- `batch["teacher_token_logprobs"]`: `[B, T-1]` aligned to `targets=input_ids[:, 1:]`
+- `batch["old_token_logprobs"]`: `[B, T-1]` aligned to `targets=input_ids[:, 1:]`
 
 ---
 
@@ -463,17 +384,18 @@ def make_opd(
 from ludic.training.algorithm import make_opd
 from ludic.training.trainer import Trainer
 from ludic.training.batching import RolloutBatchSource
-from transformers import AutoModelForCausalLM
 
-# Load models
-student = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B")
-teacher = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B")
-teacher.eval()  # Teacher in eval mode, no grad
+# Teacher is remote: vLLM 0.11.0 OpenAI-compatible server
+TEACHER_BASE_URL = "http://teacher-host:8000"
+TEACHER_MODEL_NAME = "teacher-model"
+TEACHER_API_KEY = None  # or "token-..."
 
 # Create OPD algorithm
 algo = make_opd(
-    teacher_model=teacher,
-    pad_token_id=tokenizer.pad_token_id,
+    teacher_base_url=TEACHER_BASE_URL,
+    teacher_model_name=TEACHER_MODEL_NAME,
+    teacher_api_key=TEACHER_API_KEY,
+    prompt_logprobs_k=0,       # 0 = chosen-token logprob only (cheapest)
     length_normalize=True,
 )
 
@@ -502,7 +424,9 @@ trainer.train(num_steps=1000)
 
 ```python
 def make_mopd(
-    teacher_model: nn.Module,
+    teacher_base_url: str,
+    teacher_model_name: str,
+    teacher_api_key: str | None,
     pad_token_id: int,
     kl_weight: float = 1.0,
     reward_weight: float = 0.1,
@@ -512,28 +436,51 @@ def make_mopd(
         name="mopd",
         credit_assigner=MonteCarloReturn(gamma=1.0),  # Use env rewards
         loss=HybridOPDLoss(kl_weight=kl_weight, reward_weight=reward_weight),
-        preprocess=make_opd_preprocessor(teacher_model, pad_token_id),
+        preprocess=make_opd_preprocessor(teacher_base_url, teacher_model_name, teacher_api_key),
     )
 ```
 
 ### 2. Async Teacher Inference
 
-For large teachers, compute logprobs asynchronously:
+For large teachers, compute logprobs asynchronously (still using `/v1/completions`, `max_tokens=0`):
 
 ```python
 class AsyncTeacherPreprocessor:
-    def __init__(self, teacher_client: ChatClient):
-        self.teacher_client = teacher_client
+    def __init__(self, teacher_base_url: str, teacher_model_name: str, api_key: str | None):
+        self.teacher_base_url = teacher_base_url
+        self.teacher_model_name = teacher_model_name
+        self.api_key = api_key
 
     async def __call__(self, saw_batch: SAWBatch) -> SAWBatch:
-        # Batch compute_logprobs calls
-        tasks = [
-            self.teacher_client.compute_logprobs_async(item)
-            for item in saw_batch.items
-        ]
-        results = await asyncio.gather(*tasks)
-        for item, logprobs in zip(saw_batch.items, results):
-            item.meta["teacher_token_logprobs"] = logprobs
+        import aiohttp
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async def one(item):
+                payload = {
+                    "model": self.teacher_model_name,
+                    "prompt": item.prompt_text,
+                    "max_tokens": 0,
+                    "temperature": 0.0,
+                    "echo": True,
+                    "stream": False,
+                    "prompt_logprobs": 0,
+                    "logprobs": 0,
+                    "return_token_ids": True,
+                }
+                async with session.post(f"{self.teacher_base_url}/v1/completions", json=payload) as r:
+                    r.raise_for_status()
+                    resp = await r.json()
+                    choice = resp["choices"][0]
+                    item.meta["teacher_token_ids"] = choice.get("prompt_token_ids") or choice.get("token_ids") or []
+                    lp = choice.get("prompt_logprobs") or choice.get("logprobs", {}).get("token_logprobs")
+                    item.meta["teacher_token_logprobs"] = [(float("nan") if x is None else x) for x in lp]
+                return item
+
+            await asyncio.gather(*(one(item) for item in saw_batch.items))
+
         return saw_batch
 ```
 
@@ -541,8 +488,9 @@ class AsyncTeacherPreprocessor:
 
 ```python
 def make_filtered_opd(
-    teacher_model: nn.Module,
-    pad_token_id: int,
+    teacher_base_url: str,
+    teacher_model_name: str,
+    teacher_api_key: str | None,
     reward_threshold: float = 0.5,
 ) -> RLAlgorithm:
     """OPD only on trajectories with positive reward."""
@@ -552,7 +500,7 @@ def make_filtered_opd(
         name="filtered_opd",
         credit_assigner=ConstantCredit(1.0),
         loss=ReverseKLLoss(),
-        preprocess=make_opd_preprocessor(teacher_model, pad_token_id),
+        preprocess=make_opd_preprocessor(teacher_base_url, teacher_model_name, teacher_api_key),
         sample_filter=drop_below_reward(reward_threshold),
     )
 ```
@@ -561,8 +509,14 @@ def make_filtered_opd(
 
 ## Testing Checklist
 
-- [ ] Unit test `ReverseKLLoss` with mock batch
-- [ ] Unit test `_compute_teacher_logprobs` with small model
-- [ ] Integration test: student logprobs match teacher on identical models
-- [ ] Integration test: loss decreases over training steps
-- [ ] E2E test: train on GSM8K with OPD, measure accuracy improvement
+* [ ] Unit test `ReverseKLLoss` with mock batch
+* [ ] Unit test `_compute_teacher_logprobs_vllm` against a tiny teacher model served with vLLM 0.11.0
+* [ ] Integration test: student logprobs match teacher on identical models
+* [ ] Integration test: loss decreases over training steps
+* [ ] E2E test: train on GSM8K with OPD, measure accuracy improvement
+
+```
+
+Sources (for the vLLM 0.11.0 wiring details): :contentReference[oaicite:0]{index=0}
+::contentReference[oaicite:1]{index=1}
+```

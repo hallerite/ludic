@@ -23,6 +23,7 @@ from .algorithm import (
     make_reinforce,
     make_reinforce_baseline,
     make_grpo,
+    make_opd,
     make_sft,
 )
 from .credit_assignment import (
@@ -77,6 +78,7 @@ __all__ = [
     "make_reinforce",
     "make_reinforce_baseline",
     "make_grpo",
+    "make_opd",
     "make_sft",
     # Credit assignment
     "GroupNormalizedReturn",

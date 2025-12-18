@@ -95,6 +95,20 @@ def _collate_saw_items(
             except Exception:
                 old_logp_sums.append(None)
 
+    # teacher_token_logprobs is optional; used for OPD.
+    teacher_token_logps_present: List[Optional[List[float]]] = []
+    for it in items:
+        token_logps = it.meta.get("teacher_token_logprobs")
+        if not isinstance(token_logps, list):
+            teacher_token_logps_present.append(None)
+        else:
+            action_len = int(sum(it.action_mask))
+            if action_len != len(token_logps):
+                raise ValueError(
+                    "Length mismatch between teacher_token_logprobs and the number of action tokens."
+                )
+            teacher_token_logps_present.append([float(v) for v in token_logps])
+
     batch: Dict[str, Tensor] = {
         "input_ids": torch.stack(input_ids_list, dim=0).to(device),
         "attention_mask": torch.stack(attn_mask_list, dim=0).to(device),
@@ -107,6 +121,63 @@ def _collate_saw_items(
             raise ValueError("Mixed presence of old_token_logprobs; either provide them for all samples or none.")
         tensor_vals = [float(v) for v in old_logp_sums]  # type: ignore[arg-type]
         batch["old_logp_action"] = torch.tensor(tensor_vals, dtype=torch.float32, device=device)
+
+    # For token-level objectives (e.g. OPD), collate per-token logprobs aligned to targets.
+    def _align_action_token_logprobs(
+        token_logprobs: List[float],
+        *,
+        action_mask: List[int],
+        seq_len: int,
+    ) -> List[float]:
+        # Align to targets input_ids[1:] with length (max_len - 1).
+        out = [0.0] * (max_len - 1)
+        # Positions in the shifted space correspond to token indices 1..seq_len-1.
+        # action_mask marks tokens; shift to match targets => action_mask[1:seq_len].
+        shifted = action_mask[1:seq_len]
+        j = 0
+        for p, m in enumerate(shifted):
+            if int(m) == 1:
+                if j >= len(token_logprobs):
+                    raise ValueError("Not enough action token logprobs to fill shifted mask.")
+                out[p] = float(token_logprobs[j])
+                j += 1
+        if j != len(token_logprobs):
+            raise ValueError("Unused action token logprobs after filling shifted mask.")
+        return out
+
+    if any(v is not None for v in teacher_token_logps_present):
+        if any(v is None for v in teacher_token_logps_present):
+            raise ValueError(
+                "Mixed presence of teacher_token_logprobs; either provide them for all samples or none."
+            )
+        teacher_aligned: List[List[float]] = []
+        for it, tlogps in zip(items, teacher_token_logps_present):
+            assert tlogps is not None
+            teacher_aligned.append(
+                _align_action_token_logprobs(tlogps, action_mask=it.action_mask, seq_len=len(it.input_ids))
+            )
+        batch["teacher_token_logprobs"] = torch.tensor(teacher_aligned, dtype=torch.float32, device=device)
+
+    # If we have old_token_logprobs for all samples, also collate token-level old logprobs.
+    old_token_logps_present: List[Optional[List[float]]] = []
+    for it in items:
+        token_logps = it.meta.get("old_token_logprobs")
+        if not isinstance(token_logps, list):
+            old_token_logps_present.append(None)
+        else:
+            old_token_logps_present.append([float(v) for v in token_logps])
+
+    if any(v is not None for v in old_token_logps_present):
+        if any(v is None for v in old_token_logps_present):
+            raise ValueError("Mixed presence of old_token_logprobs; either provide them for all samples or none.")
+        old_aligned: List[List[float]] = []
+        for it, ologps in zip(items, old_token_logps_present):
+            assert ologps is not None
+            old_aligned.append(
+                _align_action_token_logprobs(ologps, action_mask=it.action_mask, seq_len=len(it.input_ids))
+            )
+        batch["old_token_logprobs"] = torch.tensor(old_aligned, dtype=torch.float32, device=device)
+
     return batch
 
 

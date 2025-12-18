@@ -14,6 +14,7 @@ from ludic.training.loss import (
     ClippedSurrogateLoss,
     selective_log_softmax,
     MaskedCausalLMCrossEntropyLoss,
+    OnPolicyDistillationLoss,
 )
 from ludic.training.credit_assignment import MonteCarloReturn, GroupNormalizedReturn, ConstantCredit
 
@@ -213,6 +214,108 @@ def make_old_logprob_preprocessor(*, backfill_chunk_size: Optional[int] = None) 
         )
 
     return _pre
+
+
+# ---------------------------------------------------------------------------
+# On-Policy Distillation (OPD)
+# ---------------------------------------------------------------------------
+
+
+def make_opd_preprocessor(
+    *,
+    subtract_student_logprobs: bool = True,
+    backfill_chunk_size: Optional[int] = None,
+) -> PreprocessFn:
+    """
+    Return a PreprocessFn that validates OPD-required metadata and ensures
+    behavior-policy token logprobs exist.
+
+    The preprocessor:
+      1) Ensures `meta["old_token_logprobs"]` exist (copies rollout-time
+         `completion_logprobs` or backfills via `model` teacher forcing).
+      2) Requires `meta["teacher_token_logprobs"]` to be present on each item,
+         attached upstream (e.g. via TeacherAnnotatedBatchSource / pipeline actor).
+      3) Validates alignment: len(old_token_logprobs) == len(teacher_token_logprobs)
+         == number of action tokens.
+    """
+
+    def _pre(
+        saw_batch: SAWBatch,
+        *,
+        model: Optional[nn.Module] = None,
+        pad_token_id: Optional[int] = None,
+    ) -> SAWBatch:
+        saw_batch = _ensure_old_token_logprobs(
+            saw_batch,
+            model=model,
+            pad_token_id=pad_token_id,
+            backfill_chunk_size=backfill_chunk_size,
+        )
+
+        for it in saw_batch.items:
+            old_lp = it.meta.get("old_token_logprobs")
+            teacher_lp = it.meta.get("teacher_token_logprobs")
+            if not isinstance(teacher_lp, list) or not all(isinstance(v, (int, float)) for v in teacher_lp):
+                raise ValueError(
+                    "teacher_token_logprobs missing or invalid. "
+                    "Attach them upstream (required) via TeacherAnnotatedBatchSource "
+                    "or by annotating SAWItems in your actor/BatchSource."
+                )
+
+            if subtract_student_logprobs:
+                if not isinstance(old_lp, list) or not all(isinstance(v, (int, float)) for v in old_lp):
+                    raise ValueError("old_token_logprobs missing or invalid; required for subtract_student_logprobs.")
+                if len(old_lp) != len(teacher_lp):
+                    raise ValueError("Length mismatch between old_token_logprobs and teacher_token_logprobs.")
+                it.meta["opd_old_logp_action"] = float(sum(float(v) for v in old_lp))
+
+            it.meta["opd_teacher_logp_action"] = float(sum(float(v) for v in teacher_lp))
+
+        return saw_batch
+
+    return _pre
+
+
+def make_opd(
+    *,
+    credit_assigner: Optional[CreditAssigner] = None,
+    opd_coef: float = 1.0,
+    subtract_student_logprobs: bool = True,
+    env_weight_coef: float = 0.0,
+    length_normalize: bool = False,
+    backfill_chunk_size: Optional[int] = None,
+    name: str = "opd",
+) -> RLAlgorithm:
+    """
+    On-Policy Distillation (OPD) preset.
+
+    Uses on-policy student rollouts, then shapes the scalar per-sample weight
+    using teacher-forced logprobs of the sampled action tokens.
+
+    Implementation notes:
+      - The training loss is token-level OPD (`OnPolicyDistillationLoss`).
+      - OPD uses `old_token_logprobs` (behavior) and `teacher_token_logprobs`
+        (teacher) attached to SAWItems; it does not compute logprobs itself.
+      - This algorithm NEVER calls the teacher. It requires each SAWItem to
+        already carry `meta["teacher_token_logprobs"]` populated upstream.
+    """
+    credit: CreditAssigner = credit_assigner or ConstantCredit(value=0.0)
+    loss: Loss = OnPolicyDistillationLoss(
+        opd_coef=opd_coef,
+        env_weight_coef=env_weight_coef,
+        length_normalize=length_normalize,
+    )
+    preprocess = make_opd_preprocessor(
+        subtract_student_logprobs=subtract_student_logprobs,
+        backfill_chunk_size=backfill_chunk_size,
+    )
+
+    return RLAlgorithm(
+        name=name,
+        credit_assigner=credit,
+        loss=loss,
+        preprocess=preprocess,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,8 @@ from ludic.training.types import (
 )
 from ludic.inference.client import VersionedClient
 from .rollout_engine import RolloutEngine
+from .teacher_annotated import annotate_teacher_logprobs
+from ludic.training.teacher import TeacherLogprobScorer, AsyncTeacherLogprobScorer
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +103,8 @@ async def run_pipeline_actor(
     retokenize: bool = False,
     tokenize: Optional[TokenizeFn] = None,
     client: Optional[VersionedClient] = None,
+    teacher_scorer: Optional[TeacherLogprobScorer | AsyncTeacherLogprobScorer] = None,
+    teacher_chunk_size: Optional[int] = None,
 ):
     """
     Actor-side component. Runs an infinite loop to:
@@ -157,6 +161,20 @@ async def run_pipeline_actor(
             logger.error(f"Error in actor generation loop: {e}")
             await asyncio.sleep(1.0)
             continue
+
+        # Optionally attach teacher logprobs in the actor process so the learner
+        # never talks to the teacher (canonical placement for pipeline RL).
+        if teacher_scorer is not None and saw_batch.items:
+            try:
+                saw_batch = await annotate_teacher_logprobs(
+                    saw_batch,
+                    teacher_scorer=teacher_scorer,
+                    teacher_chunk_size=teacher_chunk_size,
+                )
+            except Exception as e:
+                logger.error(f"Error annotating teacher logprobs in actor: {e}")
+                await asyncio.sleep(1.0)
+                continue
         
         if not saw_batch.items:
             await asyncio.sleep(0.1)

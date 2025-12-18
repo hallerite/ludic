@@ -85,13 +85,41 @@ uv sync --group examples
 
 ## TODO
 
+### New Algorithms
+
 - Add on-policy distillation, plus a script for the MOPD variant introduced in: https://github.com/XiaomiMiMo/MiMo-V2-Flash/blob/main/paper.pdf
-- Introduce a sensible object for sampling arguments (so we don’t have to use brittle dicts).
-- Improve packaging:
-	- `eval`, `training`, and `batch_gen` should be distinct modules.
-- Add a classic Gym-style registry for agent harnesses, environments, and interaction protocols (so they don’t have to be built on the fly).
-- Use proper FSDP2 wrapping (I was new to FSDP2, but now I know better)
 - Add Single Stream Policy Optimization (as described in https://arxiv.org/abs/2509.13232v2).
+
+### Algorithmic Improvements
+- Implement the findings of the LLM Data co. regarding importance sampling:
+   - https://www.llmdata.com/blog/mismatch-praxis/
+
+### Environments & Agents
+- Build agent harness & environment for Pokemon!
+   - the agent harness and env are fused together in Claude Plays Pokemon: https://github.com/davidhershey/ClaudePlaysPokemonStarter.
+   - our goal is to disentangle them!
+
+- create Rustorio env
+   - https://github.com/albertsgarde/rustorio
+
+- Agent with folding
+   - https://context-folding.github.io/
+
+
+### QOL Improvements
+- Introduce a sensible object for sampling arguments (so we don’t have to use brittle dicts).
+
+- Add a classic Gym-style registry for agent harnesses, environments, and interaction protocols (so they don’t have to be built on the fly).
+   - adapt example scripts
+
+- Use proper FSDP2 wrapping in the training scripts
+
 - Move to a token-in / token-out API.
+
+### Misc
 - Make `scripts/push_to_hub.py` work with `--revision` for uploading different checkpoints.
 - Add a progress bar to eval.
+
+### Package changes (very breaking, do only after everything else is done)
+- Improve packaging:
+	- `eval`, `training`, and `batch_gen` should be distinct modules.

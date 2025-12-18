@@ -6,6 +6,7 @@ from typing import Any, Dict, Mapping, Protocol, Tuple, List
 import torch
 from torch import Tensor
 import torch.nn.functional as F
+import math
 
 
 Batch = Mapping[str, Tensor]
@@ -179,6 +180,104 @@ class MaskedCausalLMCrossEntropyLoss:
             "logp_mean": float(per_sample_logp.mean().detach().cpu()),
             "nll_mean": float(per_sample_nll.mean().detach().cpu()),
             "avg_action_tokens": float(token_counts.mean().detach().cpu()),
+        }
+        return loss, stats
+
+
+@dataclass
+class OnPolicyDistillationLoss:
+    """
+    On-Policy Distillation (OPD) using per-token reverse-KL advantages.
+
+    Expects:
+      - batch["input_ids"]: [B, T]
+      - batch["action_mask"]: [B, T] (1 on action/completion tokens)
+      - batch["teacher_token_logprobs"]: [B, T-1] teacher-forced chosen-token logprobs,
+            aligned to targets input_ids[:, 1:] and zero elsewhere.
+      - batch["old_token_logprobs"]: [B, T-1] behavior-policy chosen-token logprobs,
+            aligned to targets input_ids[:, 1:] and zero elsewhere.
+
+    Optional:
+      - batch["weight"]: [B] scalar env-derived weight; used only when env_weight_coef != 0.
+    """
+
+    opd_coef: float = 1.0
+    env_weight_coef: float = 0.0
+    length_normalize: bool = False
+
+    def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        if not math.isfinite(self.opd_coef):
+            raise ValueError("opd_coef must be finite.")
+        if not math.isfinite(self.env_weight_coef):
+            raise ValueError("env_weight_coef must be finite.")
+
+        input_ids = batch["input_ids"]  # [B, T]
+        action_mask = batch["action_mask"].to(dtype=torch.float32)  # [B, T]
+
+        if "teacher_token_logprobs" not in batch:
+            raise KeyError("OnPolicyDistillationLoss requires 'teacher_token_logprobs' in batch.")
+        if "old_token_logprobs" not in batch:
+            raise KeyError("OnPolicyDistillationLoss requires 'old_token_logprobs' in batch.")
+
+        teacher_lp = batch["teacher_token_logprobs"].to(dtype=torch.float32)  # [B, T-1]
+        old_lp = batch["old_token_logprobs"].to(dtype=torch.float32)  # [B, T-1]
+
+        if logits.ndim != 3:
+            raise ValueError(f"Expected logits [B, T, V], got {tuple(logits.shape)}")
+        if input_ids.shape != logits.shape[:2]:
+            raise ValueError(f"Shape mismatch: input_ids {input_ids.shape} vs logits {logits.shape}")
+        if logits.size(1) < 2:
+            raise ValueError("Sequence too short to compute next-token OPD loss.")
+
+        # Align with next-token prediction.
+        logits_shifted = logits[:, :-1, :]  # [B, T-1, V]
+        targets = input_ids[:, 1:]  # [B, T-1]
+        token_logp = selective_log_softmax(logits_shifted, targets)  # [B, T-1]
+
+        # Mask that selects action tokens in the target positions.
+        action_mask_shifted = action_mask[:, 1:]  # [B, T-1]
+
+        if teacher_lp.shape != token_logp.shape:
+            raise ValueError(
+                f"teacher_token_logprobs shape {tuple(teacher_lp.shape)} must match token_logp {tuple(token_logp.shape)}"
+            )
+        if old_lp.shape != token_logp.shape:
+            raise ValueError(
+                f"old_token_logprobs shape {tuple(old_lp.shape)} must match token_logp {tuple(token_logp.shape)}"
+            )
+
+        # Per-token reverse KL advantage (discount=0): A_t = logp_teacher - logp_old_student
+        advantages = (teacher_lp - old_lp).detach() * self.opd_coef  # [B, T-1]
+
+        # Optional hybrid term: broadcast env weight across action tokens.
+        if self.env_weight_coef != 0.0:
+            if "weight" not in batch:
+                raise KeyError("env_weight_coef != 0 requires 'weight' in batch.")
+            env_w = batch["weight"].to(dtype=torch.float32).unsqueeze(-1)  # [B, 1]
+            advantages = advantages + self.env_weight_coef * env_w
+
+        per_token_loss = -(advantages * token_logp)  # [B, T-1]
+        masked = per_token_loss * action_mask_shifted
+
+        if self.length_normalize:
+            denom = action_mask_shifted.sum(dim=-1).clamp(min=1.0)  # [B]
+            loss = (masked.sum(dim=-1) / denom).mean()
+        else:
+            denom = action_mask_shifted.sum().clamp(min=1.0)
+            loss = masked.sum() / denom
+
+        # Useful diagnostics.
+        with torch.no_grad():
+            denom_tokens = action_mask_shifted.sum().clamp(min=1.0)
+            mean_reverse_kl = ((token_logp - teacher_lp) * action_mask_shifted).sum() / denom_tokens
+            mean_adv = ((teacher_lp - old_lp) * action_mask_shifted).sum() / denom_tokens
+
+        stats: Dict[str, Any] = {
+            "loss": float(loss.detach().cpu()),
+            "reverse_kl_mean": float(mean_reverse_kl.detach().cpu()),
+            "adv_mean": float(mean_adv.detach().cpu()),
+            "opd_coef": float(self.opd_coef),
+            "env_weight_coef": float(self.env_weight_coef),
         }
         return loss, stats
 
