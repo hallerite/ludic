@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Protocol, Tuple, TypeGuard
+from typing import Callable, Dict, List, Optional, Protocol, Tuple, TypeVar, cast
 
 from ludic.types import JSON, Rollout, Step
 from ludic.inference.request import InferenceSpec
@@ -108,8 +108,14 @@ class CreditAssigner(Protocol):
 # ---------------------------------------------------------------------------
 
 
+class SampleExtra:
+    """
+    Marker base class for typed extras that algorithms may need.
+    """
+
+
 @dataclass(frozen=True)
-class ActorTokenLogps:
+class ActorTokenLogps(SampleExtra):
     """
     Per-token logprobs under the behavior policy (the actor), aligned to the
     sampled completion tokens.
@@ -128,7 +134,7 @@ class ActorTokenLogps:
 
 
 @dataclass(frozen=True)
-class TeacherTokenLogps:
+class TeacherTokenLogps(SampleExtra):
     """
     Per-token logprobs under the teacher policy, aligned to the sampled completion tokens.
 
@@ -145,55 +151,7 @@ class TeacherTokenLogps:
             raise TypeError("TeacherTokenLogps.token_logps must be a List[float].")
 
 
-@dataclass
-class SampleAttachments:
-    """
-    Optional typed attachments carried alongside a training sample.
-
-    These should be populated by construction by BatchSources / annotators /
-    rollout collation, not discovered ad-hoc from `meta`.
-    """
-
-    actor_logps: Optional[ActorTokenLogps] = None
-    teacher_logps: Optional[TeacherTokenLogps] = None
-
-
-class HasActorLogps(Protocol):
-    """
-    Structural “extension”: a sample that is guaranteed to carry per-token actor logps.
-
-    This is meant for typing algorithms/losses that require token-level behavior
-    logprobs, and composes naturally with other Protocol extensions.
-    """
-
-    actor_logps: ActorTokenLogps
-
-
-class HasTeacherLogps(Protocol):
-    """
-    Structural “extension”: a sample that is guaranteed to carry per-token teacher logps.
-    """
-
-    teacher_logps: TeacherTokenLogps
-
-
-def has_actor_logps(item: "SAWItem") -> TypeGuard[HasActorLogps]:
-    """
-    Type guard for `HasActorLogps`.
-
-    Use this to narrow a SAWItem to something that is guaranteed (by runtime check)
-    to have non-None `actor_logps`.
-    """
-
-    return item.actor_logps is not None
-
-
-def has_teacher_logps(item: "SAWItem") -> TypeGuard[HasTeacherLogps]:
-    """
-    Type guard for `HasTeacherLogps`.
-    """
-
-    return item.teacher_logps is not None
+TExtra = TypeVar("TExtra", bound=SampleExtra)
 
 
 @dataclass
@@ -207,23 +165,44 @@ class SAWItem:
     - weight: scalar credit for this sample
     - meta: arbitrary rollout/step metadata (JSON-serializable; for logging,
       debugging, filtering, etc.)
-    - attachments: typed, non-JSON training attachments (e.g. actor logps for
-      PPO/GRPO ratios, teacher logps for OPD)
+    - extras: typed extras that algorithms may need (e.g. actor logps for PPO/GRPO
+      ratios, teacher logps for OPD).
     """
     input_ids: List[int]
     attention_mask: List[int]
     action_mask: List[int]
     weight: float
     meta: Dict[str, JSON]
-    attachments: SampleAttachments = field(default_factory=SampleAttachments)
+    extras: List[SampleExtra] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        seen: set[type[SampleExtra]] = set()
+        for extra in self.extras:
+            if not isinstance(extra, SampleExtra):
+                raise TypeError("SAWItem.extras must contain SampleExtra instances.")
+            extra_type = type(extra)
+            if extra_type in seen:
+                raise ValueError(f"Duplicate extra type: {extra_type.__name__}")
+            seen.add(extra_type)
+
+    def get_extra(self, extra_type: type[TExtra]) -> Optional[TExtra]:
+        for extra in self.extras:
+            if isinstance(extra, extra_type):
+                return cast(TExtra, extra)
+        return None
+
+    def add_extra(self, extra: SampleExtra) -> None:
+        if self.get_extra(type(extra)) is not None:
+            raise ValueError(f"Duplicate extra type: {type(extra).__name__}")
+        self.extras.append(extra)
 
     @property
     def actor_logps(self) -> Optional[ActorTokenLogps]:
-        return self.attachments.actor_logps
+        return self.get_extra(ActorTokenLogps)
 
     @property
     def teacher_logps(self) -> Optional[TeacherTokenLogps]:
-        return self.attachments.teacher_logps
+        return self.get_extra(TeacherTokenLogps)
 
 @dataclass
 class SAWBatch:

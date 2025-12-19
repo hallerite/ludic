@@ -74,7 +74,7 @@ def validate_actor_logps(
 
     Contract:
       - For ratio objectives (PPO/GRPO/KL-to-behavior), each SAWItem must carry
-        `item.actor_logps` (backed by `item.attachments.actor_logps`), computed at rollout time by the inference
+        `item.actor_logps` (backed by per-sample extras), computed at rollout time by the inference
         client and propagated through batching/collation.
 
     This function validates the contract; it does not backfill or recompute logprobs.
@@ -101,9 +101,9 @@ def validate_actor_logps(
 
     if missing:
         raise ValueError(
-            "Missing SampleAttachments.actor_logps for a ratio-based objective. "
+            "Missing ActorTokenLogps extra for a ratio-based objective. "
             "Ensure your inference client returns chosen-token logprobs and your batch collation "
-            "populates SAWItem.attachments.actor_logps (e.g., via ReturnSpec.for_rl()). "
+            "populates SAWItem extras (e.g., via ReturnSpec.for_rl()). "
             f"Missing indices: {missing}."
         )
 
@@ -117,8 +117,8 @@ def validate_teacher_logps(
     Validate SAWItems carry per-token logprobs under the teacher policy.
 
     Contract:
-      - For OPD, each SAWItem must carry `item.teacher_logps` (backed by
-        `item.attachments.teacher_logps`), computed upstream by a teacher scorer.
+      - For OPD, each SAWItem must carry `item.teacher_logps` (from per-sample extras),
+        computed upstream by a teacher scorer.
     """
     items = saw_batch.items
 
@@ -142,7 +142,7 @@ def validate_teacher_logps(
 
     if missing:
         raise ValueError(
-            "Missing SampleAttachments.teacher_logps for OPD. "
+            "Missing TeacherTokenLogps extra for OPD. "
             "Attach them upstream via TeacherAnnotatedBatchSource or "
             "by annotating SAWItems in your actor/BatchSource. "
             f"Missing indices: {missing}."
@@ -158,12 +158,12 @@ def validate_teacher_logps(
 
 def make_opd_preprocessor() -> PreprocessFn:
     """
-    Return a PreprocessFn that validates OPD-required attachments.
+    Return a PreprocessFn that validates OPD-required extras.
 
     The preprocessor:
-      1) Requires `item.attachments.teacher_logps` to be present on each item,
+      1) Requires `item.teacher_logps` to be present on each item,
          attached upstream (e.g. via TeacherAnnotatedBatchSource / pipeline actor).
-      2) Requires `item.attachments.actor_logps` to be present (OPD uses old logps).
+      2) Requires `item.actor_logps` to be present (OPD uses old logps).
       3) Validates alignment: len(teacher_logps) == len(actor_logps) == number of action tokens.
     """
 
@@ -201,9 +201,9 @@ def make_opd(
     Implementation notes:
       - The training loss is token-level reverse KL (`ReverseKLLoss`).
       - OPD uses per-token behavior and teacher logprobs collated from SAWItem
-        attachments; it does not compute logprobs itself.
+        extras; it does not compute logprobs itself.
       - This algorithm NEVER calls the teacher. It requires each SAWItem to
-        already carry `attachments.teacher_logps` populated upstream.
+        already carry `teacher_logps` populated upstream.
     """
     credit: CreditAssigner = credit_assigner or ConstantCredit(value=0.0)
     loss: Loss = ReverseKLLoss(

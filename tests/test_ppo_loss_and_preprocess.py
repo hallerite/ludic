@@ -7,7 +7,7 @@ import torch
 
 from ludic.training.loss import ClippedSurrogateLoss
 from ludic.training.trainer import _collate_saw_items
-from ludic.training.types import SAWItem, SAWBatch, ActorTokenLogps, SampleAttachments
+from ludic.training.types import SAWItem, SAWBatch, ActorTokenLogps, SampleExtra
 from ludic.training.algorithm import RLAlgorithm, validate_actor_logps
 from ludic.training.credit_assignment import MonteCarloReturn
 
@@ -17,7 +17,7 @@ def make_item(
     action_mask: List[int],
     *,
     meta: Dict[str, Any] | None = None,
-    attachments: SampleAttachments | None = None,
+    extras: List[SampleExtra] | None = None,
 ) -> SAWItem:
     L = len(input_ids)
     return SAWItem(
@@ -26,7 +26,7 @@ def make_item(
         action_mask=action_mask,
         weight=1.0,
         meta=meta or {},
-        attachments=attachments or SampleAttachments(),
+        extras=extras or [],
     )
 
 
@@ -48,12 +48,12 @@ def test_collate_sums_behavior_logprobs():
         make_item(
             [0, 1, 2],
             [0, 1, 1],
-            attachments=SampleAttachments(actor_logps=ActorTokenLogps(token_logps=[-1.0, -2.0])),
+            extras=[ActorTokenLogps(token_logps=[-1.0, -2.0])],
         ),
         make_item(
             [0, 2, 1],
             [0, 1, 1],
-            attachments=SampleAttachments(actor_logps=ActorTokenLogps(token_logps=[-1.0, -2.0])),
+            extras=[ActorTokenLogps(token_logps=[-1.0, -2.0])],
         ),
     ]
     batch = _collate_saw_items(items, pad_token_id=0, device=torch.device("cpu"))
@@ -68,7 +68,7 @@ def test_collate_mixed_actor_logps_raises():
         make_item(
             [0, 1, 2],
             [0, 1, 1],
-            attachments=SampleAttachments(actor_logps=ActorTokenLogps(token_logps=[-1.0, -2.0])),
+            extras=[ActorTokenLogps(token_logps=[-1.0, -2.0])],
         ),
         make_item([0, 2, 1], [0, 1, 1], meta={}),  # missing
     ]

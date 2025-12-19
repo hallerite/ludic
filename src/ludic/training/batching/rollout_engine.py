@@ -17,7 +17,7 @@ from ludic.training.types import (
     SAWItem,
     SAWBatch,
     ActorTokenLogps,
-    SampleAttachments,
+    SampleExtra,
     RolloutRequest,
     ProtocolSpec,
     EnvSpec,
@@ -157,7 +157,7 @@ def _build_saw_item_from_token_trace(
       - `prompt_ids` + `completion_ids` become `input_ids` with a matching
         `action_mask` that is 1 on completion tokens.
       - `completion_logprobs` (if provided by the inference client) are attached as
-        typed `attachments.actor_logps`, aligned 1:1 with `completion_ids`.
+        typed extras (`ActorTokenLogps`), aligned 1:1 with `completion_ids`.
       - Step metadata is stored in JSON `meta` for logging/filtering/debugging.
 
     Returns:
@@ -180,11 +180,9 @@ def _build_saw_item_from_token_trace(
         prompt_len=len(prompt_ids),
     )
     meta.update(_strip_trace_info(step_info))
-    attachments = SampleAttachments()
+    extras: List[SampleExtra] = []
     if completion_logprobs is not None:
-        attachments = SampleAttachments(
-            actor_logps=ActorTokenLogps(token_logps=completion_logprobs)
-        )
+        extras.append(ActorTokenLogps(token_logps=completion_logprobs))
 
     return (
         SAWItem(
@@ -193,7 +191,7 @@ def _build_saw_item_from_token_trace(
             action_mask=action_mask,
             weight=weight,
             meta=meta,
-            attachments=attachments,
+            extras=extras,
         ),
         comp_len,
     )

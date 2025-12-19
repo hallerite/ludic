@@ -7,7 +7,7 @@ import torch
 
 from ludic.training.loss import ReverseKLLoss
 from ludic.training.trainer import _collate_saw_items
-from ludic.training.types import SAWItem, ActorTokenLogps, TeacherTokenLogps, SampleAttachments
+from ludic.training.types import SAWItem, ActorTokenLogps, TeacherTokenLogps
 
 
 def make_item(
@@ -25,10 +25,10 @@ def make_item(
         action_mask=action_mask,
         weight=weight,
         meta={},
-        attachments=SampleAttachments(
-            actor_logps=ActorTokenLogps(token_logps=list(actor_logprobs)),
-            teacher_logps=TeacherTokenLogps(token_logps=list(teacher_logprobs)),
-        ),
+        extras=[
+            ActorTokenLogps(token_logps=list(actor_logprobs)),
+            TeacherTokenLogps(token_logps=list(teacher_logprobs)),
+        ],
     )
 
 

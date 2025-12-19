@@ -20,10 +20,10 @@ async def annotate_teacher_logprobs(
     Attach per-action-token teacher-forced chosen-token logprobs to SAWItems.
 
     Writes:
-      - item.attachments.teacher_logps = TeacherTokenLogps(length == #action_tokens)
+      - item.extras includes TeacherTokenLogps(length == #action_tokens)
     """
     items = saw_batch.items
-    missing_indices = [i for i, it in enumerate(items) if it.attachments.teacher_logps is None]
+    missing_indices = [i for i, it in enumerate(items) if it.teacher_logps is None]
     if not missing_indices:
         return saw_batch
 
@@ -53,7 +53,7 @@ async def annotate_teacher_logprobs(
                     f"{expected_len} action-token logprobs, got {len(per_token) if isinstance(per_token, list) else type(per_token)}."
                 )
             values = [float(v) for v in per_token]
-            it.attachments.teacher_logps = TeacherTokenLogps(token_logps=values)
+            it.add_extra(TeacherTokenLogps(token_logps=values))
 
     return saw_batch
 

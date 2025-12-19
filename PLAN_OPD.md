@@ -20,10 +20,10 @@ OPD follows the same attachment-first design as PPO-style behavior logps.
 
 ### Attachments (source of truth)
 
-- `SAWItem.attachments.actor_logps`: behavior-policy per-token logprobs for the sampled action tokens.
-- `SAWItem.attachments.teacher_logps`: teacher per-token logprobs for the same sampled action tokens.
+- `SAWItem.extras` includes `ActorTokenLogps`: behavior-policy per-token logprobs for the sampled action tokens.
+- `SAWItem.extras` includes `TeacherTokenLogps`: teacher per-token logprobs for the same sampled action tokens.
 
-Both attachments are aligned to the completion (action) tokens only. There is **no**
+Both extras are aligned to the completion (action) tokens only. There is **no**
 metadata fallback or backfill in OPD.
 
 ### Collation
@@ -50,7 +50,7 @@ and applies them over the action tokens indicated by `action_mask`.
 Teacher scoring is done **upstream** of the Trainer:
 
 - `TeacherAnnotatedBatchSource` wraps any `BatchSource` and populates
-  `attachments.teacher_logps` using a `TeacherLogprobScorer`.
+  `TeacherTokenLogps` in `SAWItem.extras` using a `TeacherLogprobScorer`.
 - In pipeline RL, the actor process can annotate batches before pushing to Redis
   so the learner never calls the teacher.
 

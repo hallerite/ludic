@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 import pytest
 
 from ludic.training.algorithm import make_opd
-from ludic.training.types import SAWBatch, SAWItem, ActorTokenLogps, TeacherTokenLogps, SampleAttachments
+from ludic.training.types import SAWBatch, SAWItem, ActorTokenLogps, TeacherTokenLogps, SampleExtra
 
 
 def make_item(
@@ -15,7 +15,7 @@ def make_item(
     *,
     meta: Dict[str, Any] | None = None,
     weight: float = 1.0,
-    attachments: SampleAttachments | None = None,
+    extras: List[SampleExtra] | None = None,
 ) -> SAWItem:
     L = len(input_ids)
     return SAWItem(
@@ -24,7 +24,7 @@ def make_item(
         action_mask=action_mask,
         weight=weight,
         meta=meta or {},
-        attachments=attachments or SampleAttachments(),
+        extras=extras or [],
     )
 
 
@@ -36,10 +36,10 @@ def test_opd_preprocess_validates_teacher_and_actor_logprobs():
         make_item(
             [0, 1, 2],
             [0, 1, 1],
-            attachments=SampleAttachments(
-                actor_logps=ActorTokenLogps(token_logps=[-0.1, -0.2]),
-                teacher_logps=TeacherTokenLogps(token_logps=[-math.log(3.0), -math.log(3.0)]),
-            ),
+            extras=[
+                ActorTokenLogps(token_logps=[-0.1, -0.2]),
+                TeacherTokenLogps(token_logps=[-math.log(3.0), -math.log(3.0)]),
+            ],
             weight=7.0,
         )
     ]
@@ -59,11 +59,11 @@ def test_opd_requires_teacher_logprobs_if_no_scorer():
         make_item(
             [0, 1, 2],
             [0, 1, 1],
-            attachments=SampleAttachments(actor_logps=ActorTokenLogps(token_logps=[-0.1, -0.2])),
+            extras=[ActorTokenLogps(token_logps=[-0.1, -0.2])],
         )
     ]
     saw_batch = SAWBatch(items=items, meta={})
-    with pytest.raises(ValueError, match="teacher_logps"):
+    with pytest.raises(ValueError, match="TeacherTokenLogps"):
         assert algo.preprocess is not None
         algo.preprocess(saw_batch)
 
@@ -74,12 +74,10 @@ def test_opd_requires_actor_logprobs():
         make_item(
             [0, 1, 2],
             [0, 1, 1],
-            attachments=SampleAttachments(
-                teacher_logps=TeacherTokenLogps(token_logps=[-0.3, -0.4])
-            ),
+            extras=[TeacherTokenLogps(token_logps=[-0.3, -0.4])],
         )
     ]
     saw_batch = SAWBatch(items=items, meta={})
-    with pytest.raises(ValueError, match="actor_logps"):
+    with pytest.raises(ValueError, match="ActorTokenLogps"):
         assert algo.preprocess is not None
         algo.preprocess(saw_batch)

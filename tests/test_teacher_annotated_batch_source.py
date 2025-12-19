@@ -45,5 +45,5 @@ async def test_teacher_annotated_batch_source_adds_teacher_logprobs():
     batch = await annotated.next_batch()
     assert len(batch.items) == 1
     it = batch.items[0]
-    assert it.attachments.teacher_logps == TeacherTokenLogps(token_logps=[-math.log(3.0), -math.log(3.0)])
+    assert it.teacher_logps == TeacherTokenLogps(token_logps=[-math.log(3.0), -math.log(3.0)])
     assert "teacher_token_logprobs" not in it.meta
