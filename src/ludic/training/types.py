@@ -127,6 +127,24 @@ class ActorTokenLogps:
             raise TypeError("ActorTokenLogps.token_logps must be a List[float].")
 
 
+@dataclass(frozen=True)
+class TeacherTokenLogps:
+    """
+    Per-token logprobs under the teacher policy, aligned to the sampled completion tokens.
+
+    `token_logps[i]` corresponds to the chosen-token logprob for
+    `completion_token_ids[i]`.
+    """
+
+    token_logps: List[float]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.token_logps, list) or not all(
+            isinstance(v, (int, float)) for v in self.token_logps
+        ):
+            raise TypeError("TeacherTokenLogps.token_logps must be a List[float].")
+
+
 @dataclass
 class SampleAttachments:
     """
@@ -137,6 +155,7 @@ class SampleAttachments:
     """
 
     actor_logps: Optional[ActorTokenLogps] = None
+    teacher_logps: Optional[TeacherTokenLogps] = None
 
 
 class HasActorLogps(Protocol):
@@ -150,6 +169,14 @@ class HasActorLogps(Protocol):
     actor_logps: ActorTokenLogps
 
 
+class HasTeacherLogps(Protocol):
+    """
+    Structural “extension”: a sample that is guaranteed to carry per-token teacher logps.
+    """
+
+    teacher_logps: TeacherTokenLogps
+
+
 def has_actor_logps(item: "SAWItem") -> TypeGuard[HasActorLogps]:
     """
     Type guard for `HasActorLogps`.
@@ -159,6 +186,14 @@ def has_actor_logps(item: "SAWItem") -> TypeGuard[HasActorLogps]:
     """
 
     return item.actor_logps is not None
+
+
+def has_teacher_logps(item: "SAWItem") -> TypeGuard[HasTeacherLogps]:
+    """
+    Type guard for `HasTeacherLogps`.
+    """
+
+    return item.teacher_logps is not None
 
 
 @dataclass
@@ -172,8 +207,8 @@ class SAWItem:
     - weight: scalar credit for this sample
     - meta: arbitrary rollout/step metadata (JSON-serializable; for logging,
       debugging, filtering, etc.)
-    - attachments: typed, non-JSON training attachments (e.g. actor logps needed
-      for PPO/GRPO ratios)
+    - attachments: typed, non-JSON training attachments (e.g. actor logps for
+      PPO/GRPO ratios, teacher logps for OPD)
     """
     input_ids: List[int]
     attention_mask: List[int]
@@ -185,6 +220,10 @@ class SAWItem:
     @property
     def actor_logps(self) -> Optional[ActorTokenLogps]:
         return self.attachments.actor_logps
+
+    @property
+    def teacher_logps(self) -> Optional[TeacherTokenLogps]:
+        return self.attachments.teacher_logps
 
 @dataclass
 class SAWBatch:

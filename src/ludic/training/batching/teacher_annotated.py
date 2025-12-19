@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from ludic.training.types import BatchSource, SAWBatch
+from ludic.training.types import BatchSource, SAWBatch, TeacherTokenLogps
 from ludic.training.teacher import (
     TeacherLogprobScorer,
     AsyncTeacherLogprobScorer,
@@ -15,16 +15,15 @@ async def annotate_teacher_logprobs(
     *,
     teacher_scorer: TeacherLogprobScorer | AsyncTeacherLogprobScorer,
     teacher_chunk_size: Optional[int] = None,
-    meta_key: str = "teacher_token_logprobs",
 ) -> SAWBatch:
     """
     Attach per-action-token teacher-forced chosen-token logprobs to SAWItems.
 
     Writes:
-      - item.meta[meta_key] = List[float] of length == #action_tokens
+      - item.attachments.teacher_logps = TeacherTokenLogps(length == #action_tokens)
     """
     items = saw_batch.items
-    missing_indices = [i for i, it in enumerate(items) if not isinstance(it.meta.get(meta_key), list)]
+    missing_indices = [i for i, it in enumerate(items) if it.attachments.teacher_logps is None]
     if not missing_indices:
         return saw_batch
 
@@ -53,7 +52,8 @@ async def annotate_teacher_logprobs(
                     "Teacher scorer length mismatch: expected "
                     f"{expected_len} action-token logprobs, got {len(per_token) if isinstance(per_token, list) else type(per_token)}."
                 )
-            it.meta[meta_key] = [float(v) for v in per_token]
+            values = [float(v) for v in per_token]
+            it.attachments.teacher_logps = TeacherTokenLogps(token_logps=values)
 
     return saw_batch
 
@@ -72,12 +72,10 @@ class TeacherAnnotatedBatchSource(BatchSource):
         *,
         teacher_scorer: TeacherLogprobScorer | AsyncTeacherLogprobScorer,
         teacher_chunk_size: Optional[int] = None,
-        meta_key: str = "teacher_token_logprobs",
     ) -> None:
         self._inner = inner
         self._teacher_scorer = teacher_scorer
         self._teacher_chunk_size = teacher_chunk_size
-        self._meta_key = meta_key
 
     async def next_batch(self) -> SAWBatch:
         saw_batch = await self._inner.next_batch()
@@ -85,5 +83,4 @@ class TeacherAnnotatedBatchSource(BatchSource):
             saw_batch,
             teacher_scorer=self._teacher_scorer,
             teacher_chunk_size=self._teacher_chunk_size,
-            meta_key=self._meta_key,
         )

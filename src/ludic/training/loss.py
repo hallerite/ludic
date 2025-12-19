@@ -185,17 +185,17 @@ class MaskedCausalLMCrossEntropyLoss:
 
 
 @dataclass
-class OnPolicyDistillationLoss:
+class ReverseKLLoss:
     """
-    On-Policy Distillation (OPD) using per-token reverse-KL advantages.
+    Reverse-KL loss using per-token advantages.
 
     Expects:
       - batch["input_ids"]: [B, T]
       - batch["action_mask"]: [B, T] (1 on action/completion tokens)
-      - batch["teacher_token_logprobs"]: [B, T-1] teacher-forced chosen-token logprobs,
-            aligned to targets input_ids[:, 1:] and zero elsewhere.
-      - batch["old_token_logprobs"]: [B, T-1] behavior-policy chosen-token logprobs,
-            aligned to targets input_ids[:, 1:] and zero elsewhere.
+      - batch["teacher_logps"]: [B, T] teacher-forced chosen-token logprobs,
+            aligned to input_ids with zeros outside the action region.
+      - batch["actor_logps"]: [B, T] behavior-policy chosen-token logprobs,
+            aligned to input_ids with zeros outside the action region.
 
     Optional:
       - batch["weight"]: [B] scalar env-derived weight; used only when env_weight_coef != 0.
@@ -214,13 +214,13 @@ class OnPolicyDistillationLoss:
         input_ids = batch["input_ids"]  # [B, T]
         action_mask = batch["action_mask"].to(dtype=torch.float32)  # [B, T]
 
-        if "teacher_token_logprobs" not in batch:
-            raise KeyError("OnPolicyDistillationLoss requires 'teacher_token_logprobs' in batch.")
-        if "old_token_logprobs" not in batch:
-            raise KeyError("OnPolicyDistillationLoss requires 'old_token_logprobs' in batch.")
+        if "teacher_logps" not in batch:
+            raise KeyError("ReverseKLLoss requires 'teacher_logps' in batch.")
+        if "actor_logps" not in batch:
+            raise KeyError("ReverseKLLoss requires 'actor_logps' in batch.")
 
-        teacher_lp = batch["teacher_token_logprobs"].to(dtype=torch.float32)  # [B, T-1]
-        old_lp = batch["old_token_logprobs"].to(dtype=torch.float32)  # [B, T-1]
+        teacher_lp = batch["teacher_logps"].to(dtype=torch.float32)  # [B, T]
+        actor_lp = batch["actor_logps"].to(dtype=torch.float32)  # [B, T]
 
         if logits.ndim != 3:
             raise ValueError(f"Expected logits [B, T, V], got {tuple(logits.shape)}")
@@ -236,18 +236,20 @@ class OnPolicyDistillationLoss:
 
         # Mask that selects action tokens in the target positions.
         action_mask_shifted = action_mask[:, 1:]  # [B, T-1]
+        teacher_lp_shifted = teacher_lp[:, 1:]  # [B, T-1]
+        actor_lp_shifted = actor_lp[:, 1:]  # [B, T-1]
 
-        if teacher_lp.shape != token_logp.shape:
+        if teacher_lp_shifted.shape != token_logp.shape:
             raise ValueError(
-                f"teacher_token_logprobs shape {tuple(teacher_lp.shape)} must match token_logp {tuple(token_logp.shape)}"
+                f"teacher_logps shape {tuple(teacher_lp_shifted.shape)} must match token_logp {tuple(token_logp.shape)}"
             )
-        if old_lp.shape != token_logp.shape:
+        if actor_lp_shifted.shape != token_logp.shape:
             raise ValueError(
-                f"old_token_logprobs shape {tuple(old_lp.shape)} must match token_logp {tuple(token_logp.shape)}"
+                f"actor_logps shape {tuple(actor_lp_shifted.shape)} must match token_logp {tuple(token_logp.shape)}"
             )
 
         # Per-token reverse KL advantage (discount=0): A_t = logp_teacher - logp_old_student
-        advantages = (teacher_lp - old_lp).detach() * self.opd_coef  # [B, T-1]
+        advantages = (teacher_lp_shifted - actor_lp_shifted).detach() * self.opd_coef  # [B, T-1]
 
         # Optional hybrid term: broadcast env weight across action tokens.
         if self.env_weight_coef != 0.0:
@@ -269,8 +271,8 @@ class OnPolicyDistillationLoss:
         # Useful diagnostics.
         with torch.no_grad():
             denom_tokens = action_mask_shifted.sum().clamp(min=1.0)
-            mean_reverse_kl = ((token_logp - teacher_lp) * action_mask_shifted).sum() / denom_tokens
-            mean_adv = ((teacher_lp - old_lp) * action_mask_shifted).sum() / denom_tokens
+            mean_reverse_kl = ((token_logp - teacher_lp_shifted) * action_mask_shifted).sum() / denom_tokens
+            mean_adv = ((teacher_lp_shifted - actor_lp_shifted) * action_mask_shifted).sum() / denom_tokens
 
         stats: Dict[str, Any] = {
             "loss": float(loss.detach().cpu()),

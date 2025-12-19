@@ -7,7 +7,7 @@ import pytest
 
 from ludic.training.batching.teacher_annotated import TeacherAnnotatedBatchSource
 from ludic.training.teacher import TeacherLogprobScorer
-from ludic.training.types import BatchSource, SAWBatch, SAWItem
+from ludic.training.types import BatchSource, SAWBatch, SAWItem, TeacherTokenLogps
 
 
 class DummyBatchSource(BatchSource):
@@ -45,5 +45,5 @@ async def test_teacher_annotated_batch_source_adds_teacher_logprobs():
     batch = await annotated.next_batch()
     assert len(batch.items) == 1
     it = batch.items[0]
-    assert it.meta["teacher_token_logprobs"] == [-math.log(3.0), -math.log(3.0)]
-
+    assert it.attachments.teacher_logps == TeacherTokenLogps(token_logps=[-math.log(3.0), -math.log(3.0)])
+    assert "teacher_token_logprobs" not in it.meta
