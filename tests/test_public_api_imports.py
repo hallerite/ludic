@@ -11,7 +11,7 @@ def test_top_level_exports_import() -> None:
     from ludic.interaction import InteractionProtocol, SingleAgentSyncProtocol, MultiAgentProtocol, TraceCollector  # noqa: F401
     from ludic.parsers import boxed_parser, xml_tag_parser, compose_parsers, think_prefix_parser  # noqa: F401
     from ludic.distributed import create_vllm_publisher  # noqa: F401
-    from ludic.types import Rollout, Step, SamplingArgs  # noqa: F401
+    from ludic.types import Rollout, Step  # noqa: F401
 
 
 def test_training_exports_import() -> None:

@@ -4,7 +4,8 @@ from typing import Optional, Dict, List, Set
 
 from ludic.envs.env import LudicEnv
 from ludic.agents.base_agent import Agent
-from ludic.types import Rollout, Step, StepOutcome, SamplingArgs
+from ludic.types import Rollout, Step, StepOutcome
+from ludic.inference.request import InferenceSpec
 from .base import InteractionProtocol
 from .step_collector import TraceCollector
 from .info import merge_step_info
@@ -44,12 +45,12 @@ class MultiAgentProtocol(InteractionProtocol):
         *,
         env: LudicEnv,
         max_steps: int,
-        seed: Optional[int] = None,
-        sampling_args: Optional[SamplingArgs] = None,
+        env_seed: Optional[int] = None,
+        sampling_seed: Optional[int] = None,
+        inference: Optional[InferenceSpec] = None,
         timeout_s: Optional[float] = None,
     ) -> List[Rollout]:
-
-        sargs: SamplingArgs = sampling_args or {}
+        inf = inference or InferenceSpec()
 
         # Initialize the collector to track separate histories per agent
         collector = TraceCollector(
@@ -62,7 +63,7 @@ class MultiAgentProtocol(InteractionProtocol):
         finished_agents: Set[str] = set()
 
         # 1. --- Reset Env and all managed Agents ---
-        obs_info_dict = env.reset(seed=seed)
+        obs_info_dict = env.reset(seed=env_seed)
         sys_prompt = getattr(env, "suggested_sysprompt", None)
 
         for agent_id, agent in self.agent_map.items():
@@ -115,7 +116,7 @@ class MultiAgentProtocol(InteractionProtocol):
 
             # --- C. Gather actions in parallel ---
             tasks = [
-                agent.act(sampling_args=sargs, timeout_s=timeout_s)
+                agent.act(inference=inf, sampling_seed=sampling_seed, timeout_s=timeout_s)
                 for agent in agents_to_poll.values()
             ]
             results = await asyncio.gather(*tasks)
@@ -125,7 +126,7 @@ class MultiAgentProtocol(InteractionProtocol):
             # Temporary storage to hold data needed for logging after the env step
             step_context_cache: Dict[str, Dict] = {}
 
-            for agent_id, (parse_result, raw, info) in zip(
+            for agent_id, (parse_result, raw, info, token_trace) in zip(
                 agents_to_poll.keys(), results
             ):
                 # Cache context for this specific agent's step
@@ -134,6 +135,7 @@ class MultiAgentProtocol(InteractionProtocol):
                     "raw_action": raw,
                     "client_info": info,
                     "parse_result": parse_result,
+                    "token_trace": token_trace,
                 }
 
                 if parse_result.action is not None:
@@ -150,6 +152,7 @@ class MultiAgentProtocol(InteractionProtocol):
             for agent_id, ctx in step_context_cache.items():
                 parse_result = ctx["parse_result"]
                 client_info = ctx["client_info"]
+                token_trace = ctx.get("token_trace")
 
                 # Did parsing fail?
                 if parse_result.action is None:
@@ -164,6 +167,7 @@ class MultiAgentProtocol(InteractionProtocol):
                             client_info=client_info,
                             extra={"parse_error": True},
                         ),
+                        trace=token_trace,
                     )
                 else:
                     # Normal environment outcome
@@ -185,6 +189,7 @@ class MultiAgentProtocol(InteractionProtocol):
                             client_info=client_info,
                             env_info=raw_outcome.info,
                         ),
+                        trace=token_trace,
                     )
 
                 # Track if this agent has finished
@@ -205,6 +210,7 @@ class MultiAgentProtocol(InteractionProtocol):
                     truncated=outcome.truncated,
                     terminated=outcome.terminated,
                     info=outcome.info,
+                    trace=outcome.trace,
                 )
                 collector.add(agent_id, step)
 

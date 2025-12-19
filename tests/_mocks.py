@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import torch
 
-from typing import Any, Optional, List, Tuple, Mapping, Dict
-from dataclasses import asdict
-
+from typing import Any, Optional, Tuple, Mapping, Dict
 from ludic.envs.single_agent_env import SingleAgentEnv
-from ludic.types import Message, StepOutcome, Observation, Info
+from ludic.types import StepOutcome, Observation, Info
 from ludic.inference.client import ChatResponse, ChatClient
-from ludic.inference.sampling import SamplingConfig
+from ludic.inference.request import ChatCompletionRequest
 from ludic.agents.base_agent import Agent
 from ludic.context.base import ContextStrategy
 from ludic.context.full_dialog import FullDialog
@@ -38,13 +36,10 @@ class MockClient(ChatClient):
 
     async def complete(
         self,
-        *,
-        model: str,
-        messages: List[Message],
-        sampling: SamplingConfig,
+        request: ChatCompletionRequest,
     ) -> tuple[ChatResponse, Dict[str, Any]]:
         resp = ChatResponse(text=self._text, finish_reason=self._finish_reason)
-        return resp, {"used_args": asdict(sampling)}
+        return resp, {"used_request": request.to_dict()}
 
     def sync_weights(self, params: Mapping[str, torch.Tensor], **kwargs) -> str:  # type: ignore[name-defined]
         return "mock-version"
@@ -81,14 +76,13 @@ class SeedableMockClient(ChatClient):
 
     async def complete(
         self,
-        *,
-        model: str,
-        messages: List[Message],
-        sampling: SamplingConfig,
+        request: ChatCompletionRequest,
     ) -> tuple[ChatResponse, Dict[str, Any]]:
         
         # Get the deterministic text output based on the sampling seed
-        text_out = self._seed_map.get(sampling.seed, "DEFAULT_FALLBACK")
+        if request.seed is None:
+            raise ValueError("SeedableMockClient requires request.seed to be set")
+        text_out = self._seed_map.get(int(request.seed), "DEFAULT_FALLBACK")
         
         resp = ChatResponse(
             text=text_out,
@@ -97,7 +91,7 @@ class SeedableMockClient(ChatClient):
             completion_token_ids=[10, 11] # Action
         )
         # Return the serializable dict, not the object
-        return resp, {"used_args": asdict(sampling)}
+        return resp, {"used_request": request.to_dict()}
 
     def sync_weights(self, params: Mapping[str, torch.Tensor], **kwargs) -> str:
         # Not needed for this test

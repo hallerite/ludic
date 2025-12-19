@@ -6,6 +6,7 @@ from ludic.interaction.single_agent import SingleAgentSyncProtocol
 from ludic.interaction.multi_agent import MultiAgentProtocol
 from ludic.agents.base_agent import Agent
 from ludic.inference.client import ChatResponse
+from ludic.inference.request import ChatCompletionRequest
 from ludic.parsers import (
     ParseResult,
     xml_tag_parser,
@@ -33,7 +34,6 @@ async def test_happy_path_terminates_immediately():
     rollouts = await protocol.run(
         env=env,
         max_steps=5,
-        sampling_args={},
     )
 
     assert len(rollouts) == 1
@@ -46,8 +46,8 @@ async def test_happy_path_terminates_immediately():
 @pytest.mark.asyncio
 async def test_truncation_when_agent_is_wrong():
     class WrongClient(MockClient):
-        async def complete(self, *, model, messages, sampling, **kwargs):
-            return ChatResponse(text="nope"), {"used_args": sampling}
+        async def complete(self, request: ChatCompletionRequest, **kwargs):
+            return ChatResponse(text="nope"), {"used_request": request.to_dict()}
 
     env = MockEnv(max_steps=2, target="1")
     agent = MockAgent(client=WrongClient())
@@ -56,7 +56,6 @@ async def test_truncation_when_agent_is_wrong():
     rollouts = await protocol.run(
         env=env,
         max_steps=10,
-        sampling_args={},
     )
 
     assert len(rollouts) == 1
@@ -103,7 +102,6 @@ async def test_run_episode_uses_action_parser_and_logs_parsed_action():
     rollouts = await protocol.run(
         env=env,
         max_steps=5,
-        sampling_args={},
     )
 
     assert len(rollouts) == 1
@@ -341,7 +339,7 @@ async def test_single_agent_protocol_logs_parser_failure_without_env_step():
     )
     protocol = SingleAgentSyncProtocol(agent=agent)
 
-    rollouts = await protocol.run(env=env, max_steps=1, sampling_args={})
+    rollouts = await protocol.run(env=env, max_steps=1)
 
     assert env.step_calls == 0
     assert len(rollouts) == 1
@@ -410,7 +408,7 @@ async def test_multi_agent_protocol_excludes_parse_fail_actions_and_logs_synthet
     bad_agent = MockAgent(client=MockClient(text="BADRAW"), parser=always_fail_parser)
 
     protocol = MultiAgentProtocol(agents={"A": good_agent, "B": bad_agent})
-    rollouts = await protocol.run(env=env, max_steps=3, sampling_args={})
+    rollouts = await protocol.run(env=env, max_steps=3)
 
     assert env.last_actions == {"A": "GOOD"}
     assert len(rollouts) == 2
@@ -465,7 +463,7 @@ async def test_multi_agent_protocol_all_parse_fail_does_not_step_env():
     agent_b = MockAgent(client=MockClient(text="RAW_B"), parser=always_fail_parser)
 
     protocol = MultiAgentProtocol(agents={"A": agent_a, "B": agent_b})
-    rollouts = await protocol.run(env=env, max_steps=1, sampling_args={})
+    rollouts = await protocol.run(env=env, max_steps=1)
 
     assert env.step_calls == 0
     assert len(rollouts) == 2
@@ -502,7 +500,7 @@ async def test_single_agent_max_steps_truncation():
     protocol = SingleAgentSyncProtocol(agent=agent)
 
     # Protocol max_steps=3, so we'll hit that before env's max_steps
-    rollouts = await protocol.run(env=env, max_steps=3, sampling_args={})
+    rollouts = await protocol.run(env=env, max_steps=3)
 
     assert len(rollouts) == 1
     r = rollouts[0]
@@ -538,7 +536,7 @@ async def test_single_agent_env_truncation_preserved():
     protocol = SingleAgentSyncProtocol(agent=agent)
 
     # Protocol allows many steps, but env will truncate at 2
-    rollouts = await protocol.run(env=env, max_steps=100, sampling_args={})
+    rollouts = await protocol.run(env=env, max_steps=100)
 
     assert len(rollouts) == 1
     r = rollouts[0]
@@ -563,7 +561,7 @@ async def test_single_agent_normal_termination_not_truncated():
     agent = MockAgent(client=MockClient(text="win"))
     protocol = SingleAgentSyncProtocol(agent=agent)
 
-    rollouts = await protocol.run(env=env, max_steps=100, sampling_args={})
+    rollouts = await protocol.run(env=env, max_steps=100)
 
     assert len(rollouts) == 1
     r = rollouts[0]
@@ -622,7 +620,7 @@ async def test_multi_agent_max_steps_truncation():
     agent_b = MockAgent(client=MockClient(text="action_b"))
 
     protocol = MultiAgentProtocol(agents={"A": agent_a, "B": agent_b})
-    rollouts = await protocol.run(env=env, max_steps=3, sampling_args={})
+    rollouts = await protocol.run(env=env, max_steps=3)
 
     assert len(rollouts) == 2
 
@@ -696,7 +694,7 @@ async def test_multi_agent_independent_termination():
     agent_b = MockAgent(client=MockClient(text="action_b"))
 
     protocol = MultiAgentProtocol(agents={"A": agent_a, "B": agent_b})
-    rollouts = await protocol.run(env=env, max_steps=5, sampling_args={})
+    rollouts = await protocol.run(env=env, max_steps=5)
 
     assert len(rollouts) == 2
 

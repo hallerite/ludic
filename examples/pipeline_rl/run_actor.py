@@ -4,7 +4,7 @@ import asyncio
 # Ludic Imports
 from ludic.agent import Agent
 from ludic.context import FullDialog
-from ludic.inference import VLLMChatClient
+from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec
 from ludic.parsers import xml_tag_parser
 from ludic.training import (
     RolloutEngine,
@@ -62,17 +62,16 @@ def make_requests() -> list[RolloutRequest]:
     base_prompt = TicTacToeEnv().suggested_sysprompt or ""
     training_prompt = base_prompt + "\n\nOutput your move as a single XML tag, e.g., <move>A1</move>."
 
-    sampling_args = {
-        "temperature": 1.0, 
-        "max_tokens": 100,
-        "extras": {"extra_body": {"return_token_ids": True}} 
-    }
+    inference = InferenceSpec(
+        sampling=SamplingParams(temperature=1.0, max_tokens=100),
+        return_=ReturnSpec.for_eval(return_token_ids=True),
+    )
     
     return [
         RolloutRequest(
             env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": True}),
             protocol=ProtocolSpec(kind="single_agent", kwargs={}),
-            sampling_args=sampling_args, 
+            inference=inference,
             num_episodes=1, 
         )
     ]
@@ -98,7 +97,6 @@ async def main():
         max_steps=5,
         concurrency=16,      # Higher concurrency = higher throughput
         client=client,       # Needed to tag data with policy version
-        retokenize=False
     )
 
 if __name__ == "__main__":

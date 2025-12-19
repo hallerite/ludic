@@ -3,7 +3,8 @@ from typing import Optional, List
 
 from ludic.envs.env import LudicEnv
 from ludic.agents.base_agent import Agent
-from ludic.types import Rollout, Step, StepOutcome, SamplingArgs
+from ludic.types import Rollout, Step, StepOutcome
+from ludic.inference.request import InferenceSpec
 from .base import InteractionProtocol
 from .info import merge_step_info
 
@@ -55,13 +56,14 @@ class SingleAgentSyncProtocol(InteractionProtocol):
         *,
         env: LudicEnv,
         max_steps: int,
-        seed: Optional[int] = None,
-        sampling_args: Optional[SamplingArgs] = None,
+        env_seed: Optional[int] = None,
+        sampling_seed: Optional[int] = None,
+        inference: Optional[InferenceSpec] = None,
         timeout_s: Optional[float] = None,
     ) -> List[Rollout]:
         
         agent = self.agent
-        sargs: SamplingArgs = sampling_args or {}
+        inf = inference or InferenceSpec()
 
         # 1. --- Validate Env and get Agent ID ---
         agent_ids = env.agent_ids
@@ -74,7 +76,7 @@ class SingleAgentSyncProtocol(InteractionProtocol):
 
         # 2. --- Reset Env ---
         # env.reset() returns a dict
-        obs_info_dict = env.reset(seed=seed)
+        obs_info_dict = env.reset(seed=env_seed)
         obs, info = obs_info_dict[agent_id]
         
         # 3. --- Reset Agent & Feed First Obs ---
@@ -102,8 +104,9 @@ class SingleAgentSyncProtocol(InteractionProtocol):
             current_obs_for_step = obs
             
             # --- A. Call the Agent ---
-            parse_result, raw_action, client_info = await agent.act(
-                sampling_args=sargs,
+            parse_result, raw_action, client_info, token_trace = await agent.act(
+                inference=inf,
+                sampling_seed=sampling_seed,
                 timeout_s=timeout_s
             )
             # --- B. Handle Parser Failure ---
@@ -123,6 +126,7 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                         client_info=client_info,
                         extra={"parse_error": True},
                     ),
+                    trace=token_trace,
                 )
                 
                 # Log this failure step
@@ -135,6 +139,7 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                     truncated=outcome.truncated,
                     terminated=outcome.terminated,
                     info=outcome.info,
+                    trace=outcome.trace,
                 ))
                 # When stopping on parse error, we still want to feed the synthetic
                 # observation back into the context before exiting.
@@ -167,7 +172,8 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                     reward=total_reward,
                     truncated=env_outcome.truncated,
                     terminated=env_outcome.terminated,
-                    info=step_info
+                    info=step_info,
+                    trace=token_trace,
                 )
 
                 # Log this success step
@@ -184,6 +190,7 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                     truncated=outcome.truncated,
                     terminated=outcome.terminated,
                     info=step_info,
+                    trace=outcome.trace,
                 ))
 
             # --- D. Update state for next loop ---

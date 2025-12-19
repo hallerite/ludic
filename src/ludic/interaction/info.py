@@ -5,12 +5,7 @@ from typing import Any, Dict, Mapping, Optional
 
 log = logging.getLogger(__name__)
 
-RESERVED_INFO_KEYS = {
-    "prompt_token_ids",
-    "completion_token_ids",
-    "completion_logprobs",
-    "finish_reason",
-}
+RESERVED_INFO_KEYS: set[str] = set()
 
 
 def merge_step_info(
@@ -21,7 +16,9 @@ def merge_step_info(
     reserved_keys: set[str] = RESERVED_INFO_KEYS,
 ) -> Dict[str, Any]:
     """
-    Merge Step.info dictionaries with safety around "reserved" training keys.
+    Merge Step.info dictionaries with safety around "reserved" keys.
+
+    Token traces live on Step.trace, so Step.info should stay JSON-only.
 
     Precedence:
       1) client_info seeds the dict
@@ -49,4 +46,3 @@ def merge_step_info(
     _merge_in(env_info, src_name="env_info")
     _merge_in(extra, src_name="extra")
     return merged
-

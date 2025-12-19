@@ -53,6 +53,11 @@ def start_vllm_server(
     if max_model_len is not None:
         cmd.extend(["--max-model-len", str(max_model_len)])
 
+    # vLLM can load model-provided HF generation configs that override default
+    # sampling params. Default to `vllm` unless the caller explicitly opts out.
+    if not any(a == "--generation-config" or a.startswith("--generation-config=") for a in extra_args):
+        cmd.extend(["--generation-config", "vllm"])
+
     cmd.extend(extra_args)
 
     if enforce_eager:

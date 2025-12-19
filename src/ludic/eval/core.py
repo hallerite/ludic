@@ -10,7 +10,7 @@ Eval items are dicts shaped like training `SAWItem.meta` (one per step).
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 
 from ludic.training.batching.rollout_engine import RolloutEngine
 from ludic.training.stats import Reducer, apply_reducers_to_records
@@ -27,8 +27,9 @@ def _eval_items_from_rollout(rollout: Rollout) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     for step in rollout.steps:
         info = step.info or {}
-        completion_ids = info.get("completion_token_ids") or []
-        comp_len = len(completion_ids) if isinstance(completion_ids, list) else 0
+        trace = step.trace
+        completion_ids = trace.completion_token_ids if trace is not None else []
+        comp_len = len(completion_ids)
 
         meta: Dict[str, Any] = {
             "rollout_id": rollout.id,

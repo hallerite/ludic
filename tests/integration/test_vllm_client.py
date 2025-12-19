@@ -3,10 +3,9 @@ from __future__ import annotations
 import pytest
 
 from ludic.inference.vllm_client import VLLMChatClient
-from ludic.inference.sampling import (
-    get_default_sampling_config,
-    SamplingConfig,
-)
+from ludic.inference.request import ChatCompletionRequest, ReturnSpec
+from ludic.inference.extensions import VLLMExtensions
+from ludic.inference.sampling import SamplingParams
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -24,7 +23,7 @@ async def test_vllm_client_completion_roundtrip(
     """
     Basic completion sanity check against the live vLLM server.
     """
-    sampling = get_default_sampling_config()
+    sampling = SamplingParams()
 
     messages = [
         {
@@ -38,9 +37,12 @@ async def test_vllm_client_completion_roundtrip(
     ]
 
     resp, info = await vllm_client.complete(
-        model=vllm_model_name,
-        messages=messages,
-        sampling=sampling,
+        ChatCompletionRequest(
+            model=vllm_model_name,
+            messages=messages,
+            sampling=sampling,
+            return_=ReturnSpec.for_eval(return_token_ids=True),
+        )
     )
 
     assert isinstance(resp.text, str)
@@ -64,19 +66,9 @@ async def test_vllm_client_same_seed_is_deterministic(
     fully deterministic outputs: same text, same token IDs, same
     prompt token IDs.
     """
-    base = get_default_sampling_config()
     seed_value = 1234
 
-    sampling_with_seed = SamplingConfig(
-        seed=seed_value,
-        temperature=0.0,
-        max_tokens=base.max_tokens,
-        top_p=1.0,
-        frequency_penalty=0.0,
-        presence_penalty=0.0,
-        stop=base.stop,
-        extras=base.extras,
-    )
+    sampling = SamplingParams(temperature=0.0, max_tokens=256)
 
     messages = [
         {
@@ -92,10 +84,13 @@ async def test_vllm_client_same_seed_is_deterministic(
     results = []
     for _ in range(3):
         resp, _ = await vllm_client.complete(
-            model=vllm_model_name,
-            messages=messages,
-            sampling=sampling_with_seed,
-            return_token_ids=True,
+            ChatCompletionRequest(
+                model=vllm_model_name,
+                messages=messages,
+                sampling=sampling,
+                seed=seed_value,
+                return_=ReturnSpec.for_eval(return_token_ids=True),
+            )
         )
         assert resp.text.strip() != ""
         results.append(resp)
@@ -115,7 +110,7 @@ async def test_vllm_client_returns_token_ids_and_detok(
     """
     Ensure return_token_ids=True yields token IDs + prompt token IDs.
     """
-    sampling = get_default_sampling_config()
+    sampling = SamplingParams()
 
     messages = [
         {"role": "system", "content": "You are a test assistant."},
@@ -123,10 +118,12 @@ async def test_vllm_client_returns_token_ids_and_detok(
     ]
 
     resp, _ = await vllm_client.complete(
-        model=vllm_model_name,
-        messages=messages,
-        sampling=sampling,
-        return_token_ids=True,
+        ChatCompletionRequest(
+            model=vllm_model_name,
+            messages=messages,
+            sampling=sampling,
+            return_=ReturnSpec.for_eval(return_token_ids=True),
+        )
     )
 
     assert resp.text.strip() != ""
@@ -148,17 +145,7 @@ async def test_vllm_global_think_processor_triggers_at_very_small_max_think(
 
     interrupt_thinking = 1  # trigger almost immediately
 
-    base = get_default_sampling_config()
-    sampling = SamplingConfig(
-        seed=123,
-        temperature=base.temperature,
-        max_tokens=base.max_tokens,
-        top_p=base.top_p,
-        frequency_penalty=base.frequency_penalty,
-        presence_penalty=base.presence_penalty,
-        stop=base.stop,
-        extras=base.extras,
-    )
+    sampling = SamplingParams()
 
     messages = [
         {
@@ -175,11 +162,14 @@ async def test_vllm_global_think_processor_triggers_at_very_small_max_think(
     ]
 
     resp, _ = await vllm_client.complete(
-        model=vllm_model_name,
-        messages=messages,
-        sampling=sampling,
-        interrupt_thinking=interrupt_thinking,
-        return_token_ids=True,
+        ChatCompletionRequest(
+            model=vllm_model_name,
+            messages=messages,
+            sampling=sampling,
+            seed=123,
+            return_=ReturnSpec.for_eval(return_token_ids=True),
+            extensions=VLLMExtensions(max_think=interrupt_thinking),
+        )
     )
 
     assert resp.text.strip() != ""

@@ -6,7 +6,7 @@ from .cli import (
     add_common_eval_args,
     maybe_start_vllm,
     build_single_agent_engine,
-    sampling_args_from_cli,
+    inference_spec_from_cli,
     write_jsonl,
 )
 
@@ -18,6 +18,6 @@ __all__ = [
     "add_common_eval_args",
     "maybe_start_vllm",
     "build_single_agent_engine",
-    "sampling_args_from_cli",
+    "inference_spec_from_cli",
     "write_jsonl",
 ]

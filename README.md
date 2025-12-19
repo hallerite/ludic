@@ -87,36 +87,27 @@ uv sync --group examples
 
 ### New Algorithms
 
-- Add on-policy distillation, plus a script for the MOPD variant introduced in: https://github.com/XiaomiMiMo/MiMo-V2-Flash/blob/main/paper.pdf
-- Add Single Stream Policy Optimization (as described in https://arxiv.org/abs/2509.13232v2).
+### High Priority
+- Add on-policy distillation
+	- plus a script for the MOPD variant introduced in [MiMo-V2-Flash](https://github.com/XiaomiMiMo/MiMo-V2-Flash/blob/main/paper.pdf)
+- Add a classic Gym-style registry for agent harnesses, environments, and interaction protocols (so they don’t have to be built on the fly).
+   - this will also allow us to create general eval and training scripts instead of hand-crafted ones
+- Use proper FSDP2 wrapping in the training scripts
+- Move to Token-In/Token-Out API
+	- we currently have a Token-Out API already
 
-### Algorithmic Improvements
-- Implement the findings of the LLM Data co. regarding importance sampling:
-   - https://www.llmdata.com/blog/mismatch-praxis/
+### Medium Priority
 
-### Environments & Agents
+- Add Single Stream Policy Optimization (as described in [this paper](https://arxiv.org/abs/2509.13232v2)).
+
+- Implement the [findings](https://www.llmdata.com/blog/mismatch-praxis/) from the LLM Data co. regarding **importance sampling**:
 - Build agent harness & environment for Pokemon!
    - the agent harness and env are fused together in Claude Plays Pokemon: https://github.com/davidhershey/ClaudePlaysPokemonStarter.
-   - our goal is to disentangle them!
+   - we should disentangle them into a re-usable agent harness and the different Pokemon games as environments
+- create [Rustorio](https://github.com/albertsgarde/rustorio) env
+- add agent with context folding as described in [this paper](https://context-folding.github.io/)
 
-- create Rustorio env
-   - https://github.com/albertsgarde/rustorio
-
-- Agent with folding
-   - https://context-folding.github.io/
-
-
-### QOL Improvements
-- Introduce a sensible object for sampling arguments (so we don’t have to use brittle dicts).
-
-- Add a classic Gym-style registry for agent harnesses, environments, and interaction protocols (so they don’t have to be built on the fly).
-   - adapt example scripts
-
-- Use proper FSDP2 wrapping in the training scripts
-
-- Move to a token-in / token-out API.
-
-### Misc
+### Low Priority
 - Make `scripts/push_to_hub.py` work with `--revision` for uploading different checkpoints.
 - Add a progress bar to eval.
 

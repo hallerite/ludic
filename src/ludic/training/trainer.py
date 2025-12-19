@@ -78,22 +78,13 @@ def _collate_saw_items(
         action_mask_list.append(actm)
         weights_list.append(torch.tensor(it.weight, dtype=torch.float32))
 
-    # old_token_logprobs is optional; collect and sum per-sample if present in meta.
-    old_logp_sums: List[Optional[float]] = []
+    # actor_logps is optional; required for ratio objectives (PPO/GRPO).
+    old_logp_action: List[Optional[float]] = []
+    actor_logps_tokens: List[Optional[List[float]]] = []
     for it in items:
-        token_logps = it.meta.get("old_token_logprobs")
-        if not isinstance(token_logps, list):
-            old_logp_sums.append(None)
-        else:
-            action_len = int(sum(it.action_mask))
-            if action_len != len(token_logps):
-                raise ValueError(
-                    "Length mismatch between old_token_logprobs and the number of action tokens."
-                )
-            try:
-                old_logp_sums.append(float(sum(float(v) for v in token_logps)))
-            except Exception:
-                old_logp_sums.append(None)
+        actor = it.actor_logps
+        actor_logps_tokens.append(None if actor is None else list(actor.token_logps))
+        old_logp_action.append(None if actor is None else float(sum(float(v) for v in actor.token_logps)))
 
     # teacher_token_logprobs is optional; used for OPD.
     teacher_token_logps_present: List[Optional[List[float]]] = []
@@ -116,10 +107,29 @@ def _collate_saw_items(
         "weight": torch.stack(weights_list, dim=0).to(device),
     }
 
-    if any(v is not None for v in old_logp_sums):
-        if any(v is None for v in old_logp_sums):
-            raise ValueError("Mixed presence of old_token_logprobs; either provide them for all samples or none.")
-        tensor_vals = [float(v) for v in old_logp_sums]  # type: ignore[arg-type]
+    if any(v is not None for v in old_logp_action):
+        if any(v is None for v in old_logp_action):
+            raise ValueError(
+                "Mixed presence of actor_logps; either provide it for all samples or none."
+            )
+        assert all(v is not None for v in actor_logps_tokens)
+
+        # Optional token-level actor logps aligned to token positions.
+        # Shape: [B, T], zeros outside action region / padding.
+        actor_logps_batch = torch.zeros((len(items), max_len), dtype=torch.float32, device=device)
+        for b, it in enumerate(items):
+            token_logps = actor_logps_tokens[b]
+            assert token_logps is not None
+            action_positions = [i for i, m in enumerate(it.action_mask) if int(m) == 1]
+            if len(token_logps) != len(action_positions):
+                raise ValueError(
+                    "Length mismatch between actor_logps and the number of action tokens."
+                )
+            for lp, pos in zip(token_logps, action_positions):
+                actor_logps_batch[b, pos] = float(lp)
+
+        batch["actor_logps"] = actor_logps_batch
+        tensor_vals = [float(v) for v in old_logp_action]  # type: ignore[arg-type]
         batch["old_logp_action"] = torch.tensor(tensor_vals, dtype=torch.float32, device=device)
 
     # For token-level objectives (e.g. OPD), collate per-token logprobs aligned to targets.
@@ -596,11 +606,8 @@ class Trainer:
                     saw_batch.items = fresh_items
 
                 # Algorithm-specific preprocessing (CPU-side) before collation.
-                saw_batch = self.algo.preprocess_batch(
-                    saw_batch,
-                    model=self.model,
-                    pad_token_id=self.cfg.pad_token_id,
-                )
+                if self.algo.preprocess is not None:
+                    saw_batch = self.algo.preprocess(saw_batch)
 
                 # If the batch is empty (e.g. all stale), drop it and fetch another.
                 if not saw_batch.items:

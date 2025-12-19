@@ -6,7 +6,8 @@ from typing import Optional, Tuple, List, Dict, Any
 import pytest
 
 from ludic.envs.single_agent_env import SingleAgentEnv
-from ludic.types import Observation, Info, StepOutcome, SamplingArgs
+from ludic.types import Observation, Info, StepOutcome
+from ludic.inference import InferenceSpec, SamplingParams, ReturnSpec
 from ludic.training.types import (
     RolloutRequest,
     ProtocolSpec,
@@ -140,30 +141,24 @@ async def test_grpo_e2e_seed_grouping_and_credit() -> None:
 
     def make_expanded_requests() -> List[RolloutRequest]:
         # 1. Define Base Requests
-        s_args_A: SamplingArgs = {
-            "temperature": 0.7,
-            "max_tokens": 5,
-            "seed": base_seed_A,
-            "extras": {"extra_body": {"return_token_ids": True}},
-        }
-        s_args_B: SamplingArgs = {
-            "temperature": 0.7,
-            "max_tokens": 5,
-            "seed": base_seed_B,
-            "extras": {"extra_body": {"return_token_ids": True}},
-        }
+        inference = InferenceSpec(
+            sampling=SamplingParams(temperature=0.7, max_tokens=5),
+            return_=ReturnSpec.for_eval(return_token_ids=True),
+        )
 
         req_A = RolloutRequest(
             env=EnvSpec(kind="env_A", kwargs={}),
             protocol=ProtocolSpec(kind="grpo_protocol", kwargs={}),
-            seed=seed_group_A,  # Force env seed for Group A
-            sampling_args=s_args_A,
+            env_seed=seed_group_A,  # Force env seed for Group A
+            sampling_seed=base_seed_A,
+            inference=inference,
         )
         req_B = RolloutRequest(
             env=EnvSpec(kind="env_B", kwargs={}),
             protocol=ProtocolSpec(kind="grpo_protocol", kwargs={}),
-            seed=seed_group_B,  # Force env seed for Group B
-            sampling_args=s_args_B,
+            env_seed=seed_group_B,  # Force env seed for Group B
+            sampling_seed=base_seed_B,
+            inference=inference,
         )
         
         # 2. Expand using GRPO Strategy
@@ -177,8 +172,6 @@ async def test_grpo_e2e_seed_grouping_and_credit() -> None:
         credit_assigner=credit_assigner,
         requests_fn=make_expanded_requests,
         max_steps=3,
-        retokenize=False,
-        tokenize=None,
     )
 
     # ---- 2. Act ----
@@ -194,24 +187,25 @@ async def test_grpo_e2e_seed_grouping_and_credit() -> None:
     for item in saw_batch.items:
         rollout_id = item.meta["rollout_id"]
         rollouts[rollout_id]["id"] = rollout_id
-        rollouts[rollout_id]["used_seed"] = item.meta["engine"]["used_seed"]
+        rollouts[rollout_id]["env_seed"] = item.meta["engine"]["env_seed"]
+        rollouts[rollout_id]["sampling_seed"] = item.meta["engine"]["sampling_seed"]
         rollouts[rollout_id]["prev_obs"] = item.meta["prev_obs"]
         rollouts[rollout_id]["reward"] = item.meta["reward"]
         rollouts[rollout_id]["weight"] = item.weight
 
-        assert "prompt_token_ids" in item.meta
-        assert "completion_token_ids" in item.meta
+        assert "prompt_length" in item.meta
+        assert "completion_length" in item.meta
         assert item.meta["engine"]["protocol_kind"] == "grpo_protocol"
 
     rollout_list = list(rollouts.values())
     assert len(rollout_list) == 4
 
     # --- Assert 1: Correct Grouping by Env Seed ---
-    seeds_seen = {r["used_seed"] for r in rollout_list}
+    seeds_seen = {r["env_seed"] for r in rollout_list}
     assert seeds_seen == {seed_group_A, seed_group_B}
 
-    rollouts_in_A = [r for r in rollout_list if r["used_seed"] == seed_group_A]
-    rollouts_in_B = [r for r in rollout_list if r["used_seed"] == seed_group_B]
+    rollouts_in_A = [r for r in rollout_list if r["env_seed"] == seed_group_A]
+    rollouts_in_B = [r for r in rollout_list if r["env_seed"] == seed_group_B]
 
     assert len(rollouts_in_A) == G_PER_GROUP
     assert len(rollouts_in_B) == G_PER_GROUP

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Union, Optional, TypedDict
+from typing import Any, Dict, List, Union, Optional
 import logging
 import time
 import uuid
@@ -11,20 +11,44 @@ log = logging.getLogger(__name__)
 JSON = Union[str, int, float, bool, None, Dict[str, Any], List[Any]]
 
 
-# ----- Agent level types -----
-
-class SamplingArgs(TypedDict, total=False):
-    seed: int
-    temperature: float
-    max_tokens: int
-    top_p: float
-    frequency_penalty: float
-    presence_penalty: float
-    stop: Union[str, List[str]]
-    extras: dict[str, Any] # for vendor-specific stuff
-
 # Chat-style message schema
 Message = Dict[str, str]  # {"role": "system|user|assistant", "content": "..."}
+
+
+@dataclass(frozen=True)
+class TokenTrace:
+    """
+    Canonical token-in/token-out trace for a single model call.
+
+    This is the single source of truth for prompt/completion token IDs
+    and (optional) chosen-token logprobs. It is kept separate from Step.info
+    to avoid duplicating large token arrays in JSON metadata.
+    """
+    prompt_token_ids: List[int]
+    completion_token_ids: List[int]
+    completion_logprobs: Optional[List[float]] = None
+    finish_reason: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.prompt_token_ids, list) or not all(
+            isinstance(v, int) for v in self.prompt_token_ids
+        ):
+            raise TypeError("TokenTrace.prompt_token_ids must be a List[int].")
+        if not isinstance(self.completion_token_ids, list) or not all(
+            isinstance(v, int) for v in self.completion_token_ids
+        ):
+            raise TypeError("TokenTrace.completion_token_ids must be a List[int].")
+        if self.completion_logprobs is not None:
+            if not isinstance(self.completion_logprobs, list) or not all(
+                isinstance(v, (int, float)) for v in self.completion_logprobs
+            ):
+                raise TypeError("TokenTrace.completion_logprobs must be a List[float].")
+            if len(self.completion_logprobs) != len(self.completion_token_ids):
+                raise ValueError(
+                    "TokenTrace completion_logprobs length mismatch "
+                    f"({len(self.completion_logprobs)} vs {len(self.completion_token_ids)})."
+                )
+
 
 @dataclass
 class ChatResponse:
@@ -59,12 +83,6 @@ class ChatResponse:
         info: Dict[str, Any] = {
             "completion": self.text,
         }
-        if self.prompt_token_ids is not None:
-            info["prompt_token_ids"] = list(self.prompt_token_ids)
-        if self.completion_token_ids is not None:
-            info["completion_token_ids"] = list(self.completion_token_ids)
-        if self.completion_logprobs is not None:
-            info["completion_logprobs"] = list(self.completion_logprobs)
         if self.finish_reason is not None:
             info["finish_reason"] = self.finish_reason
         return info
@@ -78,6 +96,21 @@ class ChatResponse:
         info.update(self.to_info())
         return info
 
+    def to_trace(self) -> Optional[TokenTrace]:
+        """
+        Build a TokenTrace if the response includes token IDs.
+        """
+        if self.prompt_token_ids is None or self.completion_token_ids is None:
+            return None
+        return TokenTrace(
+            prompt_token_ids=list(self.prompt_token_ids),
+            completion_token_ids=list(self.completion_token_ids),
+            completion_logprobs=(
+                list(self.completion_logprobs) if self.completion_logprobs is not None else None
+            ),
+            finish_reason=self.finish_reason,
+        )
+
 # ----- Environment level types -----
 
 Observation = str
@@ -90,6 +123,7 @@ class StepOutcome:
     truncated: bool
     terminated: bool
     info: Info = field(default_factory=dict)
+    trace: Optional[TokenTrace] = None
 
 @dataclass(frozen=True)
 class Snapshot:
@@ -119,6 +153,7 @@ class Step:
     truncated: bool
     terminated: bool
     info: Info = field(default_factory=dict)
+    trace: Optional[TokenTrace] = None
     ts_ns: int = field(default_factory=lambda: time.time_ns())
 
 @dataclass

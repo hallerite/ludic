@@ -1,6 +1,7 @@
 import asyncio
 import os
 import signal
+import sys
 from argparse import Namespace
 from typing import Any, Awaitable, Sequence, Set, Optional, Tuple
 
@@ -567,7 +568,13 @@ def main() -> None:
         description="vLLM OpenAI-compatible server with weight synchronization"
     )
     parser = make_arg_parser(parser)
-    args = parser.parse_args() or Namespace()
+    argv = sys.argv[1:]
+    # vLLM can silently override sampling params using the model's Hugging Face
+    # `generation_config` unless `--generation-config vllm` is set. Defaulting
+    # to `vllm` makes Ludic's SamplingParams the source of truth.
+    if not any(a == "--generation-config" or a.startswith("--generation-config=") for a in argv):
+        argv = [*argv, "--generation-config", "vllm"]
+    args = parser.parse_args(argv) or Namespace()
     validate_parsed_serve_args(args)
     print(args)
     uvloop.run(run_server(args))

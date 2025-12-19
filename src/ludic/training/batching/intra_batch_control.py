@@ -49,15 +49,16 @@ class GRPORequestStrategy:
             # 1. Determine the single environment seed for this group.
             #    If the user provided a specific seed, we respect it (lock it for the whole group).
             #    If not, we generate one random seed and lock THAT for the whole group.
-            if base_req.seed is not None:
-                group_env_seed = base_req.seed
+            if base_req.env_seed is not None:
+                group_env_seed = base_req.env_seed
             else:
                 group_env_seed = self._rng.randint(0, 2**32 - 1)
 
             # 2. Get the base sampling seed (if any) to ensure deterministic expansion.
-            base_sampling_args = base_req.sampling_args or {}
-            base_sampling_seed = base_sampling_args.get(
-                "seed", self._rng.randint(0, 2**32 - 1)
+            base_sampling_seed = (
+                base_req.sampling_seed
+                if base_req.sampling_seed is not None
+                else self._rng.randint(0, 2**32 - 1)
             )
 
             # 3. Generate a unique group_id for this base request's expansion.
@@ -65,22 +66,17 @@ class GRPORequestStrategy:
 
             # 4. Create G variants for this group.
             for i in range(self.group_size):
-                # Create new sampling args with a *different* seed for each member.
-                # We add 'i' to ensure deterministic diversity within the group.
-                new_sampling_args = {
-                    **base_sampling_args,
-                    "seed": base_sampling_seed + i,
-                }
+                sampling_seed = int(base_sampling_seed + i)
 
                 # Merge group_id into request meta
                 new_meta = {**base_req.meta, "group_id": group_id}
 
                 # Create a copy of the request, forcing the group env seed
-                # and the diverse sampling args.
+                # and the diverse sampling seed.
                 new_req = replace(
                     base_req,
-                    seed=group_env_seed,
-                    sampling_args=new_sampling_args,
+                    env_seed=group_env_seed,
+                    sampling_seed=sampling_seed,
                     meta=new_meta,
                     # Crucial: Each expanded request represents exactly ONE execution trace.
                     # The original 'num_episodes' on the base request is interpreted as

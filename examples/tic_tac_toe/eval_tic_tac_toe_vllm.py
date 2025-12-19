@@ -27,7 +27,7 @@ from ludic.eval.cli import (
     add_common_eval_args,
     build_single_agent_engine,
     maybe_start_vllm,
-    sampling_args_from_cli,
+    inference_spec_from_cli,
     write_jsonl,
 )
 from ludic.context import FullDialog, TruncatedThinkingContext
@@ -45,7 +45,7 @@ TICTACTOE_REDUCERS: Dict[str, Reducer] = {
 
 
 def make_requests(episodes: int, args: argparse.Namespace) -> List[RolloutRequest]:
-    sargs = sampling_args_from_cli(args)
+    inf = inference_spec_from_cli(args)
     start_flags = [True] * ((episodes + 1) // 2) + [False] * (episodes // 2)
     requests: List[RolloutRequest] = []
     for seed, agent_starts in enumerate(start_flags):
@@ -53,11 +53,9 @@ def make_requests(episodes: int, args: argparse.Namespace) -> List[RolloutReques
             RolloutRequest(
                 env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": agent_starts}),
                 protocol=ProtocolSpec(kind="single_agent"),
-                seed=seed,
-                sampling_args={
-                    **sargs,
-                    "extras": {"extra_body": {"return_token_ids": True}},
-                },
+                env_seed=seed,
+                sampling_seed=seed,
+                inference=inf,
                 num_episodes=1,
                 meta={"seed": seed, "agent_starts": agent_starts},
             )

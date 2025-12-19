@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Callable, Dict, List, Optional, Protocol, Tuple, TypeGuard
 
-from ludic.types import JSON, Rollout, SamplingArgs, Step
+from ludic.types import JSON, Rollout, Step
+from ludic.inference.request import InferenceSpec
 
 
 @dataclass
@@ -68,7 +69,7 @@ class RolloutRequest:
       - protocol:
             ProtocolSpec, resolved via protocol_registry.
             
-      - sampling_args:
+      - inference:
             Passed directly to Agent via protocol.run().
 
       - num_episodes:
@@ -79,8 +80,9 @@ class RolloutRequest:
     """
     env: EnvSpec
     protocol: ProtocolSpec
-    seed: Optional[int] = None
-    sampling_args: Optional[SamplingArgs] = None
+    env_seed: Optional[int] = None
+    sampling_seed: Optional[int] = None
+    inference: Optional[InferenceSpec] = None
     num_episodes: int = 1
     meta: Dict[str, JSON] = field(default_factory=dict)
 
@@ -106,6 +108,59 @@ class CreditAssigner(Protocol):
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class ActorTokenLogps:
+    """
+    Per-token logprobs under the behavior policy (the actor), aligned to the
+    sampled completion tokens.
+
+    `token_logps[i]` corresponds to the chosen-token logprob for
+    `completion_token_ids[i]`.
+    """
+
+    token_logps: List[float]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.token_logps, list) or not all(
+            isinstance(v, (int, float)) for v in self.token_logps
+        ):
+            raise TypeError("ActorTokenLogps.token_logps must be a List[float].")
+
+
+@dataclass
+class SampleAttachments:
+    """
+    Optional typed attachments carried alongside a training sample.
+
+    These should be populated by construction by BatchSources / annotators /
+    rollout collation, not discovered ad-hoc from `meta`.
+    """
+
+    actor_logps: Optional[ActorTokenLogps] = None
+
+
+class HasActorLogps(Protocol):
+    """
+    Structural “extension”: a sample that is guaranteed to carry per-token actor logps.
+
+    This is meant for typing algorithms/losses that require token-level behavior
+    logprobs, and composes naturally with other Protocol extensions.
+    """
+
+    actor_logps: ActorTokenLogps
+
+
+def has_actor_logps(item: "SAWItem") -> TypeGuard[HasActorLogps]:
+    """
+    Type guard for `HasActorLogps`.
+
+    Use this to narrow a SAWItem to something that is guaranteed (by runtime check)
+    to have non-None `actor_logps`.
+    """
+
+    return item.actor_logps is not None
+
+
 @dataclass
 class SAWItem:
     """
@@ -115,14 +170,21 @@ class SAWItem:
     - attention_mask: 1/0 attention mask to tell tokens from padding
     - action_mask: 1 on action tokens, 0 on state tokens
     - weight: scalar credit for this sample
-    - meta: arbitrary rollout/step metadata (algo-specific fields may live here,
-      e.g., per-token behavior logprobs for PPO)
+    - meta: arbitrary rollout/step metadata (JSON-serializable; for logging,
+      debugging, filtering, etc.)
+    - attachments: typed, non-JSON training attachments (e.g. actor logps needed
+      for PPO/GRPO ratios)
     """
     input_ids: List[int]
     attention_mask: List[int]
     action_mask: List[int]
     weight: float
     meta: Dict[str, JSON]
+    attachments: SampleAttachments = field(default_factory=SampleAttachments)
+
+    @property
+    def actor_logps(self) -> Optional[ActorTokenLogps]:
+        return self.attachments.actor_logps
 
 @dataclass
 class SAWBatch:

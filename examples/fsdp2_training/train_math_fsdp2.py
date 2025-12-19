@@ -29,7 +29,7 @@ from datasets import load_dataset  # type: ignore
 from environments.math import MATHEnv
 from ludic.agent import Agent
 from ludic.context import FullDialog
-from ludic.inference import VLLMChatClient
+from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.distributed import create_vllm_publisher
 from ludic.parsers import boxed_parser, extract_last_boxed_content
@@ -308,17 +308,16 @@ def main() -> None:
         protocol_registry=protocol_registry,
         jsonl_path=rollout_log_path,
     )
-    sampling_args = {
-        "temperature": args.train_temperature,
-        "max_tokens": args.max_tokens,
-        "extras": {"extra_body": {"return_token_ids": True, "logprobs": True, "top_logprobs": 1}},
-    }
+    train_inference = InferenceSpec(
+        sampling=SamplingParams(temperature=args.train_temperature, max_tokens=args.max_tokens),
+        return_=ReturnSpec.for_rl(top_logprobs_k=1),
+    )
     requests_fn = make_dataset_queue_requests_fn(
         samples_q,
         batch_size=args.batch_size,
         env_kind="math",
         protocol_kind="single_agent",
-        sampling_args=sampling_args,
+        inference=train_inference,
         protocol_kwargs={},
         request_meta_fn=lambda idx, sample: {
             "sample_index": idx,
@@ -326,7 +325,8 @@ def main() -> None:
             "level": sample.get("level"),
             "type": sample.get("type"),
         },
-        seed_fn=lambda idx, _sample: idx,
+        env_seed_fn=lambda idx, _sample: idx,
+        sampling_seed_fn=lambda idx, _sample: idx,
         group_size=args.group_size,
     )
     batch_source = RolloutBatchSource(
@@ -335,7 +335,6 @@ def main() -> None:
         requests_fn=requests_fn,
         max_steps=1,
         concurrency=args.concurrency,
-        retokenize=False,
     )
 
     cfg = TrainerConfig(
@@ -428,12 +427,15 @@ def main() -> None:
                         env=EnvSpec(kind="math", kwargs={"sample": sample}),
                         protocol=ProtocolSpec(kind="single_agent", kwargs={}),
                         num_episodes=1,
-                        seed=int(idx),
-                        sampling_args={
-                            "temperature": float(args.eval_temperature),
-                            "max_tokens": int(args.max_tokens),
-                            "extras": {"extra_body": {"return_token_ids": True}},
-                        },
+                        env_seed=int(idx),
+                        sampling_seed=int(idx),
+                        inference=InferenceSpec(
+                            sampling=SamplingParams(
+                                temperature=float(args.eval_temperature),
+                                max_tokens=int(args.max_tokens),
+                            ),
+                            return_=ReturnSpec.for_eval(return_token_ids=True),
+                        ),
                         meta={"eval_sample_index": idx, "problem_id": sample.get("id", idx)},
                     )
                     for idx, sample in enumerate(eval_samples)

@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Tuple
 
 import pytest
 
 from ludic.agents.tool_agent import ToolAgent
 from ludic.context.full_dialog import FullDialog
 from ludic.inference.client import ChatClient, ChatResponse
-from ludic.inference.sampling import SamplingConfig
-from ludic.types import Message
+from ludic.inference.request import ChatCompletionRequest
 
 from tests._mocks import _mock_parser, calculator_tool
 
@@ -17,10 +16,7 @@ from tests._mocks import _mock_parser, calculator_tool
 class DummyClient(ChatClient):
     async def complete(
         self,
-        *,
-        model: str,
-        messages: List[Message],
-        sampling: SamplingConfig,
+        request: ChatCompletionRequest,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
         return ChatResponse(text="ok"), {"raw_response": {"choices": [{"message": {"content": "ok"}}]}}
 
@@ -38,18 +34,14 @@ async def test_tool_agent_helpers_and_execution():
         tools=[calculator_tool],
     )
 
-    # _with_tools injects schemas + token id return
-    sargs = agent._with_tools({})  # type: ignore[arg-type]
-    assert "extras" in sargs
-    assert "tools" in sargs["extras"]
-    assert sargs["extras"]["tool_choice"] == "auto"
-    assert sargs["extras"]["extra_body"]["return_token_ids"] is True
+    # _with_tools enforces return_token_ids for drift-free training.
+    inf = agent._with_tools(None)
+    assert inf.return_.return_token_ids is True
 
-    # _strip_tools removes only tool-related fields
-    stripped = agent._strip_tools(sargs)
-    assert "tools" not in stripped["extras"]
-    assert "tool_choice" not in stripped["extras"]
-    assert stripped["extras"]["extra_body"]["return_token_ids"] is True
+    # _tool_request advertises schemas and tool choice.
+    tool_req = agent._tool_request()
+    assert tool_req.tool_choice == "auto"
+    assert len(tool_req.tools) == 1
 
     # _extract_openai_message reads content/tool_calls
     info = {

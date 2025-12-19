@@ -52,7 +52,7 @@ async def test_multi_agent_env_truncation_is_recorded_as_env() -> None:
         }
     )
 
-    rollouts = await protocol.run(env=env, max_steps=10, sampling_args={})
+    rollouts = await protocol.run(env=env, max_steps=10)
     assert len(rollouts) == 2
 
     for r in rollouts:
@@ -61,4 +61,3 @@ async def test_multi_agent_env_truncation_is_recorded_as_env() -> None:
         assert r.meta.get("episode_truncated") is True
         assert r.meta.get("truncation_reason") == "env"
         assert r.steps[-1].info.get("truncation_reason") is None
-

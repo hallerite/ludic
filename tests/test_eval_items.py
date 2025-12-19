@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import List, Sequence
 
 import pytest
 
 from ludic.eval.core import run_eval
 from ludic.training.stats import Reducer
 from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
-from ludic.types import Rollout, Step
+from ludic.types import Rollout, Step, TokenTrace
 
 
 @dataclass
@@ -40,7 +40,11 @@ def _mk_rollout(n_steps: int, *, completion_lens: List[int]) -> Rollout:
                 reward=1.0,
                 truncated=False,
                 terminated=(i == n_steps - 1),
-                info={"completion_token_ids": completion_token_ids, "is_last": i == n_steps - 1},
+                info={"is_last": i == n_steps - 1},
+                trace=TokenTrace(
+                    prompt_token_ids=[0],
+                    completion_token_ids=completion_token_ids,
+                ),
             )
         )
     return Rollout(steps=steps, meta={})

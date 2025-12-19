@@ -6,7 +6,7 @@ from typing import Any, List, Dict, Optional, Tuple
 from ludic.agents.react_agent import ReActAgent
 from ludic.context.full_dialog import FullDialog
 from ludic.inference.client import ChatClient, ChatResponse
-from ludic.inference.sampling import SamplingConfig
+from ludic.inference.request import ChatCompletionRequest
 from ludic.types import Message
 from ludic.parsers import xml_tag_parser
 from tests._mocks import calculator_tool
@@ -25,15 +25,12 @@ class ReplayMockClient(ChatClient):
         # e.g. [{"content": "...", "tool_calls": [...]}, ...]
         self.steps = steps
         self.call_count = 0
-        self.last_sampling_args: Optional[SamplingConfig] = None
+        self.last_request: Optional[ChatCompletionRequest] = None
         self.last_messages: Optional[List[Message]] = None
 
     async def complete(
         self,
-        *,
-        model: str,
-        messages: List[Message],
-        sampling: SamplingConfig,
+        request: ChatCompletionRequest,
         **kwargs,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
         
@@ -43,8 +40,8 @@ class ReplayMockClient(ChatClient):
         step_data = self.steps[self.call_count]
         self.call_count += 1
         
-        self.last_sampling_args = sampling
-        self.last_messages = messages
+        self.last_request = request
+        self.last_messages = request.messages
 
         # Construct ChatResponse (High level)
         text = step_data.get("content") or ""
@@ -113,7 +110,7 @@ async def test_react_agent_happy_path_single_tool():
         tools=[calculator_tool]
     )
 
-    parse_result, raw_text, _ = await agent.act(sampling_args={})
+    parse_result, raw_text, _, _ = await agent.act()
 
     # Assert Final Output
     assert parse_result.action == "4"
@@ -176,16 +173,16 @@ async def test_react_agent_shot_clock_fallback():
         max_react_steps=2 # Strict limit
     )
 
-    result, _, _ = await agent.act(sampling_args={})
+    result, _, _, _ = await agent.act()
 
     # 1. Did it finish?
     assert result.action == "Sunny"
 
     # 2. Was the "Shot Clock" logic triggered?
     # On the last call, "tools" should NOT be in extras
-    last_args = client.last_sampling_args
-    assert "tools" not in (last_args.extras or {})
-    assert "tool_choice" not in (last_args.extras or {})
+    last_req = client.last_request
+    assert last_req is not None
+    assert last_req.tools is None
 
     # 3. Was the forced message injected?
     last_msgs = client.last_messages
@@ -224,7 +221,7 @@ async def test_react_agent_handles_bad_tool_calls():
         tools=[calculator_tool] # ghost_tool not here
     )
 
-    await agent.act(sampling_args={})
+    await agent.act()
 
     # Check that the error was added to context
     # Messages sent during Step 2 should include the Tool output from Step 1
@@ -287,7 +284,7 @@ async def test_react_agent_records_bad_json_tool_arguments():
         max_react_steps=3,
     )
 
-    result, _, _ = await agent.act(sampling_args={})
+    result, _, _, _ = await agent.act()
     assert result.action == "ok"
 
     final_history = client.last_messages
@@ -331,7 +328,7 @@ async def test_react_agent_records_tool_execution_exception():
         max_react_steps=3,
     )
 
-    result, _, _ = await agent.act(sampling_args={})
+    result, _, _, _ = await agent.act()
     assert result.action == "ok"
 
     final_history = client.last_messages
@@ -378,7 +375,7 @@ async def test_react_agent_handles_multiple_tool_calls_in_one_turn():
         max_react_steps=3,
     )
 
-    result, _, _ = await agent.act(sampling_args={})
+    result, _, _, _ = await agent.act()
     assert result.action == "4 and Sunny in NYC"
 
     final_history = client.last_messages
@@ -432,7 +429,7 @@ async def test_react_agent_multi_tool_calls_continue_on_error():
         max_react_steps=3,
     )
 
-    result, _, _ = await agent.act(sampling_args={})
+    result, _, _, _ = await agent.act()
     assert result.action == "ok"
 
     final_history = client.last_messages

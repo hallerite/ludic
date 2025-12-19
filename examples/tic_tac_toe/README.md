@@ -39,6 +39,25 @@ PYTHONPATH=. uv run python examples/tic_tac_toe/eval_tic_tac_toe_vllm.py \
 ```
 - Reports win/loss/draw/illegal/parse-error rates; writes `tictactoe_eval.jsonl` by default.
 
+### Using a LoRA adapter with vLLM
+If your policy is a LoRA adapter (for example `hallerite/Qwen2.5-7B-TTT-RL`), start vLLM with the base model and load the adapter explicitly. The `--start-server` helper does not pass LoRA flags, so launch the server yourself:
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. uv run python -m ludic.inference.vllm_server \
+  --model hallerite/Qwen2.5-7B-TTT \
+  --enable-lora \
+  --lora-modules ttt_rl=hallerite/Qwen2.5-7B-TTT-RL
+```
+Then point eval at the adapter name you chose (`ttt_rl` here) and do **not** use `--start-server`:
+```bash
+PYTHONPATH=. uv run python examples/tic_tac_toe/eval_tic_tac_toe_vllm.py \
+  --model ttt_rl \
+  --episodes 200 \
+  --ctx truncated
+```
+Notes:
+- You can name the adapter whatever you like (`ttt_rl=`); just pass the same name via `--model`.
+- Local adapters also work: `--lora-modules ttt_rl=/path/to/adapter`.
+
 ---
 
 ## Training from Scratch (Cold-Start with SFT)

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, List, Protocol
+from typing import Any, Dict, Mapping, Optional, Protocol
 
 from torch import nn, Tensor
-import torch
 
 from ludic.training.types import CreditAssigner, SAWBatch
 from ludic.training.loss import (
@@ -12,7 +11,6 @@ from ludic.training.loss import (
     ReinforceLoss,
     ReinforceBaselineLoss,
     ClippedSurrogateLoss,
-    selective_log_softmax,
     MaskedCausalLMCrossEntropyLoss,
     OnPolicyDistillationLoss,
 )
@@ -22,13 +20,7 @@ from ludic.training.credit_assignment import MonteCarloReturn, GroupNormalizedRe
 Batch = Mapping[str, Tensor]
 
 class PreprocessFn(Protocol):
-    def __call__(
-        self,
-        saw_batch: SAWBatch,
-        *,
-        model: Optional[nn.Module] = None,
-        pad_token_id: Optional[int] = None,
-    ) -> SAWBatch: ...
+    def __call__(self, saw_batch: SAWBatch) -> SAWBatch: ...
 
 
 @dataclass
@@ -68,152 +60,54 @@ class RLAlgorithm:
         # Pass the resulting logits to the loss function
         return self.loss.compute(logits, batch)
 
-    # ------------------------------------------------------------------
-    # Optional preprocessing hook
-    # ------------------------------------------------------------------
-    def preprocess_batch(
-        self,
-        saw_batch: SAWBatch,
-        *,
-        model: Optional[nn.Module] = None,
-        pad_token_id: Optional[int] = None,
-    ) -> SAWBatch:
-        """
-        Optional algorithm-specific preprocessing on the SAWBatch before collation.
-
-        This is mainly used to materialize additional metadata needed by the loss,
-        e.g. behavior-policy logprobs for ratio-based objectives.
-        """
-        if self.preprocess is None:
-            return saw_batch
-        return self.preprocess(saw_batch, model=model, pad_token_id=pad_token_id)
-
 
 # ---------------------------------------------------------------------------
-# Behavior logprob plumbing (for ratio-based objectives)
+# Behavior logprob requirements (ratio-based objectives)
 # ---------------------------------------------------------------------------
 
 
-def _ensure_old_token_logprobs(
+def validate_actor_logps(
     saw_batch: SAWBatch,
-    *,
-    model: Optional[nn.Module] = None,
-    pad_token_id: Optional[int] = None,
-    backfill_chunk_size: Optional[int] = None,
 ) -> SAWBatch:
     """
-    Ensure SAWItems carry per-token behavior logprobs for the action region.
+    Validate SAWItems carry per-token logprobs under the behavior policy (actor).
 
-    Source priority:
-      1) If an item has `meta["completion_logprobs"]` (rollout-time chosen-token
-         logprobs), copy them to `meta["old_token_logprobs"]`.
-      2) If still missing, optionally backfill via teacher forcing under `model`
-         (no grad), but only for synchronous (on-policy) batches.
+    Contract:
+      - For ratio objectives (PPO/GRPO/KL-to-behavior), each SAWItem must carry
+        `item.actor_logps` (backed by `item.attachments.actor_logps`), computed at rollout time by the inference
+        client and propagated through batching/collation.
 
-    - If all items already have old_token_logprobs, this is a no-op.
-    - If some items are missing and a model is provided, it computes per-token
-      logprobs of the sampled sequence under the current model (no grad) and
-      stores them on the items.
-    - Recompute is only allowed for synchronous (on-policy) batches; async /
-      pipeline batches must ship behavior logprobs with the data.
+    This function validates the contract; it does not backfill or recompute logprobs.
     """
     items = saw_batch.items
 
-    # 1) Copy rollout-time chosen-token logprobs if present.
-    for it in items:
-        if "completion_logprobs" in it.meta and isinstance(it.meta["completion_logprobs"], list):
-            it.meta["old_token_logprobs"] = list(it.meta["completion_logprobs"])
+    missing = []
+    for i, it in enumerate(items):
+        actor = it.actor_logps
+        if actor is None:
+            missing.append(i)
+            continue
+        expected_len = int(sum(int(x) for x in it.action_mask))
+        if len(actor.token_logps) != expected_len:
+            raise ValueError(
+                "ActorTokenLogps length mismatch for item "
+                f"(index={i}, rollout_id={it.meta.get('rollout_id')!r}, step_index={it.meta.get('step_index')!r}): "
+                f"expected {expected_len}, got {len(actor.token_logps)}."
+            )
+        if not isinstance(actor.token_logps, list) or not all(
+            isinstance(v, (int, float)) for v in actor.token_logps
+        ):
+            raise TypeError("ActorTokenLogps.token_logps must be a List[float].")
 
-    missing_indices: List[int] = [
-        i for i, it in enumerate(items) if not isinstance(it.meta.get("old_token_logprobs"), list)
-    ]
-    if not missing_indices:
-        return saw_batch
-
-    # 2) Teacher-forced backfill is only allowed for synchronous (on-policy) batches.
-    is_async = any("policy_version" in it.meta for it in items)
-    if is_async:
+    if missing:
         raise ValueError(
-            "Missing old_token_logprobs on a batch tagged with policy_version; "
-            "recomputation is only supported for synchronous on-policy batches."
+            "Missing SampleAttachments.actor_logps for a ratio-based objective. "
+            "Ensure your inference client returns chosen-token logprobs and your batch collation "
+            "populates SAWItem.attachments.actor_logps (e.g., via ReturnSpec.for_rl()). "
+            f"Missing indices: {missing}."
         )
-
-    if model is None or pad_token_id is None:
-        raise ValueError("model and pad_token_id are required to backfill old_token_logprobs.")
-
-    device = next(model.parameters()).device
-    subset = [items[i] for i in missing_indices]
-    chunk_size = backfill_chunk_size or len(subset)
-
-    restore_train_state = model.training
-    if restore_train_state:
-        model.eval()
-
-    try:
-        for start in range(0, len(subset), chunk_size):
-            chunk_items = subset[start : start + chunk_size]
-            lengths = [len(it.input_ids) for it in chunk_items]
-            max_len = max(lengths)
-
-            input_ids_list = []
-            attn_mask_list = []
-            action_mask_list = []
-            for it in chunk_items:
-                L = len(it.input_ids)
-                ids = torch.full((max_len,), pad_token_id, dtype=torch.long)
-                am = torch.zeros((max_len,), dtype=torch.long)
-                actm = torch.zeros((max_len,), dtype=torch.float32)
-                ids[:L] = torch.tensor(it.input_ids, dtype=torch.long)
-                am[:L] = torch.tensor(it.attention_mask, dtype=torch.long)
-                actm[:L] = torch.tensor(it.action_mask, dtype=torch.float32)
-                input_ids_list.append(ids)
-                attn_mask_list.append(am)
-                action_mask_list.append(actm)
-
-            batch_input_ids = torch.stack(input_ids_list, dim=0).to(device)
-            batch_attn = torch.stack(attn_mask_list, dim=0).to(device)
-            batch_action_mask = torch.stack(action_mask_list, dim=0).to(device)
-
-            with torch.inference_mode():
-                logits = model(input_ids=batch_input_ids, attention_mask=batch_attn).logits
-                logits_shifted = logits[:, :-1, :]
-                target_ids = batch_input_ids[:, 1:]
-                token_logp = selective_log_softmax(logits_shifted, target_ids)  # [B, T-1]
-                action_mask_shifted = batch_action_mask[:, 1:]  # align with targets
-
-            for idx, it in enumerate(chunk_items):
-                mask = action_mask_shifted[idx].bool()
-                per_token = token_logp[idx][mask].detach().cpu().tolist()
-                it.meta["old_token_logprobs"] = [float(v) for v in per_token]
-    finally:
-        if restore_train_state:
-            model.train()
 
     return saw_batch
-
-
-def make_old_logprob_preprocessor(*, backfill_chunk_size: Optional[int] = None) -> PreprocessFn:
-    """
-    Return a PreprocessFn that ensures per-token behavior logprobs exist on items.
-
-    This is a small functional wrapper so callers can configure backfill behavior
-    without needing an algorithm subclass.
-    """
-
-    def _pre(
-        saw_batch: SAWBatch,
-        *,
-        model: Optional[nn.Module] = None,
-        pad_token_id: Optional[int] = None,
-    ) -> SAWBatch:
-        return _ensure_old_token_logprobs(
-            saw_batch,
-            model=model,
-            pad_token_id=pad_token_id,
-            backfill_chunk_size=backfill_chunk_size,
-        )
-
-    return _pre
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +284,6 @@ def make_grpo(
     clip_eps: float = 0.2,
     length_normalize: bool = False,
     name: str = "grpo",
-    backfill_chunk_size: Optional[int] = None,
 ) -> RLAlgorithm:
     """
     GRPO-style preset (clipped surrogate):
@@ -408,12 +301,9 @@ def make_grpo(
         clip_eps: PPO clipping epsilon for the surrogate objective.
         length_normalize: Whether to normalize log-probs by action length.
         name: Algorithm name for logging/metrics.
-        backfill_chunk_size: Chunk size for teacher-forced logprob backfill.
-
     Note: For the clipped ratio objective, we need behavior-policy logprobs.
-    This preset installs a preprocessor that:
-      - copies rollout-time `completion_logprobs` into `old_token_logprobs`, or
-      - backfills via teacher forcing for synchronous on-policy batches.
+    This preset installs a preprocessor that validates
+    `item.actor_logps` is present.
     """
     credit_assigner: CreditAssigner = GroupNormalizedReturn(
         group_size=group_size,
@@ -421,7 +311,7 @@ def make_grpo(
         positive_only=positive_only,
     )
     loss: Loss = ClippedSurrogateLoss(clip_eps=clip_eps, length_normalize=length_normalize)
-    preprocess = make_old_logprob_preprocessor(backfill_chunk_size=backfill_chunk_size)
+    preprocess = validate_actor_logps
 
     return RLAlgorithm(
         name=name,

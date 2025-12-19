@@ -10,11 +10,18 @@ import argparse
 import contextlib
 import json
 import signal
-from typing import Any, Callable, Dict, Iterable, Iterator, Mapping, Optional
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
 from ludic.agent import Agent
 from ludic.context import FullDialog
-from ludic.inference import VLLMChatClient, start_vllm_server, wait_for_vllm_health
+from ludic.inference import (
+    VLLMChatClient,
+    start_vllm_server,
+    wait_for_vllm_health,
+    InferenceSpec,
+    SamplingParams,
+    ReturnSpec,
+)
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import ParseResult
 from ludic.training.batching.rollout_engine import RolloutEngine
@@ -99,12 +106,14 @@ def build_single_agent_engine(
     )
 
 
-def sampling_args_from_cli(args: argparse.Namespace) -> Dict[str, Any]:
-    return {
-        "temperature": float(args.temperature),
-        "max_tokens": int(args.max_tokens),
-        "extras": {"extra_body": {"return_token_ids": True}},
-    }
+def inference_spec_from_cli(args: argparse.Namespace) -> InferenceSpec:
+    return InferenceSpec(
+        sampling=SamplingParams(
+            temperature=float(args.temperature),
+            max_tokens=int(args.max_tokens),
+        ),
+        return_=ReturnSpec.for_eval(return_token_ids=True),
+    )
 
 
 def write_jsonl(path: str, records: Iterable[Mapping[str, Any]]) -> None:

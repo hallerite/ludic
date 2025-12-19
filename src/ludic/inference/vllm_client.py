@@ -13,9 +13,10 @@ from requests.exceptions import RequestException, Timeout
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.utils import StatelessProcessGroup
 
-from ludic.types import Message, ChatResponse
+from ludic.types import ChatResponse
 from ludic.inference.client import ChatClient
-from ludic.inference.sampling import SamplingConfig
+from ludic.inference.request import ChatCompletionRequest, ToolRequest
+from ludic.inference.extensions import BackendExtensions, VLLMExtensions
 
 log = logging.getLogger(__name__)
 
@@ -121,37 +122,10 @@ class VLLMChatClient(ChatClient):
 
     async def complete(
         self,
-        *,
-        model: str,
-        messages: List[Message],
-        sampling: SamplingConfig,
-        interrupt_thinking: Optional[int] = None,
-        return_token_ids: bool = False,
+        request: ChatCompletionRequest,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
         """
         High-level LLM invocation with vLLM extensions.
-
-        Args:
-            interrupt_thinking:
-                If set to an integer N, injects:
-                    extra_body["vllm_xargs"]["max_think"] = N
-                This activates the custom GlobalThinkProcessor, forcing the
-                model to emit the '</think>' token sequence after N generated
-                tokens. Purely a vLLM-side feature.
-
-            return_token_ids:
-                If True, injects:
-                    extra_body["return_token_ids"] = True
-                The vLLM OpenAI-compatible API (>= v0.10.2) will return:
-                    - resp.prompt_token_ids
-                    - resp.choices[*].token_ids
-                allowing drift-free RL training by exposing the *exact* tokens
-                the model consumed and produced.
-
-            model, messages, sampling:
-                Standard OpenAI-compatible chat completion fields. Sampling
-                options are created from SamplingConfig and passed through
-                untouched.
 
         Returns:
             (ChatResponse, info):
@@ -166,48 +140,63 @@ class VLLMChatClient(ChatClient):
 
         # Sampling → OpenAI kwargs
         request_kwargs: Dict[str, Any] = dict(
-            model=model,
-            messages=messages,
+            model=request.model,
+            messages=request.messages,
         )
-        request_kwargs.update(sampling.to_openai_kwargs())
+        request_kwargs.update(request.sampling.to_openai_kwargs())
+        if request.seed is not None:
+            request_kwargs["seed"] = int(request.seed)
+
+        # Tools (OpenAI-style)
+        if request.tools is not None:
+            tools: ToolRequest = request.tools
+            request_kwargs["tools"] = tools.tools
+            if tools.tool_choice is not None:
+                request_kwargs["tool_choice"] = tools.tool_choice
 
         # ----------------------------------------------------------
         # vLLM-specific extensions live under `extra_body`:
         #
-        #   - interrupt_thinking -> extra_body["vllm_xargs"]["max_think"]
-        #   - return_token_ids   -> extra_body["return_token_ids"] = True
-        #
-        # Any SamplingConfig.extras may also inject/override fields by
-        # providing an "extra_body" dict.
+        #   - max_think        -> extra_body["vllm_xargs"]["max_think"]
+        #   - return_token_ids -> extra_body["return_token_ids"] = True
         # ----------------------------------------------------------
         extra_body: Dict[str, Any] = {}
 
-        # Merge any existing extras (SamplingConfig.extras → extra_body)
-        existing_extra_body = request_kwargs.pop("extra_body", None)
-        if isinstance(existing_extra_body, dict):
-            extra_body.update(existing_extra_body)
+        if request.extensions is not None:
+            ext: BackendExtensions = request.extensions
+            if isinstance(ext, VLLMExtensions):
+                if ext.max_think is not None:
+                    if not isinstance(ext.max_think, int) or ext.max_think <= 0:
+                        raise ValueError("VLLMExtensions.max_think must be a positive integer")
+                if ext.repetition_penalty <= 0:
+                    raise ValueError("VLLMExtensions.repetition_penalty must be > 0")
+                # OpenAI's Python SDK rejects unknown kwargs (like repetition_penalty),
+                # so send vLLM/HF-only knobs via `extra_body` which is merged into the
+                # JSON request body.
+                extra_body["repetition_penalty"] = float(ext.repetition_penalty)
 
-        # Extract or create vllm_xargs
-        vllm_xargs = extra_body.get("vllm_xargs", {})
-
-        # Think forcing
-        if interrupt_thinking is not None:
-            if not isinstance(interrupt_thinking, int) or interrupt_thinking <= 0:
-                raise ValueError("interrupt_thinking must be a positive integer")
-            vllm_xargs["max_think"] = interrupt_thinking
-
-        if vllm_xargs:
-            extra_body["vllm_xargs"] = vllm_xargs
+                if ext.max_think is not None:
+                    vllm_xargs = extra_body.get("vllm_xargs", {})
+                    if not isinstance(vllm_xargs, dict):
+                        vllm_xargs = {}
+                    vllm_xargs["max_think"] = int(ext.max_think)
+                    extra_body["vllm_xargs"] = vllm_xargs
+                if ext.extra_body_overrides:
+                    extra_body.update(dict(ext.extra_body_overrides))
+            else:
+                raise TypeError(
+                    f"{self.__class__.__name__} received unsupported request.extensions kind="
+                    f"{getattr(ext, 'kind', None)!r} (type={type(ext).__name__}); expected VLLMExtensions."
+                )
 
         # Token IDs
-        if return_token_ids:
+        if request.return_.return_token_ids:
             extra_body["return_token_ids"] = True
 
-        # Request per-token logprobs unless the caller already set it (either via
-        # regular kwargs or via SamplingConfig.extras["extra_body"]).
-        # vLLM/OpenAI expect `logprobs` as an int (top-k); using 1 avoids disabling it.
-        if "logprobs" not in request_kwargs and "logprobs" not in extra_body:
-            request_kwargs["logprobs"] = 1  # chosen-token logprobs only
+        # Request chosen-token logprobs if asked.
+        # vLLM uses OpenAI-compatible shape where `logprobs` is an int (top-k).
+        if request.return_.return_chosen_logprobs:
+            request_kwargs["logprobs"] = int(max(1, request.return_.top_logprobs_k))
 
         if extra_body:
             request_kwargs["extra_body"] = extra_body

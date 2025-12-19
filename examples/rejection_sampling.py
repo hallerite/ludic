@@ -16,7 +16,7 @@ from typing import Any
 
 from ludic.agent import Agent
 from ludic.context import FullDialog
-from ludic.inference import VLLMChatClient
+from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import xml_tag_parser
 from ludic.training import RolloutEngine, EnvSpec, ProtocolSpec, RolloutRequest
@@ -97,24 +97,23 @@ async def generate_filtered_data(args: argparse.Namespace) -> None:
         jsonl_path=None,  # Disable auto-logging; we filter manually
     )
 
-    sampling_args: dict[str, Any] = {
-        "temperature": args.temperature,
-        "max_tokens": args.max_tokens,
-    }
+    inference = InferenceSpec(
+        sampling=SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens),
+    )
 
     requests = [
         RolloutRequest(
             env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": True}),
             protocol=ProtocolSpec(kind="single_agent", kwargs={}),
             num_episodes=args.episodes // 2,
-            sampling_args=sampling_args,
+            inference=inference,
             meta={"setup": "agent_starts"},
         ),
         RolloutRequest(
             env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": False}),
             protocol=ProtocolSpec(kind="single_agent", kwargs={}),
             num_episodes=args.episodes - (args.episodes // 2),
-            sampling_args=sampling_args,
+            inference=inference,
             meta={"setup": "opponent_starts"},
         ),
     ]

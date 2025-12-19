@@ -11,7 +11,8 @@ from ludic.interaction.base import InteractionProtocol
 from ludic.interaction.single_agent import SingleAgentSyncProtocol
 from ludic.context.full_dialog import FullDialog
 from ludic.envs.env import LudicEnv
-from ludic.inference.sampling import SamplingConfig
+from ludic.inference.request import ChatCompletionRequest, InferenceSpec, ReturnSpec
+from ludic.inference.sampling import SamplingParams
 
 from ludic.training.batching import (
     RolloutEngine,
@@ -24,7 +25,7 @@ from ludic.training.types import (
 )
 from ludic.training.credit_assignment import MonteCarloReturn
 from ludic.training.filters import drop_truncated
-from ludic.types import Rollout, SamplingArgs, Step
+from ludic.types import Rollout, Step
 
 from tests._mocks import MockClient, _mock_parser, MockAgent
 
@@ -42,10 +43,7 @@ class TokenClient(MockClient):
 
     async def complete(
         self,
-        *,
-        model: str,
-        messages: List[Dict[str, str]],
-        sampling: SamplingConfig,
+        request: ChatCompletionRequest,
         **kwargs,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
         # Prompt is "some prompt", completion is "1".
@@ -55,7 +53,7 @@ class TokenClient(MockClient):
             prompt_token_ids=[10, 11],
             completion_token_ids=[12, 13, 14],
         )
-        return resp, {"used_args": sampling.to_openai_kwargs()}
+        return resp, {"used_request": request.to_dict()}
 
 
 class ConstantCreditAssigner:
@@ -75,12 +73,10 @@ class ConstantCreditAssigner:
         return out
 
 
-def fake_tokenize(text: str) -> List[int]:
-    """
-    Extremely dumb tokenizer for retokenize=True path:
-    converts each character to its ord().
-    """
-    return [ord(c) for c in text]
+DEFAULT_INFERENCE = InferenceSpec(
+    sampling=SamplingParams(temperature=0.0, max_tokens=16),
+    return_=ReturnSpec.for_eval(return_token_ids=True),
+)
 
 # ---------------------------------------------------------------------
 # Mock Protocol that produces MULTIPLE rollouts per run()
@@ -93,8 +89,9 @@ class MultiTraceMockProtocol(InteractionProtocol):
         *,
         env: LudicEnv,
         max_steps: int,
-        seed: Optional[int] = None,
-        sampling_args: Optional[SamplingArgs] = None,
+        env_seed: Optional[int] = None,
+        sampling_seed: Optional[int] = None,
+        inference: Optional[InferenceSpec] = None,
         timeout_s: Optional[float] = None,
     ) -> List[Rollout]:
         # Simulate Agent A
@@ -398,7 +395,6 @@ async def test_generate_batch_uses_model_token_ids_when_available(
         credit_assigner=credit_assigner,
         timeout_s=None,
         concurrency=1,
-        retokenize=False,  # MUST not retokenize; should use model IDs
     )
 
     # Single rollout, single step
@@ -423,7 +419,7 @@ async def test_generate_batch_uses_model_token_ids_when_available(
 
 
 # ---------------------------------------------------------------------
-# generate_batch: missing token IDs and retokenize behaviour
+# generate_batch: missing token IDs
 # ---------------------------------------------------------------------
 
 
@@ -449,72 +445,14 @@ async def test_generate_batch_raises_if_no_token_ids_and_no_retokenize(
         num_episodes=1,
     )
 
-    with pytest.raises(ValueError, match="Missing model token IDs"):
+    with pytest.raises(ValueError, match="Missing rollout-time token trace"):
         await engine.generate_batch(
             requests=[request],
             max_steps=2,
             credit_assigner=credit_assigner,
             timeout_s=None,
             concurrency=1,
-            retokenize=False,
         )
-
-
-@pytest.mark.asyncio
-async def test_generate_batch_retokenize_path_uses_custom_tokenizer(
-    env_registry,
-    mock_agent,
-) -> None:
-    protocol_registry = {
-        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=mock_agent)
-    }
-    
-    engine = RolloutEngine(
-        env_registry=env_registry,
-        protocol_registry=protocol_registry,
-    )
-
-    # Use a real credit assigner here just to check it integrates fine
-    credit_assigner = MonteCarloReturn(gamma=1.0)
-
-    request = RolloutRequest(
-        env=EnvSpec(kind="mock", kwargs={"max_steps": 1, "target": "1"}),
-        protocol=ProtocolSpec(kind="mock_protocol"),
-        num_episodes=1,
-    )
-
-    batch = await engine.generate_batch(
-        requests=[request],
-        max_steps=2,
-        credit_assigner=credit_assigner,
-        timeout_s=None,
-        concurrency=1,
-        retokenize=True,
-        tokenize=fake_tokenize,
-    )
-
-    assert batch.meta["num_rollouts"] == 1
-    assert batch.meta["num_samples"] == 1
-    assert batch.meta["avg_total_reward"] == pytest.approx(1.0)
-
-    assert len(batch.items) == 1
-    item = batch.items[0]
-
-    # State text is the initial observation from MockEnv.reset()
-    state_text = "Reply with '1' to finish."
-    state_len = len(state_text)
-
-    # We used per-character ord() tokenization
-    assert item.input_ids[:state_len] == [ord(c) for c in state_text]
-
-    # Action is "1" from MockClient; so last token should be ord("1")
-    assert item.input_ids[-1] == ord("1")
-
-    # Action mask should be 0 over state region, 1 over action region
-    assert all(v == 0 for v in item.action_mask[:state_len])
-    assert all(v == 1 for v in item.action_mask[state_len:])
-
-    assert item.weight == pytest.approx(batch.items[0].weight)
 
 
 # ---------------------------------------------------------------------
@@ -525,10 +463,15 @@ async def test_generate_batch_retokenize_path_uses_custom_tokenizer(
 @pytest.mark.asyncio
 async def test_rollout_batch_source_next_batch_integration(
     env_registry,
-    mock_agent,
 ) -> None:
+    agent = Agent(
+        client=TokenClient(),
+        model="mock",
+        ctx=FullDialog(),
+        parser=_mock_parser,
+    )
     protocol_registry = {
-        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=mock_agent)
+        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent)
     }
     
     engine = RolloutEngine(
@@ -545,6 +488,7 @@ async def test_rollout_batch_source_next_batch_integration(
                 env=EnvSpec(kind="mock", kwargs={"max_steps": 2, "target": "1"}),
                 protocol=ProtocolSpec(kind="mock_protocol"),
                 num_episodes=2,
+                inference=DEFAULT_INFERENCE,
                 meta={"batch_source": True},
             )
         ]
@@ -556,8 +500,6 @@ async def test_rollout_batch_source_next_batch_integration(
         max_steps=3,
         timeout_s=None,
         concurrency=2,
-        retokenize=True,
-        tokenize=fake_tokenize,
     )
 
     saw_batch = await batch_source.next_batch()
@@ -578,7 +520,12 @@ async def test_rollout_batch_source_next_batch_integration(
 async def test_rollout_batch_source_passes_sample_filter(
     env_registry,
 ) -> None:
-    agent = MockAgent(client=MockClient(text="wrong"))
+    agent = Agent(
+        client=TokenClient(),
+        model="mock",
+        ctx=FullDialog(),
+        parser=_mock_parser,
+    )
     protocol_registry = {
         "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent)
     }
@@ -596,6 +543,7 @@ async def test_rollout_batch_source_passes_sample_filter(
                 env=EnvSpec(kind="mock", kwargs={"max_steps": 10, "target": "win"}),
                 protocol=ProtocolSpec(kind="mock_protocol"),
                 num_episodes=1,
+                inference=DEFAULT_INFERENCE,
             )
         ]
 
@@ -604,8 +552,6 @@ async def test_rollout_batch_source_passes_sample_filter(
         credit_assigner=credit_assigner,
         requests_fn=requests_fn,
         max_steps=3,
-        retokenize=True,
-        tokenize=fake_tokenize,
         sample_filter=drop_truncated,
     )
 
@@ -626,7 +572,12 @@ async def test_saw_item_contains_truncation_flags(
     from Rollout.meta.
     """
 
-    agent = MockAgent(client=MockClient(text="wrong"))  # Never terminates
+    agent = Agent(
+        client=TokenClient(),
+        model="mock",
+        ctx=FullDialog(),
+        parser=_mock_parser,
+    )  # Never terminates the env since it never outputs target="win"
     protocol_registry = {
         "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent),
     }
@@ -638,14 +589,12 @@ async def test_saw_item_contains_truncation_flags(
 
     credit_assigner = MonteCarloReturn()
 
-    def fake_tokenize(s: str) -> List[int]:
-        return [ord(c) % 100 for c in s[:10]]
-
     requests = [
         RolloutRequest(
             env=EnvSpec(kind="mock", kwargs={"max_steps": 10, "target": "win"}),
             protocol=ProtocolSpec(kind="mock_protocol"),
             num_episodes=1,
+            inference=DEFAULT_INFERENCE,
         )
     ]
 
@@ -654,8 +603,6 @@ async def test_saw_item_contains_truncation_flags(
         requests=requests,
         max_steps=3,
         credit_assigner=credit_assigner,
-        retokenize=True,
-        tokenize=fake_tokenize,
     )
 
     assert len(batch.items) == 3
@@ -680,7 +627,12 @@ async def test_saw_item_contains_truncation_flags(
 async def test_generate_batch_applies_sample_filter_and_updates_counts(
     env_registry,
 ) -> None:
-    agent = MockAgent(client=MockClient(text="wrong"))  # Never terminates
+    agent = Agent(
+        client=TokenClient(),
+        model="mock",
+        ctx=FullDialog(),
+        parser=_mock_parser,
+    )  # Never terminates the env since it never outputs target="win"
     protocol_registry = {
         "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent),
     }
@@ -697,6 +649,7 @@ async def test_generate_batch_applies_sample_filter_and_updates_counts(
             env=EnvSpec(kind="mock", kwargs={"max_steps": 10, "target": "win"}),
             protocol=ProtocolSpec(kind="mock_protocol"),
             num_episodes=1,
+            inference=DEFAULT_INFERENCE,
         )
     ]
 
@@ -704,8 +657,6 @@ async def test_generate_batch_applies_sample_filter_and_updates_counts(
         requests=requests,
         max_steps=3,
         credit_assigner=credit_assigner,
-        retokenize=True,
-        tokenize=fake_tokenize,
         sample_filter=drop_truncated,
     )
 
@@ -728,15 +679,20 @@ async def test_avg_completion_length_respects_filtered_items(
 
         async def complete(  # type: ignore[override]
             self,
-            *,
-            model: str,
-            messages: List[Dict[str, str]],
-            sampling: SamplingConfig,
+            request: ChatCompletionRequest,
             **kwargs,
         ) -> Tuple[ChatResponse, Dict[str, Any]]:
             text = self._texts[min(self._i, len(self._texts) - 1)]
             self._i += 1
-            return ChatResponse(text=text), {"used_args": sampling.to_openai_kwargs()}
+            completion_ids = list(range(100, 100 + len(text)))
+            return (
+                ChatResponse(
+                    text=text,
+                    prompt_token_ids=[1, 2],
+                    completion_token_ids=completion_ids,
+                ),
+                {"used_request": request.to_dict()},
+            )
 
     agent = Agent(
         client=SeqClient(["a", "bb", "ccc"]),
@@ -759,6 +715,7 @@ async def test_avg_completion_length_respects_filtered_items(
             env=EnvSpec(kind="mock", kwargs={"max_steps": 10, "target": "win"}),
             protocol=ProtocolSpec(kind="mock_protocol"),
             num_episodes=1,
+            inference=DEFAULT_INFERENCE,
         )
     ]
 
@@ -767,8 +724,6 @@ async def test_avg_completion_length_respects_filtered_items(
         requests=requests,
         max_steps=3,
         credit_assigner=credit_assigner,
-        retokenize=True,
-        tokenize=fake_tokenize,
         sample_filter=lambda item: item.meta.get("step_index") == 0,
     )
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import os
 from functools import partial
-from typing import List, Dict, Any
+from typing import List
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -23,7 +23,7 @@ from peft import get_peft_model, LoraConfig, TaskType
 from environments.tic_tac_toe import TicTacToeEnv
 from ludic.agent import Agent
 from ludic.context import FullDialog, TruncatedThinkingContext
-from ludic.inference import VLLMChatClient
+from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.distributed.adapters import create_vllm_publisher
 from ludic.parsers import compose_parsers, think_prefix_parser, xml_tag_parser
@@ -55,7 +55,7 @@ TICTACTOE_PARSER = compose_parsers(
 def build_requests_fn(
     rng: torch.Generator,
     batch_size: int,
-    sampling_args: Dict[str, Any],
+    inference: InferenceSpec,
 ):
     def _fn() -> List[RolloutRequest]:
         reqs: List[RolloutRequest] = []
@@ -70,8 +70,9 @@ def build_requests_fn(
                     env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": agent_starts}),
                     protocol=ProtocolSpec(kind="single_agent", kwargs={}),
                     num_episodes=1,
-                    seed=int(seed),
-                    sampling_args=sampling_args,
+                    env_seed=int(seed),
+                    sampling_seed=int(seed),
+                    inference=inference,
                     meta={"agent_starts": agent_starts},
                 )
             )
@@ -196,13 +197,11 @@ def main():
         protocol_registry=protocol_registry,
         jsonl_path=rollout_log_path,
     )
-    sampling_args = {
-        "temperature": args.train_temperature,
-        "max_tokens": 250,
-        # Ask vLLM for token IDs.
-        "extras": {"extra_body": {"return_token_ids": True}},
-    }
-    base_requests_fn = build_requests_fn(rng, args.batch_size, sampling_args)
+    train_inference = InferenceSpec(
+        sampling=SamplingParams(temperature=args.train_temperature, max_tokens=250),
+        return_=ReturnSpec.for_eval(return_token_ids=True),
+    )
+    base_requests_fn = build_requests_fn(rng, args.batch_size, train_inference)
     # Expand each logical request into a group with shared env seed and diverse sampling seeds.
     def requests_fn() -> List[RolloutRequest]:
         return GRPORequestStrategy(group_size=args.group_size).expand(base_requests_fn())
@@ -212,7 +211,6 @@ def main():
         requests_fn=requests_fn,
         max_steps=args.max_steps_per_episode,
         concurrency=args.concurrency,
-        retokenize=False,
     )
 
     # Trainer
@@ -342,12 +340,12 @@ def main():
                         env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": agent_starts}),
                         protocol=ProtocolSpec(kind="single_agent", kwargs={}),
                         num_episodes=1,
-                        seed=int(seed),
-                        sampling_args={
-                            "temperature": args.eval_temperature,
-                            "max_tokens": 250,
-                            "extras": {"extra_body": {"return_token_ids": True}},
-                        },
+                        env_seed=int(seed),
+                        sampling_seed=int(seed),
+                        inference=InferenceSpec(
+                            sampling=SamplingParams(temperature=args.eval_temperature, max_tokens=250),
+                            return_=ReturnSpec.for_eval(return_token_ids=True),
+                        ),
                         meta={"eval_seed": seed, "agent_starts": agent_starts},
                     )
                     for seed, agent_starts in enumerate(

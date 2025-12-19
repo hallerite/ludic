@@ -9,7 +9,8 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ludic.inference.vllm_client import VLLMChatClient
-from ludic.inference.sampling import get_default_sampling_config, SamplingConfig
+from ludic.inference.request import ChatCompletionRequest, ReturnSpec
+from ludic.inference.sampling import SamplingParams
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu, pytest.mark.report]
 
@@ -33,18 +34,15 @@ async def test_vllm_client_returns_logprobs(
     """
     Ensure vLLM returns per-token logprobs when requested (logprobs=1 by default).
     """
-    base = get_default_sampling_config()
     # Use "no-op" sampling settings so HF teacher-forcing logprobs match the
     # distribution vLLM should report (no temperature scaling / truncation).
-    sampling = SamplingConfig(
-        seed=base.seed,
+    sampling = SamplingParams(
         temperature=1.0,
-        max_tokens=base.max_tokens,
+        max_tokens=256,
         top_p=1.0,
         frequency_penalty=0.0,
         presence_penalty=0.0,
-        stop=base.stop,
-        extras=base.extras,
+        stop=None,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -52,15 +50,13 @@ async def test_vllm_client_returns_logprobs(
         trust_remote_code=True,
     )
 
-    long_sampling = SamplingConfig(
-        seed=base.seed,
+    long_sampling = SamplingParams(
         temperature=1.0,
-        max_tokens=max(base.max_tokens, 32),
+        max_tokens=max(256, 32),
         top_p=1.0,
         frequency_penalty=0.0,
         presence_penalty=0.0,
-        stop=base.stop,
-        extras=base.extras,
+        stop=None,
     )
 
     scenarios = [
@@ -82,14 +78,19 @@ async def test_vllm_client_returns_logprobs(
         ),
     ]
 
-    responses: list[tuple[str, SamplingConfig, list[int], list[int], list[int], list[float]]] = []
+    # (scenario_name, sampling_cfg, seed, prompt_token_ids, completion_token_ids, completion_logprobs)
+    responses: list[tuple[str, SamplingParams, int, list[int], list[int], list[float]]] = []
 
     for scenario_name, messages, sampling_cfg in scenarios:
+        seed = 0
         resp, _ = await vllm_client.complete(
-            model=vllm_model_name,
-            messages=messages,
-            sampling=sampling_cfg,
-            return_token_ids=True,
+            ChatCompletionRequest(
+                model=vllm_model_name,
+                messages=messages,
+                sampling=sampling_cfg,
+                seed=seed,
+                return_=ReturnSpec.for_rl(top_logprobs_k=1),
+            )
         )
 
         assert resp.text.strip() != ""
@@ -116,8 +117,8 @@ async def test_vllm_client_returns_logprobs(
             (
                 scenario_name,
                 sampling_cfg,
-                prompt_ids,
-                completion_ids,
+                seed,
+                list(prompt_ids),
                 list(resp.completion_token_ids),
                 list(resp.completion_logprobs),
             )
@@ -180,7 +181,7 @@ async def test_vllm_client_returns_logprobs(
         if target_dtype is None:
             raise RuntimeError(f"Unsupported dtype requested for server: {server_dtype}")
 
-        for scenario_name, _, prompt_ids, completion_ids, completion_token_ids, completion_logprobs in responses:
+        for scenario_name, _sampling_cfg, _seed, prompt_ids, completion_token_ids, completion_logprobs in responses:
             scenario_results: list[tuple[str, float, float, bool]] = []
 
             hf_logprobs = teacher_force_logprobs(prompt_ids, completion_token_ids, target_dtype)
@@ -196,7 +197,7 @@ async def test_vllm_client_returns_logprobs(
             scenario_results.append((server_dtype, max_abs_err, mean_abs_err, within_tolerance))
 
             scenario_summaries.append(
-                (scenario_name, len(completion_ids), scenario_results)
+                (scenario_name, len(completion_token_ids), scenario_results)
             )
 
         with capfd.disabled():

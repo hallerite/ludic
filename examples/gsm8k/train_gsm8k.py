@@ -25,7 +25,7 @@ from environments.gsm8k import GSM8KEnv
 
 from ludic.agent import Agent
 from ludic.context import FullDialog
-from ludic.inference import VLLMChatClient
+from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import boxed_parser
 from ludic.distributed.adapters import create_vllm_publisher
@@ -145,24 +145,24 @@ def main():
         protocol_registry=protocol_registry,
         jsonl_path=rollout_log_path,
     )
-    sampling_args = {
-        "temperature": args.train_temperature,
-        "max_tokens": 512,
-        # Ask vLLM for token IDs + logprobs so GRPO can use rollout-time behavior logprobs.
-        "extras": {"extra_body": {"return_token_ids": True, "logprobs": True, "top_logprobs": 1}},
-    }
+    train_inference = InferenceSpec(
+        sampling=SamplingParams(temperature=args.train_temperature, max_tokens=512),
+        # Ask vLLM for token IDs + chosen-token logprobs so GRPO can use rollout-time behavior logprobs.
+        return_=ReturnSpec.for_rl(top_logprobs_k=1),
+    )
     requests_fn = make_dataset_queue_requests_fn(
         samples_q,
         batch_size=args.batch_size,
         env_kind="gsm8k",
         protocol_kind="single_agent",
-        sampling_args=sampling_args,
+        inference=train_inference,
         protocol_kwargs={},
         request_meta_fn=lambda idx, sample: {
             "sample_index": idx,
             "question_id": sample.get("id", idx),
         },
-        seed_fn=lambda idx, _sample: idx,
+        env_seed_fn=lambda idx, _sample: idx,
+        sampling_seed_fn=lambda idx, _sample: idx,
         group_size=args.group_size,
     )
     batch_source = RolloutBatchSource(
@@ -171,7 +171,6 @@ def main():
         requests_fn=requests_fn,
         max_steps=1,
         concurrency=args.concurrency,
-        retokenize=False,
     )
 
     # Trainer
@@ -257,13 +256,13 @@ def main():
                             kwargs={"sample": sample},
                         ),
                         protocol=ProtocolSpec(kind="single_agent"),
-                        sampling_args={
-                            "temperature": args.eval_temperature,
-                            "max_tokens": 512,
-                            "extras": {"extra_body": {"return_token_ids": True}},
-                        },
+                        env_seed=idx,
+                        sampling_seed=idx,
+                        inference=InferenceSpec(
+                            sampling=SamplingParams(temperature=args.eval_temperature, max_tokens=512),
+                            return_=ReturnSpec.for_eval(return_token_ids=True),
+                        ),
                         num_episodes=1,
-                        seed=idx,
                         meta={"eval_sample_index": idx, "question_id": sample.get("id", idx)},
                     )
                     for idx, sample in enumerate(eval_samples)

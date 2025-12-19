@@ -4,7 +4,8 @@ import queue
 from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple, TypeVar
 
 from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
-from ludic.types import JSON, SamplingArgs
+from ludic.types import JSON
+from ludic.inference.request import InferenceSpec
 
 from .intra_batch_control import GRPORequestStrategy, RequestStrategy
 
@@ -61,11 +62,12 @@ def make_dataset_queue_requests_fn(
     batch_size: int,
     env_kind: str,
     protocol_kind: str,
-    sampling_args: Optional[SamplingArgs] = None,
+    inference: Optional[InferenceSpec] = None,
     env_kwargs_fn: Optional[Callable[[T], Dict[str, JSON]]] = None,
     protocol_kwargs: Optional[Dict[str, JSON]] = None,
     request_meta_fn: Optional[Callable[[int, T], Dict[str, JSON]]] = None,
-    seed_fn: Optional[Callable[[int, T], int]] = None,
+    env_seed_fn: Optional[Callable[[int, T], int]] = None,
+    sampling_seed_fn: Optional[Callable[[int, T], int]] = None,
     group_size: int = 1,
     on_empty: Literal["raise", "return_empty"] = "raise",
 ) -> Callable[[], List[RolloutRequest]]:
@@ -88,11 +90,17 @@ def make_dataset_queue_requests_fn(
 
     protocol_kwargs_final: Dict[str, JSON] = dict(protocol_kwargs) if protocol_kwargs is not None else {}
 
-    seed_fn_final: Callable[[int, T], int]
-    if seed_fn is None:
-        seed_fn_final = lambda idx, _sample: idx
+    env_seed_fn_final: Callable[[int, T], int]
+    if env_seed_fn is None:
+        env_seed_fn_final = lambda idx, _sample: idx
     else:
-        seed_fn_final = seed_fn
+        env_seed_fn_final = env_seed_fn
+
+    sampling_seed_fn_final: Callable[[int, T], int]
+    if sampling_seed_fn is None:
+        sampling_seed_fn_final = lambda idx, _sample: idx
+    else:
+        sampling_seed_fn_final = sampling_seed_fn
 
     meta_fn = request_meta_fn
 
@@ -109,8 +117,9 @@ def make_dataset_queue_requests_fn(
             env=EnvSpec(kind=env_kind, kwargs=env_kwargs_fn_final(sample)),
             protocol=ProtocolSpec(kind=protocol_kind, kwargs=protocol_kwargs_final),
             num_episodes=1,
-            seed=int(seed_fn_final(idx, sample)),
-            sampling_args=sampling_args,
+            env_seed=int(env_seed_fn_final(idx, sample)),
+            sampling_seed=int(sampling_seed_fn_final(idx, sample)),
+            inference=inference,
             meta=meta,
         )
 
@@ -129,11 +138,12 @@ def make_dataset_sequence_requests_fn(
     batch_size: int,
     env_kind: str,
     protocol_kind: str,
-    sampling_args: Optional[SamplingArgs] = None,
+    inference: Optional[InferenceSpec] = None,
     env_kwargs_fn: Optional[Callable[[T], Dict[str, JSON]]] = None,
     protocol_kwargs: Optional[Dict[str, JSON]] = None,
     request_meta_fn: Optional[Callable[[int, T], Dict[str, JSON]]] = None,
-    seed_fn: Optional[Callable[[int, T], int]] = None,
+    env_seed_fn: Optional[Callable[[int, T], int]] = None,
+    sampling_seed_fn: Optional[Callable[[int, T], int]] = None,
     group_size: int = 1,
     shuffle: bool = False,
     rng_seed: int = 0,
@@ -163,11 +173,17 @@ def make_dataset_sequence_requests_fn(
 
     protocol_kwargs_final: Dict[str, JSON] = dict(protocol_kwargs) if protocol_kwargs is not None else {}
 
-    seed_fn_final: Callable[[int, T], int]
-    if seed_fn is None:
-        seed_fn_final = lambda idx, _sample: idx
+    env_seed_fn_final: Callable[[int, T], int]
+    if env_seed_fn is None:
+        env_seed_fn_final = lambda idx, _sample: idx
     else:
-        seed_fn_final = seed_fn
+        env_seed_fn_final = env_seed_fn
+
+    sampling_seed_fn_final: Callable[[int, T], int]
+    if sampling_seed_fn is None:
+        sampling_seed_fn_final = lambda idx, _sample: idx
+    else:
+        sampling_seed_fn_final = sampling_seed_fn
 
     meta_fn = request_meta_fn
 
@@ -195,8 +211,9 @@ def make_dataset_sequence_requests_fn(
                     env=EnvSpec(kind=env_kind, kwargs=env_kwargs_fn_final(sample)),
                     protocol=ProtocolSpec(kind=protocol_kind, kwargs=protocol_kwargs_final),
                     num_episodes=1,
-                    seed=int(seed_fn_final(idx, sample)),
-                    sampling_args=sampling_args,
+                    env_seed=int(env_seed_fn_final(idx, sample)),
+                    sampling_seed=int(sampling_seed_fn_final(idx, sample)),
+                    inference=inference,
                     meta=meta,
                 )
             )

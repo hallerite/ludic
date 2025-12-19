@@ -31,7 +31,7 @@ from ludic.eval.cli import (
     add_common_eval_args,
     build_single_agent_engine,
     maybe_start_vllm,
-    sampling_args_from_cli,
+    inference_spec_from_cli,
     write_jsonl,
 )
 
@@ -105,7 +105,7 @@ GSM8K_REDUCERS: Dict[str, Reducer] = {
 
 
 def make_requests(samples: List[dict], args: argparse.Namespace) -> List[RolloutRequest]:
-    sargs = sampling_args_from_cli(args)
+    inf = inference_spec_from_cli(args)
     return [
         RolloutRequest(
             env=EnvSpec(
@@ -113,7 +113,9 @@ def make_requests(samples: List[dict], args: argparse.Namespace) -> List[Rollout
                 kwargs={"sample": sample, "system_prompt": args.system_prompt},
             ),
             protocol=ProtocolSpec(kind="single_agent"),
-            sampling_args=sargs,
+            env_seed=idx,
+            sampling_seed=idx,
+            inference=inf,
             num_episodes=1,
             meta={"sample_index": idx},
         )

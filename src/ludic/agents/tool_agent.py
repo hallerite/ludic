@@ -6,7 +6,7 @@ import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ludic.agents.base_agent import Agent
-from ludic.types import SamplingArgs
+from ludic.inference.request import InferenceSpec, ReturnSpec, ToolRequest
 
 logger = logging.getLogger(__name__)
 
@@ -31,28 +31,27 @@ class ToolAgent(Agent):
         self.tool_map: Dict[str, Callable] = {t.__name__: t for t in tools}
         self.tool_schemas: List[Dict[str, Any]] = [self._func_to_schema(t) for t in tools]
 
-    def _with_tools(self, sampling_args: SamplingArgs) -> SamplingArgs:
-        """Return a copy of sampling_args with tools advertised and token IDs forced on."""
-        sargs = sampling_args.copy()
-        extras = sargs.get("extras", {}).copy()
-        extras["tools"] = self.tool_schemas
-        extras["tool_choice"] = "auto"
+    def _tool_request(self) -> ToolRequest:
+        return ToolRequest(tools=list(self.tool_schemas), tool_choice="auto")
 
-        extra_body = extras.get("extra_body", {}).copy() if extras.get("extra_body") else {}
-        extra_body["return_token_ids"] = True
-        extras["extra_body"] = extra_body
+    def _with_tools(self, inference: Optional[InferenceSpec]) -> InferenceSpec:
+        """
+        Return an InferenceSpec suitable for tool calling.
 
-        sargs["extras"] = extras
-        return sargs
-
-    def _strip_tools(self, sampling_args: SamplingArgs) -> SamplingArgs:
-        """Return a copy of sampling_args with tool fields removed."""
-        sargs = sampling_args.copy()
-        extras = sargs.get("extras", {}).copy()
-        extras.pop("tools", None)
-        extras.pop("tool_choice", None)
-        sargs["extras"] = extras
-        return sargs
+        Enforces `return_token_ids=True` so training can stay drift-free.
+        """
+        inf = inference or InferenceSpec()
+        if inf.return_.return_token_ids:
+            return inf
+        return InferenceSpec(
+            sampling=inf.sampling,
+            return_=ReturnSpec(
+                return_token_ids=True,
+                return_chosen_logprobs=inf.return_.return_chosen_logprobs,
+                top_logprobs_k=inf.return_.top_logprobs_k,
+            ),
+            extensions=inf.extensions,
+        )
 
     def _extract_openai_message(
         self, info: Dict[str, Any]
