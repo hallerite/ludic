@@ -23,7 +23,9 @@ from typing import Any, Dict, List
 import torch
 import torch.distributed as dist
 from torch.distributed import fsdp
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset  # type: ignore
 
 from environments.math import MATHEnv
@@ -149,7 +151,7 @@ def load_math_eval(limit: int | None) -> List[Dict[str, Any]]:
             raise SystemExit(f"{MATH_EVAL_DATASET} sample is missing 'solution' at index={idx}")
         if extract_last_boxed_content(str(solution)) is None:
             raise SystemExit(
-                f"{MATH_EVAL_DATASET} sample at index={idx} does not contain a final \\boxed{...} answer"
+                f"{MATH_EVAL_DATASET} sample at index={idx} does not contain a final \\boxed{{...}} answer"
             )
         sample["solution"] = str(solution)
         samples.append(sample)
@@ -245,7 +247,7 @@ def main() -> None:
         samples_q.put((idx, s))
 
     # Tokenizer + model
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -254,21 +256,92 @@ def main() -> None:
         reduce_dtype=torch.float32,
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        dtype=torch.bfloat16,
-        device_map={"": "cpu"},
-        low_cpu_mem_usage=True,
-    )
+    # -----------------------------------------------------------------------
+    # FSDP2 init pattern:
+    #   1) Build the model on meta (no real parameter storage)
+    #   2) Create an explicit 1D DeviceMesh (DP-only)
+    #   3) Apply fully_shard per block, then on the root
+    #   4) Allocate real storage directly on device via to_empty()
+    #   5) Load pretrained weights into the sharded model
+    # -----------------------------------------------------------------------
+
+    # 1) Build config + meta-init model (no allocation)
+    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+
+    # 2) Explicit 1D mesh for DP/FSDP-style sharding
+    if torch.cuda.is_available():
+        mesh = init_device_mesh("cuda", (world_size,))
+    else:
+        # FSDP2 is primarily a CUDA story; this keeps CPU paths from crashing in trivial cases.
+        mesh = None
+
+    # 3) Shard per-block first, then root (fail-loud block selection)
     blocks = None
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         blocks = model.model.layers  # type: ignore[attr-defined]
     elif hasattr(model, "layers"):
         blocks = model.layers  # type: ignore[attr-defined]
-    if blocks is not None:
-        for layer in blocks:
-            fsdp.fully_shard(layer, mp_policy=mp_policy)
-    fsdp.fully_shard(model, mp_policy=mp_policy)
+
+    if blocks is None:
+        raise RuntimeError("Unsupported model structure: expected transformer blocks at `model.model.layers` or `model.layers`")
+
+    for layer in blocks:
+        fsdp.fully_shard(layer, mesh=mesh, mp_policy=mp_policy)
+
+    fsdp.fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+
+    # 4) Allocate storage on the target device without initializing weights
+    if torch.cuda.is_available():
+        model.to_empty(device=device)  # type: ignore[call-arg]
+    else:
+        model = model.to(device)
+
+    # 5) Load pretrained weights into the (now allocated + sharded) model
+    #
+    # We load the checkpoint on rank 0 and broadcast tensors to all ranks to
+    # avoid repeated disk I/O. This still materializes a full CPU state dict
+    # per rank; for large models, prefer sharded checkpoint loading.
+    full_sd = None
+    if rank == 0:
+        cpu_model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch.bfloat16,
+            device_map={"": "cpu"},
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        full_sd = cpu_model.state_dict()
+        del cpu_model
+
+    # Broadcast state dict metadata then tensors from rank 0.
+    meta_list = [[(k, v.shape, v.dtype) for k, v in full_sd.items()]] if rank == 0 else [[]]
+    dist.broadcast_object_list(meta_list, src=0)
+    meta = meta_list[0]
+
+    if rank != 0:
+        full_sd = {}
+
+    for name, shape, dtype in meta:
+        if rank == 0:
+            tensor = full_sd[name]
+        else:
+            tensor = torch.empty(shape, dtype=dtype)
+        dist.broadcast(tensor, src=0)
+        if rank != 0:
+            full_sd[name] = tensor
+
+    # Ensure all ranks reach loading together (collective semantics are easier to reason about).
+    dist.barrier()
+
+    load_opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    set_model_state_dict(model, full_sd, options=load_opts)
+
+    # Free CPU-side state dict reference as soon as possible.
+    del full_sd
+
+    # -----------------------------------------------------------------------
 
     action_parser = boxed_parser
 
