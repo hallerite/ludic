@@ -1,16 +1,55 @@
 from ludic.interaction.step_collector import TraceCollector
-from ludic.types import Step
+from ludic.types import EnvironmentStep, TokenTrace
 
 def test_trace_collector_separation():
     """Ensure collector separates steps by agent_id into distinct rollouts."""
     collector = TraceCollector(env_name="test_env")
 
     # Agent A steps
-    step_a1 = Step(index=0, prev_obs="a1", action="act_a1", next_obs="o", reward=1.0, truncated=False, terminated=False)
-    step_a2 = Step(index=1, prev_obs="a2", action="act_a2", next_obs="o", reward=1.0, truncated=False, terminated=True)
+    step_a1 = EnvironmentStep(
+        index=0,
+        prev_obs="a1",
+        action="act_a1",
+        parsed_action="act_a1",
+        next_obs="o",
+        source_agent_step_id="agentA_0",
+        agent_step_ids=["agentA_0"],
+        reward=1.0,
+        truncated=False,
+        terminated=False,
+        info={},
+        trace=TokenTrace(prompt_token_ids=[1], completion_token_ids=[2]),
+    )
+    step_a2 = EnvironmentStep(
+        index=1,
+        prev_obs="a2",
+        action="act_a2",
+        parsed_action="act_a2",
+        next_obs="o",
+        source_agent_step_id="agentA_1",
+        agent_step_ids=["agentA_1"],
+        reward=1.0,
+        truncated=False,
+        terminated=True,
+        info={},
+        trace=TokenTrace(prompt_token_ids=[1], completion_token_ids=[2]),
+    )
     
     # Agent B steps
-    step_b1 = Step(index=0, prev_obs="b1", action="act_b1", next_obs="o", reward=-1.0, truncated=False, terminated=True)
+    step_b1 = EnvironmentStep(
+        index=0,
+        prev_obs="b1",
+        action="act_b1",
+        parsed_action="act_b1",
+        next_obs="o",
+        source_agent_step_id="agentB_0",
+        agent_step_ids=["agentB_0"],
+        reward=-1.0,
+        truncated=False,
+        terminated=True,
+        info={},
+        trace=TokenTrace(prompt_token_ids=[1], completion_token_ids=[2]),
+    )
 
     collector.add("agent_A", step_a1)
     collector.add("agent_B", step_b1) # Interleaved

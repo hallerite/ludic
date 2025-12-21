@@ -72,22 +72,39 @@ Not universally; it depends on what `truncated` means in the environment and the
 
 In Ludic (by default), these incomplete completions are rejected at the `Agent` level and treated like parse failures (see above), so they can be tracked and filtered separately from env/protocol truncation.
 
-## Tool Calls vs Env Actions (future)
+## Tool Calls vs Env Actions (in progress)
 
-We need an explicit distinction between tool calls that *are* environment actions and tool calls that are *auxiliary* to reasoning.
+We now distinguish **AgentSteps** (model calls / internal loop) from **EnvironmentSteps**
+(state transitions). This fixes the “missing traces” issue: every model call gets its own
+`TokenTrace`, so ReAct-style internal tool loops are visible in rollouts.
+
+Remaining design gap: we still need an explicit distinction between tool calls that
+*are* environment actions and tool calls that are *auxiliary* to reasoning.
 
 Two categories:
-- **Env tools (state-changing):** the tool call itself is the env action. It triggers a state transition and can emit reward. Protocols should treat this like an env action (one Step per env transition).
-- **Auxiliary tools (read-only):** the tool call is part of internal reasoning. Tool results become prompt context for the next model call, but do not cause an env step on their own.
+- **Env tools (state-changing):** the tool call itself is the env action. It triggers a
+  state transition and can emit reward. Protocols should treat this like an env action
+  (one EnvironmentStep per transition).
+- **Auxiliary tools (read-only):** the tool call is part of internal reasoning. Tool
+  results become prompt context for the next model call, but do not cause an env step
+  on their own (AgentSteps only).
 
 Implications:
-- Tool result messages should be treated as prompt tokens (action_mask = 0). Only assistant completions are action tokens.
-- Interleaved tool calling is multiple model calls inside a single env step. If we want to train on the full ReAct trajectory, we likely need a per-call trace list (call-level prompt/completion token IDs) attached to a single Step, and batching that can flatten or weight those calls while still keeping one env Step.
-- Env tools should be exposed as the action contract for a given env/protocol (possibly via a dedicated parser), so that the tool call completion is the action that the env consumes.
+- Tool result messages are prompt tokens (action_mask = 0). Only assistant completions
+  are action tokens.
+- Interleaved tool calling is multiple model calls between env steps. This is now
+  recorded as multiple AgentSteps with per-call `TokenTrace`.
+- Training still defaults to env steps (plus env-targeted parse errors) via the default
+  step selector; training on internal tool calls requires an explicit `step_selector`
+  or filter.
+- Env tools still need a dedicated action contract/parser to mark tool calls as
+  `action_target="env"` and emit an EnvironmentStep directly from the tool call.
 
 Current behavior (ReActAgent):
-- `src/ludic/agents/react_agent.py` runs multiple model calls but only returns the **last** call's token trace. The protocol logs a single Step that corresponds to the env transition, so only the final assistant completion is represented in training data.
-- This is problematic because tool-call selection and intermediate reasoning completions are invisible to training. We lose credit assignment over the full trajectory and cannot audit or weight intermediate calls, even though they can dominate behavior.
+- `src/ludic/agents/react_agent.py` runs multiple model calls and returns per-call
+  AgentSteps with token traces, plus one final env-targeted step. Protocols log all
+  AgentSteps and one EnvironmentStep for the env transition, so intermediate tool
+  calls are visible but not trained on by default.
 
 ## Future: First-Class Evaluation + Better Layering
 

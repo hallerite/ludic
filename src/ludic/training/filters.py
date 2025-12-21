@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Sequence
 
 from ludic.training.types import SAWItem, SampleFilter
+from ludic.types import Step, AgentStep, EnvironmentStep
 
 
 def keep_all(item: SAWItem) -> bool:
@@ -28,6 +29,29 @@ def drop_incomplete_completions(item: SAWItem) -> bool:
 def drop_parse_errors(item: SAWItem) -> bool:
     """Drop samples where parsing failed (keep successful parses)."""
     return not item.meta.get("parse_error", False)
+
+
+def keep_env_steps(item: SAWItem) -> bool:
+    """Keep only environment steps."""
+    return item.meta.get("step_kind") == "env"
+
+
+def keep_agent_steps(item: SAWItem) -> bool:
+    """Keep only agent steps."""
+    return item.meta.get("step_kind") == "agent"
+
+
+def default_step_selector(step: Step) -> bool:
+    """
+    Default rollout step selection for training:
+      - all env steps
+      - env-targeted agent steps that failed parsing
+    """
+    if isinstance(step, EnvironmentStep):
+        return True
+    if isinstance(step, AgentStep):
+        return step.action_target == "env" and bool(step.info.get("parse_error"))
+    return False
 
 
 def combine(*filters: SampleFilter) -> SampleFilter:

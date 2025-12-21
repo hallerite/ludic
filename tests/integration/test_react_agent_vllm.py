@@ -65,12 +65,15 @@ async def test_react_agent_vllm_tool_call_loop(
     agent.on_env_reset("What is the secret code for the blue hint?", {})
 
     print("\n--- Starting ReAct Loop ---")
-    parse_result, raw_text, info, token_trace = await agent.act(
+    act_result = await agent.act(
         inference=InferenceSpec(
             sampling=SamplingParams(temperature=0.0, max_tokens=256),
             return_=ReturnSpec.for_eval(return_token_ids=True),
         )
     )
+    final_step = act_result.final_step
+    raw_text = final_step.action
+    token_trace = final_step.trace
     print(f"--- Final Output ---\n{raw_text}\n--------------------")
 
     # 4. Debug: Print Classic Trajectory (High Level)

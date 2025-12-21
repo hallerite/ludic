@@ -1,10 +1,10 @@
 from __future__ import annotations
-from typing import Callable, List, Tuple, Dict, Any, Optional
+from typing import Callable, List, Dict, Any
 
 from ludic.agents.tool_agent import ToolAgent
+from ludic.agents.base_agent import AgentActResult, AgentActStep
 from ludic.inference.request import InferenceSpec, ToolRequest
 from ludic.parsers import ParseResult
-from ludic.types import TokenTrace
 
 class ReActAgent(ToolAgent):
     """
@@ -36,13 +36,12 @@ class ReActAgent(ToolAgent):
         inference: InferenceSpec | None = None,
         sampling_seed: int | None = None,
         timeout_s: float | None = None
-    ) -> Tuple[ParseResult, str, Dict[str, Any], Optional[TokenTrace]]:
+    ) -> AgentActResult:
         
         # 1. Setup inference config (tools enabled by default)
         inf = self._with_tools(inference)
         tools_req: ToolRequest = self._tool_request()
-        last_info: Dict[str, Any] = {}
-        last_trace: Optional[TokenTrace] = None
+        steps: List[AgentActStep] = []
         
         # 2. ReAct Loop
         for step_i in range(self.max_react_steps):
@@ -76,43 +75,81 @@ class ReActAgent(ToolAgent):
                 tools=tools_req_this,
                 timeout_s=timeout_s,
             )
-            last_trace = token_trace
 
             # Extract content/tool_calls from OpenAI raw_response
             content, tool_calls = self._extract_openai_message(info)
+            raw_action = content or ""
+
+            if self._reject_incomplete and resp.finish_reason == "length":
+                parse_result = ParseResult(
+                    action=None,
+                    reward=self._incomplete_penalty,
+                    obs=self._incomplete_feedback,
+                )
+                last_info["incomplete_completion"] = True
+            else:
+                parse_result = self._parser(raw_action)
 
             # 4. Handle Final Panic Move
             if is_final_try:
                 # We forced it to output text. Return whatever it gave us.
-                final_text = content or ""
-                parse_result = self._parser(final_text)
+                final_text = raw_action
                 
                 # Update context so the agent remembers its final decision
                 # We pass None for tool_calls because tools were disabled
                 self._ctx.add_assistant_step(final_text, None)
-                
-                return parse_result, final_text, last_info, last_trace
+
+                steps.append(
+                    AgentActStep(
+                        prompt_messages=messages,
+                        action=final_text,
+                        parse_result=parse_result,
+                        info=last_info,
+                        trace=token_trace,
+                        action_target="env",
+                        loop_index=step_i,
+                    )
+                )
+                return AgentActResult(steps=steps)
 
             # 5. Normal Logic (Update Context & Check Tools)
             self._ctx.add_assistant_step(content, tool_calls)
 
             if tool_calls:
                 # --- EXECUTION PHASE ---
-                self._run_tool_calls(tool_calls)
-                
+                tool_results = self._run_tool_calls(tool_calls)
+                steps.append(
+                    AgentActStep(
+                        prompt_messages=messages,
+                        action=raw_action,
+                        parse_result=parse_result,
+                        info=last_info,
+                        trace=token_trace,
+                        action_target="internal",
+                        loop_index=step_i,
+                        tool_calls=tool_calls,
+                        tool_results=tool_results,
+                    )
+                )
                 # Continue loop -> Model sees result and thinks again
                 continue
-            
-            else:
-                # --- FINAL ANSWER PHASE ---
-                # No tool calls means the model is talking to the user/env.
-                # We expect the content to contain the action here.
-                # The format is defined by self._parser (XML, JSON, Regex, etc).
-                final_text = content or ""
-                parse_result = self._parser(final_text)
-                return parse_result, final_text, last_info, last_trace
 
-        # This should technically be unreachable due to the is_final_try block,
-        # but good for safety.
-        fallback_msg = "Error: Loop logic failure."
-        return self._parser(fallback_msg), fallback_msg, last_info, last_trace
+            # --- FINAL ANSWER PHASE ---
+            # No tool calls means the model is talking to the user/env.
+            # We expect the content to contain the action here.
+            # The format is defined by self._parser (XML, JSON, Regex, etc).
+            final_text = raw_action
+            steps.append(
+                AgentActStep(
+                    prompt_messages=messages,
+                    action=final_text,
+                    parse_result=parse_result,
+                    info=last_info,
+                    trace=token_trace,
+                    action_target="env",
+                    loop_index=step_i,
+                )
+            )
+            return AgentActResult(steps=steps)
+
+        raise RuntimeError("ReActAgent loop exited unexpectedly.")

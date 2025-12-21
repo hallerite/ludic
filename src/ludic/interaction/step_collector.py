@@ -30,9 +30,7 @@ class TraceCollector:
             agent_id: The identifier for the agent (must match the ID used in
                       Rollout.meta["agent_id"]).
             step: The Step object containing ONLY that agent's view:
-                  - prev_obs (what THEY saw)
-                  - action (what THEY output, as a raw string)
-                  - reward (what THEY received)
+                  - AgentStep or EnvironmentStep in that agent's timeline.
         """
         self._traces[agent_id].append(step)
 
@@ -92,20 +90,28 @@ class TraceCollector:
             if not steps:
                 continue
 
-            last_step = steps[-1]
-
-            # Derive episode_truncated and truncation_reason from the agent's last step
-            if last_step.terminated:
-                episode_truncated = False
-                truncation_reason = None
-            elif last_step.truncated:
-                episode_truncated = True
-                # Check if it was max_steps or env-initiated
-                truncation_reason = last_step.info.get("truncation_reason", "env")
+            last_env_step = next((s for s in reversed(steps) if s.kind == "env"), None)
+            if last_env_step is None:
+                last_step = steps[-1]
+                if last_step.terminated:
+                    episode_truncated = False
+                    truncation_reason = None
+                elif last_step.truncated:
+                    episode_truncated = True
+                    truncation_reason = last_step.info.get("truncation_reason", "max_steps")
+                else:
+                    episode_truncated = False
+                    truncation_reason = None
             else:
-                # Should not happen if protocol properly marks all endpoints
-                episode_truncated = False
-                truncation_reason = None
+                if last_env_step.terminated:
+                    episode_truncated = False
+                    truncation_reason = None
+                elif last_env_step.truncated:
+                    episode_truncated = True
+                    truncation_reason = last_env_step.info.get("truncation_reason", "env")
+                else:
+                    episode_truncated = False
+                    truncation_reason = None
 
             r = Rollout(
                 id=str(uuid.uuid4()),

@@ -18,7 +18,12 @@ class DummyClient(ChatClient):
         self,
         request: ChatCompletionRequest,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
-        return ChatResponse(text="ok"), {"raw_response": {"choices": [{"message": {"content": "ok"}}]}}
+        resp = ChatResponse(
+            text="ok",
+            prompt_token_ids=list(range(len(request.messages))),
+            completion_token_ids=[1],
+        )
+        return resp, {"raw_response": {"choices": [{"message": {"content": "ok"}}]}}
 
     def sync_weights(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         raise NotImplementedError
@@ -65,8 +70,9 @@ async def test_tool_agent_helpers_and_execution():
             },
         }
     ]
-    agent._run_tool_calls(tool_calls_payload)
+    results = agent._run_tool_calls(tool_calls_payload)
 
     assert ctx.messages[-1]["role"] == "tool"
     assert ctx.messages[-1]["content"] == "5"
     assert ctx.messages[-1]["tool_call_id"] == "call_1"
+    assert results[0]["tool_name"] == "calculator_tool"

@@ -18,7 +18,7 @@ class ReturnSpec:
     chosen-token logprobs, etc.).
     """
 
-    return_token_ids: bool = False
+    return_token_ids: bool = True
     return_chosen_logprobs: bool = False
     top_logprobs_k: int = 1
 

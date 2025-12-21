@@ -1,7 +1,7 @@
 import pytest
 import math
 
-from ludic.types import Rollout, Step
+from ludic.types import Rollout, EnvironmentStep, TokenTrace
 from ludic.training.credit_assignment import (
     MonteCarloReturn,
     EpisodicReturn,
@@ -33,16 +33,25 @@ def _make_rollout(
 
     for i, reward in enumerate(rewards):
         next_obs = f"obs_{i+1}" if i < len(rewards) - 1 else None
-        rollout.steps.append(Step(
-            index=i,
-            prev_obs=obs,
-            action=f"action_{i}",
-            next_obs=next_obs,
-            reward=reward,
-            truncated=False,
-            terminated=(i == len(rewards) - 1),
-            info={},
-        ))
+        rollout.steps.append(
+            EnvironmentStep(
+                index=i,
+                prev_obs=obs,
+                action=f"action_{i}",
+                parsed_action=f"action_{i}",
+                next_obs=next_obs,
+                source_agent_step_id=f"agent_{i}",
+                agent_step_ids=[f"agent_{i}"],
+                reward=reward,
+                truncated=False,
+                terminated=(i == len(rewards) - 1),
+                info={},
+                trace=TokenTrace(
+                    prompt_token_ids=[1],
+                    completion_token_ids=[2],
+                ),
+            )
+        )
         obs = next_obs or ""
     return rollout
 

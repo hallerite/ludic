@@ -6,7 +6,7 @@ import pytest
 
 from ludic.envs.env import LudicEnv
 from ludic.interaction.multi_agent import MultiAgentProtocol
-from ludic.types import Info, StepOutcome
+from ludic.types import Info, StepOutcome, EnvironmentStep, Rollout
 from tests._mocks import MockAgent, MockClient
 
 
@@ -42,6 +42,10 @@ class EnvTruncatesBoth(LudicEnv[str, str, str]):
         }
 
 
+def _env_steps(rollout: Rollout) -> List[EnvironmentStep]:
+    return [s for s in rollout.steps if isinstance(s, EnvironmentStep)]
+
+
 @pytest.mark.asyncio
 async def test_multi_agent_env_truncation_is_recorded_as_env() -> None:
     env = EnvTruncatesBoth()
@@ -56,8 +60,9 @@ async def test_multi_agent_env_truncation_is_recorded_as_env() -> None:
     assert len(rollouts) == 2
 
     for r in rollouts:
-        assert len(r.steps) == 2
-        assert r.steps[-1].truncated is True
+        env_steps = _env_steps(r)
+        assert len(env_steps) == 2
+        assert env_steps[-1].truncated is True
         assert r.meta.get("episode_truncated") is True
         assert r.meta.get("truncation_reason") == "env"
-        assert r.steps[-1].info.get("truncation_reason") is None
+        assert env_steps[-1].info.get("truncation_reason") is None

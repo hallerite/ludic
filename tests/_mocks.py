@@ -38,7 +38,14 @@ class MockClient(ChatClient):
         self,
         request: ChatCompletionRequest,
     ) -> tuple[ChatResponse, Dict[str, Any]]:
-        resp = ChatResponse(text=self._text, finish_reason=self._finish_reason)
+        prompt_token_ids = list(range(len(request.messages)))
+        completion_token_ids = [100]
+        resp = ChatResponse(
+            text=self._text,
+            finish_reason=self._finish_reason,
+            prompt_token_ids=prompt_token_ids,
+            completion_token_ids=completion_token_ids,
+        )
         return resp, {"used_request": request.to_dict()}
 
     def sync_weights(self, params: Mapping[str, torch.Tensor], **kwargs) -> str:  # type: ignore[name-defined]

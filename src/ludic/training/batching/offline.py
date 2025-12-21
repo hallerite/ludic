@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, TYPE_CHECKING
 
@@ -16,7 +17,8 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader, DistributedSampler, RandomSampler, SequentialSampler
 
-from ludic.types import Rollout, Step
+from ludic.types import Rollout, Step, AgentStep, EnvironmentStep, TokenTrace
+from ludic.training.filters import default_step_selector
 from ludic.training.types import (
     BatchSource,
     CreditAssigner,
@@ -130,17 +132,20 @@ def make_chat_template_step_to_item(
         attention_mask = [1] * len(input_ids)
         action_mask = [0] * len(state_ids) + [1] * len(action_ids)
 
+        prev_obs = step.prev_obs if isinstance(step, EnvironmentStep) else ""
         meta: Dict[str, Any] = {
             "rollout_id": rollout.id,
             "step_index": step.index,
             "reward": float(step.reward),
-            "prev_obs": step.prev_obs,
+            "prev_obs": prev_obs,
             "action": step.action,
             "total_reward": rollout.total_reward,
             "completion_length": len(action_ids),
             "prompt_length": len(state_ids),
             "truncated": step.truncated,
             "terminated": step.terminated,
+            "step_kind": step.kind,
+            "turn_id": step.turn_id,
             **(rollout.meta),
         }
         # Merge step info (but don't overwrite our keys)
@@ -168,20 +173,52 @@ def _load_rollouts_from_jsonl(path: Path) -> List[Rollout]:
             if not line:
                 continue
             data = json.loads(line)
-            steps = [
-                Step(
-                    index=s["index"],
-                    prev_obs=s["prev_obs"],
-                    action=s["action"],
-                    next_obs=s.get("next_obs"),
-                    reward=float(s["reward"]),
-                    truncated=s.get("truncated", False),
-                    terminated=s.get("terminated", False),
-                    info=s.get("info", {}),
-                    ts_ns=s.get("ts_ns", 0),
-                )
-                for s in data.get("steps", [])
-            ]
+            steps: List[Step] = []
+            for s in data.get("steps", []):
+                kind = s.get("kind")
+                trace_data = s.get("trace")
+                if trace_data is None:
+                    raise ValueError("Missing trace in offline rollout step.")
+                trace = TokenTrace.from_dict(trace_data)
+                common = {
+                    "index": s["index"],
+                    "reward": float(s["reward"]),
+                    "truncated": s.get("truncated", False),
+                    "terminated": s.get("terminated", False),
+                    "info": s.get("info", {}),
+                    "reward_components": s.get("reward_components", {}),
+                    "trace": trace,
+                    "id": s.get("id") or str(uuid.uuid4()),
+                    "ts_ns": s.get("ts_ns", 0),
+                    "turn_id": s.get("turn_id"),
+                    "parent_id": s.get("parent_id"),
+                }
+                if kind == "agent":
+                    steps.append(
+                        AgentStep(
+                            prompt_messages=s.get("prompt_messages", []),
+                            action=s.get("action", ""),
+                            action_target=s.get("action_target", "env"),
+                            loop_index=s.get("loop_index", 0),
+                            tool_calls=s.get("tool_calls"),
+                            tool_results=s.get("tool_results"),
+                            **common,
+                        )
+                    )
+                elif kind == "env":
+                    steps.append(
+                        EnvironmentStep(
+                            prev_obs=s.get("prev_obs", ""),
+                            action=s.get("action", ""),
+                            parsed_action=s.get("parsed_action"),
+                            next_obs=s.get("next_obs"),
+                            source_agent_step_id=s.get("source_agent_step_id", ""),
+                            agent_step_ids=s.get("agent_step_ids", []),
+                            **common,
+                        )
+                    )
+                else:
+                    raise ValueError(f"Unknown step kind in offline data: {kind!r}")
             rollout = Rollout(
                 id=data.get("id", ""),
                 steps=steps,
@@ -237,6 +274,8 @@ class OfflineBatchSource(BatchSource):
         seed: Random seed for shuffling.
         num_workers: DataLoader workers for prefetching (0 = main process).
         drop_last: Whether to drop the last incomplete batch.
+        step_selector: Optional filter over rollout steps; defaults to env
+            steps plus env-targeted parse errors.
     """
 
     jsonl_paths: List[Path]
@@ -248,6 +287,7 @@ class OfflineBatchSource(BatchSource):
     seed: int = 42
     num_workers: int = 0
     drop_last: bool = False
+    step_selector: Optional[Callable[[Step], bool]] = None
 
     # Private fields (initialized in __post_init__)
     _items: List[SAWItem] = field(default_factory=list, init=False, repr=False)
@@ -268,11 +308,14 @@ class OfflineBatchSource(BatchSource):
 
         # Compute credit weights once for all rollouts
         weights = self.credit_assigner.compute(self._rollouts)
+        selector = self.step_selector or default_step_selector
 
         # Build all SAWItems upfront (they're small, just token IDs + metadata)
         self._items = []
         for rollout in self._rollouts:
             for step in rollout.steps:
+                if not selector(step):
+                    continue
                 key = (rollout.id, step.index)
                 weight = weights.get(key, 1.0)
                 item = self.step_to_item(rollout, step, weight)

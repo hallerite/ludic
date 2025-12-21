@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Union, Optional
+from typing import Any, Dict, List, Union, Optional, Literal, Mapping
 import logging
 import time
 import uuid
@@ -9,6 +9,7 @@ import json
 log = logging.getLogger(__name__)
 
 JSON = Union[str, int, float, bool, None, Dict[str, Any], List[Any]]
+StepKind = Literal["agent", "env"]
 
 
 # Chat-style message schema
@@ -48,6 +49,27 @@ class TokenTrace:
                     "TokenTrace completion_logprobs length mismatch "
                     f"({len(self.completion_logprobs)} vs {len(self.completion_token_ids)})."
                 )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "prompt_token_ids": list(self.prompt_token_ids),
+            "completion_token_ids": list(self.completion_token_ids),
+            "completion_logprobs": (
+                list(self.completion_logprobs) if self.completion_logprobs is not None else None
+            ),
+            "finish_reason": self.finish_reason,
+        }
+
+    @staticmethod
+    def from_dict(data: Mapping[str, Any]) -> "TokenTrace":
+        if "prompt_token_ids" not in data or "completion_token_ids" not in data:
+            raise ValueError("TokenTrace missing prompt_token_ids or completion_token_ids.")
+        return TokenTrace(
+            prompt_token_ids=list(data["prompt_token_ids"]),
+            completion_token_ids=list(data["completion_token_ids"]),
+            completion_logprobs=data.get("completion_logprobs"),
+            finish_reason=data.get("finish_reason"),
+        )
 
 
 @dataclass
@@ -144,17 +166,48 @@ class Snapshot:
 # ----- Environment-Agent-Interaction level types -----
 
 @dataclass
-class Step:
+class AgentStep:
     index: int
-    prev_obs: Observation
+    prompt_messages: List[Message]
     action: str
-    next_obs: Optional[Observation]  # may be None on terminal steps
+    action_target: str  # "internal" | "env"
+    loop_index: int
     reward: float
     truncated: bool
     terminated: bool
+    trace: TokenTrace
     info: Info = field(default_factory=dict)
-    trace: Optional[TokenTrace] = None
+    reward_components: Dict[str, float] = field(default_factory=dict)
+    kind: StepKind = "agent"
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
     ts_ns: int = field(default_factory=lambda: time.time_ns())
+    turn_id: Optional[str] = None
+    parent_id: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_results: Optional[List[Dict[str, Any]]] = None
+
+@dataclass
+class EnvironmentStep:
+    index: int
+    prev_obs: Observation
+    action: str
+    parsed_action: Any
+    next_obs: Optional[Observation]
+    source_agent_step_id: str
+    agent_step_ids: List[str]
+    reward: float
+    truncated: bool
+    terminated: bool
+    trace: TokenTrace
+    info: Info = field(default_factory=dict)
+    reward_components: Dict[str, float] = field(default_factory=dict)
+    kind: StepKind = "env"
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    ts_ns: int = field(default_factory=lambda: time.time_ns())
+    turn_id: Optional[str] = None
+    parent_id: Optional[str] = None
+
+Step = Union[AgentStep, EnvironmentStep]
 
 @dataclass
 class Rollout:
@@ -164,7 +217,29 @@ class Rollout:
 
     @property
     def total_reward(self) -> float:
+        """
+        Total reward for training/eval:
+        sums env-step rewards and includes parse-error penalties from
+        env-targeted agent steps.
+        """
+        total = sum(s.reward for s in self.steps if s.kind == "env")
+        for step in self.steps:
+            if not isinstance(step, AgentStep):
+                continue
+            if step.action_target != "env":
+                continue
+            if not step.info.get("parse_error", False):
+                continue
+            total += float(step.reward)
+        return total
+
+    def total_reward_all(self) -> float:
         return sum(s.reward for s in self.steps)
+
+    def total_reward_for(self, kinds: Optional[set[StepKind]] = None) -> float:
+        if kinds is None:
+            return self.total_reward_all()
+        return sum(s.reward for s in self.steps if s.kind in kinds)
 
     @property
     def length(self) -> int:

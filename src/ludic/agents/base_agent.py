@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 import torch
@@ -48,6 +49,28 @@ def _strip_token_trace_info(info: Dict[str, Any]) -> Dict[str, Any]:
             raw["choices"] = new_choices
         stripped["raw_response"] = raw
     return stripped
+
+
+@dataclass
+class AgentActStep:
+    prompt_messages: List[Message]
+    action: str
+    parse_result: ParseResult
+    info: Dict[str, Any]
+    trace: TokenTrace
+    action_target: str  # "internal" | "env"
+    loop_index: int
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_results: Optional[List[Dict[str, Any]]] = None
+
+
+@dataclass
+class AgentActResult:
+    steps: List[AgentActStep]
+
+    @property
+    def final_step(self) -> AgentActStep:
+        return self.steps[-1]
 
 
 class Agent:
@@ -102,7 +125,7 @@ class Agent:
         sampling_seed: Optional[int] = None,
         tools: Optional[ToolRequest] = None,
         timeout_s: Optional[float] = None,
-    ) -> Tuple[ChatResponse, Dict[str, Any], Dict[str, Any], Optional[TokenTrace]]:
+    ) -> Tuple[ChatResponse, Dict[str, Any], Dict[str, Any], TokenTrace]:
         """
         Shared single inference helper.
 
@@ -133,7 +156,13 @@ class Agent:
         resp.merge_into_info(last_info)
 
         self.last_info = last_info
-        return resp, public_info, last_info, resp.to_trace()
+        trace = resp.to_trace()
+        if trace is None:
+            raise ValueError(
+                "Missing token IDs from inference response. "
+                "Ensure ReturnSpec.return_token_ids=True for all calls."
+            )
+        return resp, public_info, last_info, trace
 
     def reset(self, system_prompt: Optional[str] = None) -> None:
         """Resets the agent's internal context."""
@@ -152,7 +181,7 @@ class Agent:
         inference: Optional[InferenceSpec] = None,
         sampling_seed: Optional[int] = None,
         timeout_s: Optional[float] = None,
-    ) -> Tuple[ParseResult, str, Dict[str, Any], Optional[TokenTrace]]:
+    ) -> AgentActResult:
         """
         Runs the think -> act -> parse cycle based on current context.
 
@@ -165,7 +194,7 @@ class Agent:
             timeout_s: Optional timeout for the inference call.
 
         Returns:
-            A tuple of (ParseResult, raw_action_text, client_info_dict, token_trace).
+            AgentActResult containing one or more AgentActStep entries.
         """
         # 1. Think (prepare prompt messages from context)
         messages: List[Message] = self._ctx.on_before_act()
@@ -192,12 +221,20 @@ class Agent:
             )
             # Mark this in info for downstream tracking
             last_info["incomplete_completion"] = True
-            return parse_result, raw_action, last_info, token_trace
+        else:
+            # 5. Parse (format the raw text action)
+            parse_result = self._parser(raw_action)
 
-        # 5. Parse (format the raw text action)
-        parse_result = self._parser(raw_action)
-
-        return parse_result, raw_action, last_info, token_trace
+        step = AgentActStep(
+            prompt_messages=messages,
+            action=raw_action,
+            parse_result=parse_result,
+            info=last_info,
+            trace=token_trace,
+            action_target="env",
+            loop_index=0,
+        )
+        return AgentActResult(steps=[step])
 
     def push_policy_update(
         self,

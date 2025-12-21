@@ -14,10 +14,19 @@ from ludic.parsers import (
     Parser,
     think_prefix_parser,
 )
-from ludic.types import StepOutcome, Info
+from ludic.types import StepOutcome, Info, AgentStep, EnvironmentStep
 from ludic.envs.env import LudicEnv
 from tests._mocks import MockEnv, MockClient, MockAgent
 
+
+# ---- Helpers ----
+
+def _env_steps(rollout):
+    return [s for s in rollout.steps if isinstance(s, EnvironmentStep)]
+
+
+def _agent_steps(rollout):
+    return [s for s in rollout.steps if isinstance(s, AgentStep)]
 
 # ---------------------------------------------------------------------
 # Basic env/agent termination cases (Single Agent)
@@ -39,7 +48,8 @@ async def test_happy_path_terminates_immediately():
     assert len(rollouts) == 1
     rollout = rollouts[0]
 
-    assert rollout.steps[-1].terminated is True
+    env_steps = _env_steps(rollout)
+    assert env_steps[-1].terminated is True
     assert rollout.total_reward == pytest.approx(1.0)
 
 
@@ -47,7 +57,12 @@ async def test_happy_path_terminates_immediately():
 async def test_truncation_when_agent_is_wrong():
     class WrongClient(MockClient):
         async def complete(self, request: ChatCompletionRequest, **kwargs):
-            return ChatResponse(text="nope"), {"used_request": request.to_dict()}
+            resp = ChatResponse(
+                text="nope",
+                prompt_token_ids=list(range(len(request.messages))),
+                completion_token_ids=[101],
+            )
+            return resp, {"used_request": request.to_dict()}
 
     env = MockEnv(max_steps=2, target="1")
     agent = MockAgent(client=WrongClient())
@@ -61,7 +76,8 @@ async def test_truncation_when_agent_is_wrong():
     assert len(rollouts) == 1
     rollout = rollouts[0]
 
-    assert rollout.steps[-1].truncated is True
+    env_steps = _env_steps(rollout)
+    assert env_steps[-1].truncated is True
     assert rollout.total_reward < 0.0
 
 
@@ -108,7 +124,8 @@ async def test_run_episode_uses_action_parser_and_logs_parsed_action():
     rollout = rollouts[0]
 
     assert rollout.length >= 1
-    step = rollout.steps[-1]
+    env_steps = _env_steps(rollout)
+    step = env_steps[-1]
 
     # Raw LLM text must be preserved in the main action field
     assert "<think>" in step.action
@@ -121,7 +138,7 @@ async def test_run_episode_uses_action_parser_and_logs_parsed_action():
     assert step.terminated is True
 
     # Parser reward: +0.2 (two successful parsers); Env reward: 1.0
-    assert rollout.total_reward == pytest.approx(1.2)
+    assert rollout.total_reward_all() == pytest.approx(1.2)
 
 
 # ---------------------------------------------------------------------
@@ -215,23 +232,26 @@ async def test_multi_agent_returns_multiple_rollouts():
     r_a = next(r for r in rollouts if r.meta["agent_id"] == "agent_A")
     r_b = next(r for r in rollouts if r.meta["agent_id"] == "agent_B")
 
+    env_a = _env_steps(r_a)
+    env_b = _env_steps(r_b)
+
     # Each agent terminates after 2 actions
-    assert len(r_a.steps) == 2
-    assert len(r_b.steps) == 2
+    assert len(env_a) == 2
+    assert len(env_b) == 2
 
     # Verify Agent A's trace
-    assert r_a.steps[0].action == "Move A"
-    assert r_a.steps[0].reward == 1.0
-    assert r_a.steps[0].prev_obs == "Start A"
-    assert r_a.steps[0].terminated is False
-    assert r_a.steps[1].terminated is True
+    assert env_a[0].action == "Move A"
+    assert env_a[0].reward == 1.0
+    assert env_a[0].prev_obs == "Start A"
+    assert env_a[0].terminated is False
+    assert env_a[1].terminated is True
 
     # Verify Agent B's trace
-    assert r_b.steps[0].action == "Move B"
-    assert r_b.steps[0].reward == 2.0
-    assert r_b.steps[0].prev_obs == "Start B"
-    assert r_b.steps[0].terminated is False
-    assert r_b.steps[1].terminated is True
+    assert env_b[0].action == "Move B"
+    assert env_b[0].reward == 2.0
+    assert env_b[0].prev_obs == "Start B"
+    assert env_b[0].terminated is False
+    assert env_b[1].terminated is True
 
     # Both rollouts should NOT be marked as truncated (they terminated naturally)
     assert r_a.meta["episode_truncated"] is False
@@ -293,10 +313,11 @@ async def test_multi_agent_handles_unmanaged_bot_turns():
     r = rollouts[0]
     
     assert r.meta["agent_id"] == "hero"
-    # Hero should have 1 step (Turn 1), but the prev_obs should reflect Turn 0
-    assert len(r.steps) == 1
+    env_steps = _env_steps(r)
+    # Hero should have 1 env step (Turn 1), but the prev_obs should reflect Turn 0
+    assert len(env_steps) == 1
     
-    step = r.steps[0]
+    step = env_steps[0]
     # The hero's observation *before* acting should be the result of the bot's turn
     assert step.prev_obs == "Bot attacked!"
     assert step.action == "Hero Attack"
@@ -344,11 +365,14 @@ async def test_single_agent_protocol_logs_parser_failure_without_env_step():
     assert env.step_calls == 0
     assert len(rollouts) == 1
     r = rollouts[0]
-    assert len(r.steps) == 1
+    agent_steps = _agent_steps(r)
+    env_steps = _env_steps(r)
+    assert len(agent_steps) == 1
+    assert len(env_steps) == 0
 
-    step = r.steps[0]
+    step = agent_steps[0]
     assert step.action == "BADRAW"
-    assert step.next_obs == "bad action"  # Parser failure synthetic obs preserved
+    assert step.info.get("parse_feedback_obs") == "bad action"
     assert step.reward == pytest.approx(-0.5)
     assert step.info.get("parse_error") is True
     assert step.terminated is False
@@ -416,13 +440,16 @@ async def test_multi_agent_protocol_excludes_parse_fail_actions_and_logs_synthet
     r_a = next(r for r in rollouts if r.meta["agent_id"] == "A")
     r_b = next(r for r in rollouts if r.meta["agent_id"] == "B")
 
-    assert len(r_a.steps) == 1
-    assert r_a.steps[0].reward == pytest.approx(1.0)
+    env_a = _env_steps(r_a)
+    agent_b = _agent_steps(r_b)
 
-    assert len(r_b.steps) == 1
-    step_b = r_b.steps[0]
+    assert len(env_a) == 1
+    assert env_a[0].reward == pytest.approx(1.0)
+
+    assert len(agent_b) == 1
+    step_b = agent_b[0]
     assert step_b.action == "BADRAW"
-    assert step_b.next_obs == "bad action"
+    assert step_b.info.get("parse_feedback_obs") == "bad action"
     assert step_b.reward == pytest.approx(-0.7)
     assert step_b.info.get("parse_error") is True
     assert step_b.terminated is False
@@ -471,17 +498,20 @@ async def test_multi_agent_protocol_all_parse_fail_does_not_step_env():
     r_a = next(r for r in rollouts if r.meta["agent_id"] == "A")
     r_b = next(r for r in rollouts if r.meta["agent_id"] == "B")
 
-    assert len(r_a.steps) == 1
-    assert r_a.steps[0].action == "RAW_A"
-    assert r_a.steps[0].next_obs == "bad action"
-    assert r_a.steps[0].reward == pytest.approx(-0.3)
-    assert r_a.steps[0].info.get("parse_error") is True
+    agent_a = _agent_steps(r_a)
+    agent_b = _agent_steps(r_b)
+    assert len(agent_a) == 1
+    assert len(agent_b) == 1
 
-    assert len(r_b.steps) == 1
-    assert r_b.steps[0].action == "RAW_B"
-    assert r_b.steps[0].next_obs == "bad action"
-    assert r_b.steps[0].reward == pytest.approx(-0.3)
-    assert r_b.steps[0].info.get("parse_error") is True
+    assert agent_a[0].action == "RAW_A"
+    assert agent_a[0].info.get("parse_feedback_obs") == "bad action"
+    assert agent_a[0].reward == pytest.approx(-0.3)
+    assert agent_a[0].info.get("parse_error") is True
+
+    assert agent_b[0].action == "RAW_B"
+    assert agent_b[0].info.get("parse_feedback_obs") == "bad action"
+    assert agent_b[0].reward == pytest.approx(-0.3)
+    assert agent_b[0].info.get("parse_error") is True
 
 
 # ---------------------------------------------------------------------
@@ -504,17 +534,18 @@ async def test_single_agent_max_steps_truncation():
 
     assert len(rollouts) == 1
     r = rollouts[0]
-    assert len(r.steps) == 3
+    env_steps = _env_steps(r)
+    assert len(env_steps) == 3
 
-    # Last step should be marked as truncated
-    last_step = r.steps[-1]
+    # Last env step should be marked as truncated
+    last_step = env_steps[-1]
     assert last_step.truncated is True
     assert last_step.terminated is False
     assert last_step.info.get("truncation_reason") == "max_steps"
     assert last_step.next_obs is None  # Truncated non-parser-failure step
 
-    # Earlier steps should NOT be truncated
-    for step in r.steps[:-1]:
+    # Earlier env steps should NOT be truncated
+    for step in env_steps[:-1]:
         assert step.truncated is False
         assert step.terminated is False
         assert step.next_obs is not None
@@ -540,9 +571,10 @@ async def test_single_agent_env_truncation_preserved():
 
     assert len(rollouts) == 1
     r = rollouts[0]
-    assert len(r.steps) == 2
+    env_steps = _env_steps(r)
+    assert len(env_steps) == 2
 
-    last_step = r.steps[-1]
+    last_step = env_steps[-1]
     assert last_step.truncated is True
     assert last_step.terminated is False
 
@@ -565,9 +597,10 @@ async def test_single_agent_normal_termination_not_truncated():
 
     assert len(rollouts) == 1
     r = rollouts[0]
-    assert len(r.steps) == 1
+    env_steps = _env_steps(r)
+    assert len(env_steps) == 1
 
-    last_step = r.steps[-1]
+    last_step = env_steps[-1]
     assert last_step.terminated is True
     assert last_step.truncated is False
     assert last_step.next_obs is None  # Terminal step
@@ -625,18 +658,19 @@ async def test_multi_agent_max_steps_truncation():
     assert len(rollouts) == 2
 
     for r in rollouts:
-        assert len(r.steps) == 3
+        env_steps = _env_steps(r)
+        assert len(env_steps) == 3
         assert r.meta.get("episode_truncated") is True
         assert r.meta.get("truncation_reason") == "max_steps"
 
         # Last step truncated
-        last_step = r.steps[-1]
+        last_step = env_steps[-1]
         assert last_step.truncated is True
         assert last_step.info.get("truncation_reason") == "max_steps"
         assert last_step.next_obs is None
 
         # Earlier steps not truncated
-        for step in r.steps[:-1]:
+        for step in env_steps[:-1]:
             assert step.truncated is False
             assert step.next_obs is not None
 
@@ -701,22 +735,25 @@ async def test_multi_agent_independent_termination():
     r_a = next(r for r in rollouts if r.meta["agent_id"] == "A")
     r_b = next(r for r in rollouts if r.meta["agent_id"] == "B")
 
-    # Agent A: 1 step, terminated naturally
-    assert len(r_a.steps) == 1
-    assert r_a.steps[0].terminated is True
-    assert r_a.steps[0].truncated is False
+    env_a = _env_steps(r_a)
+    env_b = _env_steps(r_b)
+
+    # Agent A: 1 env step, terminated naturally
+    assert len(env_a) == 1
+    assert env_a[0].terminated is True
+    assert env_a[0].truncated is False
     assert r_a.meta["episode_truncated"] is False
     assert r_a.meta["truncation_reason"] is None
 
-    # Agent B: 5 steps, hit max_steps (truncated)
-    assert len(r_b.steps) == 5
-    assert r_b.steps[-1].terminated is False
-    assert r_b.steps[-1].truncated is True
-    assert r_b.steps[-1].info.get("truncation_reason") == "max_steps"
+    # Agent B: 5 env steps, hit max_steps (truncated)
+    assert len(env_b) == 5
+    assert env_b[-1].terminated is False
+    assert env_b[-1].truncated is True
+    assert env_b[-1].info.get("truncation_reason") == "max_steps"
     assert r_b.meta["episode_truncated"] is True
     assert r_b.meta["truncation_reason"] == "max_steps"
 
     # Earlier steps of B should not be truncated
-    for step in r_b.steps[:-1]:
+    for step in env_b[:-1]:
         assert step.truncated is False
         assert step.terminated is False

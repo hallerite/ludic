@@ -8,7 +8,7 @@ import pytest
 from ludic.eval.core import run_eval
 from ludic.training.stats import Reducer
 from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
-from ludic.types import Rollout, Step, TokenTrace
+from ludic.types import Rollout, EnvironmentStep, TokenTrace
 
 
 @dataclass
@@ -28,15 +28,18 @@ class _FakeEngine:
 
 def _mk_rollout(n_steps: int, *, completion_lens: List[int]) -> Rollout:
     assert len(completion_lens) == n_steps
-    steps: List[Step] = []
+    steps: List[EnvironmentStep] = []
     for i in range(n_steps):
         completion_token_ids = [0] * int(completion_lens[i])
         steps.append(
-            Step(
+            EnvironmentStep(
                 index=i,
                 prev_obs=f"obs{i}",
                 action=f"a{i}",
+                parsed_action=f"a{i}",
                 next_obs=f"obs{i+1}",
+                source_agent_step_id=f"agent_{i}",
+                agent_step_ids=[f"agent_{i}"],
                 reward=1.0,
                 truncated=False,
                 terminated=(i == n_steps - 1),

@@ -27,7 +27,11 @@ async def test_agent_rejects_incomplete_completion_by_default() -> None:
     agent.reset(system_prompt=None)
     agent.on_env_reset("obs", {})
 
-    parse_result, raw, info, _ = await agent.act()
+    act_result = await agent.act()
+    final_step = act_result.final_step
+    parse_result = final_step.parse_result
+    raw = final_step.action
+    info = final_step.info
 
     assert raw == "RAW"
     assert parse_result.action is None
@@ -50,7 +54,11 @@ async def test_agent_can_allow_incomplete_completion() -> None:
     agent.reset(system_prompt=None)
     agent.on_env_reset("obs", {})
 
-    parse_result, raw, info, _ = await agent.act()
+    act_result = await agent.act()
+    final_step = act_result.final_step
+    parse_result = final_step.parse_result
+    raw = final_step.action
+    info = final_step.info
 
     assert raw == "1"
     assert parse_result.action == "1"
@@ -73,14 +81,15 @@ async def test_single_agent_protocol_marks_incomplete_completion_as_parse_error(
 
     assert len(rollouts) == 1
     r = rollouts[0]
-    assert len(r.steps) == 1
+    agent_steps = [s for s in r.steps if s.kind == "agent"]
+    assert len(agent_steps) == 1
 
-    step = r.steps[0]
+    step = agent_steps[0]
     assert step.info.get("finish_reason") == "length"
     assert step.info.get("incomplete_completion") is True
     assert step.info.get("parse_error") is True
 
-    # Time-limit truncation is recorded, but synthetic next_obs is preserved
+    # Time-limit truncation is recorded, but parse feedback is preserved
     assert step.truncated is True
     assert step.info.get("truncation_reason") == "max_steps"
-    assert step.next_obs is not None
+    assert step.info.get("parse_feedback_obs") is not None

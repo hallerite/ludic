@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ludic.envs.env import LudicEnv
 from ludic.interaction.base import InteractionProtocol
-from ludic.types import Rollout, Step, TokenTrace
+from ludic.types import Rollout, Step, TokenTrace, AgentStep, EnvironmentStep
 from ludic.inference.request import InferenceSpec
 
 from ludic.training.types import (
@@ -23,6 +23,7 @@ from ludic.training.types import (
     EnvSpec,
     SampleFilter,
 )
+from ludic.training.filters import default_step_selector
 
 # ---------------------------------------------------------------------------
 # Factory aliases
@@ -115,6 +116,8 @@ def _base_item_meta(
     action: str,
     truncated: bool,
     terminated: bool,
+    step_kind: str,
+    turn_id: Optional[str] = None,
     prompt_len: int | None = None,
 ) -> Dict[str, Any]:
     return {
@@ -128,6 +131,8 @@ def _base_item_meta(
         "prompt_length": prompt_len,
         "truncated": truncated,
         "terminated": terminated,
+        "step_kind": step_kind,
+        "turn_id": turn_id,
         **(rollout.meta),  # Rollout-level meta (includes episode_truncated, truncation_reason)
     }
 
@@ -149,6 +154,8 @@ def _build_saw_item_from_token_trace(
     completion_logprobs: Optional[List[float]],
     truncated: bool,
     terminated: bool,
+    step_kind: str,
+    turn_id: Optional[str],
 ) -> Tuple[SAWItem, int]:
     """
     Build one SAWItem from a rollout step + rollout-time token trace.
@@ -177,6 +184,8 @@ def _build_saw_item_from_token_trace(
         action=action,
         truncated=truncated,
         terminated=terminated,
+        step_kind=step_kind,
+        turn_id=turn_id,
         prompt_len=len(prompt_ids),
     )
     meta.update(_strip_trace_info(step_info))
@@ -320,23 +329,51 @@ class RolloutEngine:
 
     def _append_jsonl(self, rollout: Rollout) -> None:
         assert self.jsonl_path is not None
+        def _serialize_step(step: Step) -> Dict[str, Any]:
+            base = {
+                "id": step.id,
+                "index": step.index,
+                "kind": step.kind,
+                "reward": step.reward,
+                "reward_components": step.reward_components,
+                "truncated": step.truncated,
+                "terminated": step.terminated,
+                "info": step.info,
+                "ts_ns": step.ts_ns,
+                "turn_id": step.turn_id,
+                "parent_id": step.parent_id,
+                "trace": step.trace.to_dict(),
+            }
+            if isinstance(step, AgentStep):
+                base.update(
+                    {
+                        "prompt_messages": step.prompt_messages,
+                        "action": step.action,
+                        "action_target": step.action_target,
+                        "loop_index": step.loop_index,
+                        "tool_calls": step.tool_calls,
+                        "tool_results": step.tool_results,
+                    }
+                )
+            elif isinstance(step, EnvironmentStep):
+                base.update(
+                    {
+                        "prev_obs": step.prev_obs,
+                        "action": step.action,
+                        "parsed_action": step.parsed_action,
+                        "next_obs": step.next_obs,
+                        "source_agent_step_id": step.source_agent_step_id,
+                        "agent_step_ids": step.agent_step_ids,
+                    }
+                )
+            else:
+                raise TypeError(f"Unknown step type: {type(step)}")
+            return base
+
         payload = {
             "id": rollout.id,
             "meta": rollout.meta,
-            "steps": [
-                {
-                    "index": s.index,
-                    "prev_obs": s.prev_obs,
-                    "action": s.action,
-                    "next_obs": s.next_obs,
-                    "reward": s.reward,
-                    "truncated": s.truncated,
-                    "terminated": s.terminated,
-                    "info": s.info,
-                    "ts_ns": s.ts_ns,
-                }
-                for s in rollout.steps
-            ],
+            "steps": [_serialize_step(s) for s in rollout.steps],
             "total_reward": rollout.total_reward,
             "length": rollout.length,
             "duration_ns": rollout.duration_ns,
@@ -394,6 +431,7 @@ class RolloutEngine:
         timeout_s: Optional[float] = None,
         concurrency: int = 8,
         sample_filter: Optional[SampleFilter] = None,
+        step_selector: Optional[Callable[[Step], bool]] = None,
     ) -> SAWBatch:
         """
         High-level entrypoint for RL-style training:
@@ -411,6 +449,8 @@ class RolloutEngine:
         - If sample_filter is provided, it's applied after SAWItems are created.
         - Filter returns True to KEEP a sample, False to DROP it.
         - Use ludic.training.filters for common predicates.
+        - If step_selector is not provided, env steps and env-targeted parse
+          errors are selected by default.
         """
         rollouts = await self.generate_rollouts(
             requests=requests,
@@ -419,11 +459,14 @@ class RolloutEngine:
             concurrency=concurrency,
         )
         weights = credit_assigner.compute(rollouts)
+        selector = step_selector or default_step_selector
 
         items_with_lengths: List[Tuple[SAWItem, int, int]] = []
 
         for r in rollouts:
             for step in r.steps:
+                if not selector(step):
+                    continue
                 w = _get_credit_weight(weights, rollout_id=r.id, step_index=step.index)
                 reward = float(step.reward)
                 _require_finite(reward, what="reward", rollout_id=r.id, step_index=step.index)
@@ -455,7 +498,7 @@ class RolloutEngine:
                     step_index=step.index,
                     reward=reward,
                     weight=w,
-                    prev_obs=step.prev_obs,
+                    prev_obs=step.prev_obs if isinstance(step, EnvironmentStep) else "",
                     action=step.action,
                     prompt_ids=prompt_ids,
                     completion_ids=completion_ids,
@@ -463,6 +506,8 @@ class RolloutEngine:
                     completion_logprobs=completion_logprobs,
                     truncated=step.truncated,
                     terminated=step.terminated,
+                    step_kind=step.kind,
+                    turn_id=step.turn_id,
                 )
                 items_with_lengths.append((item, prompt_len, comp_len))
 

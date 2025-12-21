@@ -65,8 +65,9 @@ class ToolAgent(Agent):
         tool_calls = message_data.get("tool_calls")
         return content, tool_calls
 
-    def _run_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> None:
+    def _run_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Execute tool calls and record results in context."""
+        results: List[Dict[str, Any]] = []
         for tc in tool_calls:
             fn_name = tc["function"]["name"]
             args_json = tc["function"]["arguments"]
@@ -85,6 +86,15 @@ class ToolAgent(Agent):
                 result_str = f"Error: Tool {fn_name} not found."
 
             self._ctx.add_tool_result(call_id, fn_name, result_str)
+            results.append(
+                {
+                    "tool_call_id": call_id,
+                    "tool_name": fn_name,
+                    "arguments_json": args_json,
+                    "content": result_str,
+                }
+            )
+        return results
 
     def _func_to_schema(self, f: Callable) -> Dict[str, Any]:
         """

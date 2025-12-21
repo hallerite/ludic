@@ -25,7 +25,7 @@ from ludic.training.types import (
 )
 from ludic.training.credit_assignment import MonteCarloReturn
 from ludic.training.filters import drop_truncated
-from ludic.types import Rollout, Step
+from ludic.types import Rollout, EnvironmentStep, TokenTrace
 
 from tests._mocks import MockClient, _mock_parser, MockAgent
 
@@ -34,6 +34,9 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 # ---------------------------------------------------------------------
 # Helper / local mocks
 # ---------------------------------------------------------------------
+
+def _env_steps(rollout: Rollout) -> List[EnvironmentStep]:
+    return [s for s in rollout.steps if isinstance(s, EnvironmentStep)]
 
 class TokenClient(MockClient):
     """
@@ -95,9 +98,43 @@ class MultiTraceMockProtocol(InteractionProtocol):
         timeout_s: Optional[float] = None,
     ) -> List[Rollout]:
         # Simulate Agent A
-        r1 = Rollout(steps=[Step(0, "obsA", "actA", "nextA", 1.0, False, True)])
+        r1 = Rollout(
+            steps=[
+                EnvironmentStep(
+                    index=0,
+                    prev_obs="obsA",
+                    action="actA",
+                    parsed_action="actA",
+                    next_obs="nextA",
+                    source_agent_step_id="agentA_0",
+                    agent_step_ids=["agentA_0"],
+                    reward=1.0,
+                    truncated=False,
+                    terminated=True,
+                    info={},
+                    trace=TokenTrace(prompt_token_ids=[1], completion_token_ids=[2]),
+                )
+            ]
+        )
         # Simulate Agent B
-        r2 = Rollout(steps=[Step(0, "obsB", "actB", "nextB", -0.5, False, True)])
+        r2 = Rollout(
+            steps=[
+                EnvironmentStep(
+                    index=0,
+                    prev_obs="obsB",
+                    action="actB",
+                    parsed_action="actB",
+                    next_obs="nextB",
+                    source_agent_step_id="agentB_0",
+                    agent_step_ids=["agentB_0"],
+                    reward=-0.5,
+                    truncated=False,
+                    terminated=True,
+                    info={},
+                    trace=TokenTrace(prompt_token_ids=[1], completion_token_ids=[2]),
+                )
+            ]
+        )
         return [r1, r2]
 
 # ---------------------------------------------------------------------
@@ -140,7 +177,8 @@ async def test_generate_rollouts_basic_metadata_and_termination(
 
     for r in rollouts:
         # should terminate successfully on correct action "1"
-        assert r.steps[-1].terminated is True
+        env_steps = _env_steps(r)
+        assert env_steps[-1].terminated is True
         assert r.total_reward == pytest.approx(1.0)
 
         # engine metadata
@@ -302,10 +340,11 @@ async def test_generate_rollouts_heterogeneous_protocols(
 
     # Check that the correct agent was used for each
     for r in rollouts:
+        env_steps = _env_steps(r)
         if r.meta["engine"]["protocol_kind"] == "protocol_A":
-            assert r.steps[0].action == "Agent A says hi"
+            assert env_steps[0].action == "Agent A says hi"
         elif r.meta["engine"]["protocol_kind"] == "protocol_B":
-            assert r.steps[0].action == "Agent B says hi"
+            assert env_steps[0].action == "Agent B says hi"
 
 
 @pytest.mark.asyncio
@@ -428,8 +467,20 @@ async def test_generate_batch_raises_if_no_token_ids_and_no_retokenize(
     env_registry,
     mock_agent,
 ) -> None:
+    class NoTokenClient(MockClient):
+        async def complete(  # type: ignore[override]
+            self,
+            request: ChatCompletionRequest,
+            **kwargs,
+        ) -> Tuple[ChatResponse, Dict[str, Any]]:
+            return (
+                ChatResponse(text="1"),
+                {"used_request": request.to_dict()},
+            )
+
+    no_token_agent = MockAgent(client=NoTokenClient(text="1"))
     protocol_registry = {
-        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=mock_agent)
+        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=no_token_agent)
     }
     
     engine = RolloutEngine(
@@ -445,7 +496,7 @@ async def test_generate_batch_raises_if_no_token_ids_and_no_retokenize(
         num_episodes=1,
     )
 
-    with pytest.raises(ValueError, match="Missing rollout-time token trace"):
+    with pytest.raises(ValueError, match="Missing token IDs from inference response"):
         await engine.generate_batch(
             requests=[request],
             max_steps=2,
@@ -719,12 +770,12 @@ async def test_avg_completion_length_respects_filtered_items(
         )
     ]
 
-    # Keep only the first step so avg_completion_length should match len("a") == 1.
+    # Keep only the first env step so avg_completion_length should match len("a") == 1.
     batch = await engine.generate_batch(
         requests=requests,
         max_steps=3,
         credit_assigner=credit_assigner,
-        sample_filter=lambda item: item.meta.get("step_index") == 0,
+        sample_filter=lambda item: item.meta.get("step_index") == 1,
     )
 
     assert batch.meta["num_samples"] == 1

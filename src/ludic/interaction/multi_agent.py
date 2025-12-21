@@ -1,14 +1,16 @@
 from __future__ import annotations
 import asyncio
-from typing import Optional, Dict, List, Set
+import uuid
+from typing import Optional, Dict, List, Set, Any
 
 from ludic.envs.env import LudicEnv
 from ludic.agents.base_agent import Agent
-from ludic.types import Rollout, Step, StepOutcome
+from ludic.types import Rollout, Step, StepOutcome, AgentStep, EnvironmentStep
 from ludic.inference.request import InferenceSpec
 from .base import InteractionProtocol
 from .step_collector import TraceCollector
 from .info import merge_step_info
+from .rewards import split_parser_reward
 
 
 class MultiAgentProtocol(InteractionProtocol):
@@ -74,6 +76,11 @@ class MultiAgentProtocol(InteractionProtocol):
 
         # Track current observations for all managed agents
         current_obs = {k: v[0] for k, v in obs_info_dict.items()}
+        step_indices = {agent_id: 0 for agent_id in self.agent_map}
+        turn_ids = {agent_id: str(uuid.uuid4()) for agent_id in self.agent_map}
+        turn_agent_step_ids: Dict[str, List[str]] = {
+            agent_id: [] for agent_id in self.agent_map
+        }
 
         # 2. --- Run Interaction Loop ---
         for t in range(max_steps):
@@ -122,24 +129,78 @@ class MultiAgentProtocol(InteractionProtocol):
             results = await asyncio.gather(*tasks)
 
             actions_to_take: Dict[str, str] = {}
+            step_context_cache: Dict[str, Dict[str, Any]] = {}
 
-            # Temporary storage to hold data needed for logging after the env step
-            step_context_cache: Dict[str, Dict] = {}
+            for agent_id, act_result in zip(agents_to_poll.keys(), results):
+                prev_obs = current_obs.get(agent_id, "")
+                for act_step in act_result.steps:
+                    parse_result = act_step.parse_result
+                    parse_error = parse_result.action is None
+                    extra_info = {
+                        "parse_error": parse_error,
+                        "action_target": act_step.action_target,
+                    }
+                    if parse_error and parse_result.obs is not None:
+                        extra_info["parse_feedback_obs"] = parse_result.obs
+                    if act_step.tool_calls is not None:
+                        extra_info["tool_calls"] = act_step.tool_calls
+                    if act_step.tool_results is not None:
+                        extra_info["tool_results"] = act_step.tool_results
+                    step_info = merge_step_info(
+                        client_info=act_step.info,
+                        extra=extra_info,
+                    )
+                    parser_reward = float(parse_result.reward)
+                    agent_reward, agent_reward_components, _, _ = split_parser_reward(
+                        parser_reward=parser_reward,
+                        action_target=act_step.action_target,
+                        parse_error=parse_error,
+                    )
+                    agent_step = AgentStep(
+                        index=step_indices[agent_id],
+                        prompt_messages=act_step.prompt_messages,
+                        action=act_step.action,
+                        action_target=act_step.action_target,
+                        loop_index=act_step.loop_index,
+                        reward=agent_reward,
+                        reward_components=agent_reward_components,
+                        truncated=False,
+                        terminated=False,
+                        info=step_info,
+                        trace=act_step.trace,
+                        turn_id=turn_ids[agent_id],
+                        tool_calls=act_step.tool_calls,
+                        tool_results=act_step.tool_results,
+                    )
+                    collector.add(agent_id, agent_step)
+                    step_indices[agent_id] += 1
+                    turn_agent_step_ids[agent_id].append(agent_step.id)
 
-            for agent_id, (parse_result, raw, info, token_trace) in zip(
-                agents_to_poll.keys(), results
-            ):
-                # Cache context for this specific agent's step
+                final_step = act_result.final_step
+                if final_step.action_target != "env":
+                    continue
+
+                if final_step.parse_result.action is None:
+                    synthetic_obs = final_step.parse_result.obs or "Invalid action."
+                    info = merge_step_info(
+                        client_info=final_step.info,
+                        extra={
+                            "parse_error": True,
+                            "parse_feedback_obs": synthetic_obs,
+                        },
+                    )
+                    self.agent_map[agent_id].on_after_step(synthetic_obs, info)
+                    current_obs[agent_id] = synthetic_obs
+                    turn_ids[agent_id] = str(uuid.uuid4())
+                    turn_agent_step_ids[agent_id] = []
+                    continue
+
+                actions_to_take[agent_id] = final_step.parse_result.action
                 step_context_cache[agent_id] = {
-                    "prev_obs": current_obs.get(agent_id, ""),
-                    "raw_action": raw,
-                    "client_info": info,
-                    "parse_result": parse_result,
-                    "token_trace": token_trace,
+                    "prev_obs": prev_obs,
+                    "final_step": final_step,
+                    "agent_step_ids": list(turn_agent_step_ids[agent_id]),
                 }
-
-                if parse_result.action is not None:
-                    actions_to_take[agent_id] = parse_result.action
 
             # --- D. Step the environment ---
             # actions_to_take only contains VALID actions from managed agents.
@@ -150,75 +211,63 @@ class MultiAgentProtocol(InteractionProtocol):
 
             # --- E. Process Results & Log Steps ---
             for agent_id, ctx in step_context_cache.items():
-                parse_result = ctx["parse_result"]
-                client_info = ctx["client_info"]
-                token_trace = ctx.get("token_trace")
+                raw_outcome = env_outcomes.get(agent_id)
+                if not raw_outcome:
+                    continue
 
-                # Did parsing fail?
-                if parse_result.action is None:
-                    # Create synthetic outcome for parser failure
-                    synthetic_obs = parse_result.obs or "Invalid action."
-                    outcome = StepOutcome(
-                        obs=synthetic_obs,
-                        reward=parse_result.reward,
-                        truncated=False,
-                        terminated=False,
-                        info=merge_step_info(
-                            client_info=client_info,
-                            extra={"parse_error": True},
-                        ),
-                        trace=token_trace,
-                    )
-                else:
-                    # Normal environment outcome
-                    # (It should exist in env_outcomes if we sent an action)
-                    raw_outcome = env_outcomes.get(agent_id)
-                    if not raw_outcome:
-                        # Should theoretically not happen if logic is sound
-                        continue
+                final_step = ctx["final_step"]
+                parsed_action = final_step.parse_result.action
+                if parsed_action is None:
+                    continue
 
-                    # Combine parser reward (usually 0.0) + Env reward
-                    total_reward = raw_outcome.reward + parse_result.reward
-
-                    outcome = StepOutcome(
-                        obs=raw_outcome.obs,
-                        reward=total_reward,
-                        truncated=raw_outcome.truncated,
-                        terminated=raw_outcome.terminated,
-                        info=merge_step_info(
-                            client_info=client_info,
-                            env_info=raw_outcome.info,
-                        ),
-                        trace=token_trace,
-                    )
-
-                # Track if this agent has finished
-                if outcome.terminated or outcome.truncated:
-                    finished_agents.add(agent_id)
-
-                # 1. Log the CLEAN single-agent step to the collector
-                step = Step(
-                    index=t,
-                    prev_obs=ctx["prev_obs"],
-                    action=ctx["raw_action"],
-                    next_obs=(
-                        outcome.obs
-                        if not (outcome.terminated or outcome.truncated)
-                        else None
-                    ),
-                    reward=outcome.reward,
-                    truncated=outcome.truncated,
-                    terminated=outcome.terminated,
-                    info=outcome.info,
-                    trace=outcome.trace,
+                parser_reward = float(final_step.parse_result.reward)
+                _, _, env_parser_reward, env_reward_components = split_parser_reward(
+                    parser_reward=parser_reward,
+                    action_target=final_step.action_target,
+                    parse_error=False,
                 )
-                collector.add(agent_id, step)
+                step_info = merge_step_info(
+                    client_info=final_step.info,
+                    env_info=raw_outcome.info,
+                    extra={
+                        "parsed_action": parsed_action,
+                        "source_agent_step_id": turn_agent_step_ids[agent_id][-1],
+                        "agent_step_ids": ctx["agent_step_ids"],
+                    },
+                )
+                logged_next_obs = None
+                if not (raw_outcome.terminated or raw_outcome.truncated):
+                    logged_next_obs = raw_outcome.obs
 
-                # 2. Update Agent Context for the next turn
-                # (Only if the episode isn't over for them)
-                if not (outcome.terminated or outcome.truncated):
-                    self.agent_map[agent_id].on_after_step(outcome.obs, outcome.info)
-                    current_obs[agent_id] = outcome.obs
+                env_step = EnvironmentStep(
+                    index=step_indices[agent_id],
+                    prev_obs=ctx["prev_obs"],
+                    action=final_step.action,
+                    parsed_action=parsed_action,
+                    next_obs=logged_next_obs,
+                    source_agent_step_id=turn_agent_step_ids[agent_id][-1],
+                    agent_step_ids=ctx["agent_step_ids"],
+                    reward=float(raw_outcome.reward) + env_parser_reward,
+                    reward_components={
+                        "env": float(raw_outcome.reward),
+                        **env_reward_components,
+                    },
+                    truncated=raw_outcome.truncated,
+                    terminated=raw_outcome.terminated,
+                    info=step_info,
+                    trace=final_step.trace,
+                    turn_id=turn_ids[agent_id],
+                )
+                collector.add(agent_id, env_step)
+                step_indices[agent_id] += 1
+                turn_ids[agent_id] = str(uuid.uuid4())
+                turn_agent_step_ids[agent_id] = []
+
+                if raw_outcome.terminated or raw_outcome.truncated:
+                    finished_agents.add(agent_id)
+                else:
+                    self.agent_map[agent_id].on_after_step(raw_outcome.obs, step_info)
+                    current_obs[agent_id] = raw_outcome.obs
 
             # --- F. Check if all managed agents are done ---
             if len(finished_agents) >= len(self.agent_map):
@@ -231,18 +280,21 @@ class MultiAgentProtocol(InteractionProtocol):
             if not steps:
                 continue
 
-            last_step = steps[-1]
-
-            # If this agent already terminated or was truncated by env, leave as-is
-            if last_step.terminated or last_step.truncated:
+            last_env_step = next((s for s in reversed(steps) if s.kind == "env"), None)
+            if last_env_step is None:
+                last_step = steps[-1]
+                if last_step.terminated or last_step.truncated:
+                    continue
+                last_step.truncated = True
+                last_step.info = {**last_step.info, "truncation_reason": "max_steps"}
                 continue
 
-            # This agent hit max_steps without finishing - mark as truncated
-            last_step.truncated = True
-            # Only clear next_obs if it wasn't a parser failure (which has synthetic obs).
-            if not last_step.info.get("parse_error"):
-                last_step.next_obs = None
-            last_step.info = {**last_step.info, "truncation_reason": "max_steps"}
+            if last_env_step.terminated or last_env_step.truncated:
+                continue
+
+            last_env_step.truncated = True
+            last_env_step.next_obs = None
+            last_env_step.info = {**last_env_step.info, "truncation_reason": "max_steps"}
 
         # Extract rollouts with per-agent truncation info derived from their last step
         return collector.extract_rollouts_with_per_agent_status()

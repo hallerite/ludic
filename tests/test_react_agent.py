@@ -57,7 +57,11 @@ class ReplayMockClient(ChatClient):
             ]
         }
 
-        resp = ChatResponse(text=text)
+        resp = ChatResponse(
+            text=text,
+            prompt_token_ids=list(range(len(request.messages))),
+            completion_token_ids=[100, 101],
+        )
         return resp, {"raw_response": raw_response}
 
     def sync_weights(self, *args, **kwargs):
@@ -110,7 +114,10 @@ async def test_react_agent_happy_path_single_tool():
         tools=[calculator_tool]
     )
 
-    parse_result, raw_text, _, _ = await agent.act()
+    act_result = await agent.act()
+    final_step = act_result.final_step
+    parse_result = final_step.parse_result
+    raw_text = final_step.action
 
     # Assert Final Output
     assert parse_result.action == "4"
@@ -132,6 +139,49 @@ async def test_react_agent_happy_path_single_tool():
     assert final_history[-1]["role"] == "tool"
     assert final_history[-1]["content"] == "4"
     assert final_history[-1]["tool_call_id"] == "call_123"
+
+
+@pytest.mark.asyncio
+async def test_react_agent_records_internal_steps():
+    step_1 = {
+        "content": "Calling tool.",
+        "tool_calls": [
+            {
+                "id": "call_abc",
+                "function": {
+                    "name": "calculator_tool",
+                    "arguments": json.dumps({"a": 2, "b": 3}),
+                },
+            }
+        ],
+    }
+    step_2 = {
+        "content": "Final <move>5</move>",
+        "tool_calls": None,
+    }
+
+    client = ReplayMockClient([step_1, step_2])
+    agent = ReActAgent(
+        client=client,
+        model="mock",
+        ctx=FullDialog(),
+        parser=xml_tag_parser("move"),
+        tools=[calculator_tool],
+        max_react_steps=2,
+    )
+
+    act_result = await agent.act()
+    assert len(act_result.steps) == 2
+
+    internal_step = act_result.steps[0]
+    final_step = act_result.steps[1]
+
+    assert internal_step.action_target == "internal"
+    assert internal_step.tool_calls is not None
+    assert internal_step.tool_results is not None
+    assert internal_step.tool_results[0]["content"] == "5"
+    assert final_step.action_target == "env"
+    assert final_step.parse_result.action == "5"
 
 
 @pytest.mark.asyncio
@@ -173,7 +223,8 @@ async def test_react_agent_shot_clock_fallback():
         max_react_steps=2 # Strict limit
     )
 
-    result, _, _, _ = await agent.act()
+    act_result = await agent.act()
+    result = act_result.final_step.parse_result
 
     # 1. Did it finish?
     assert result.action == "Sunny"
@@ -284,7 +335,8 @@ async def test_react_agent_records_bad_json_tool_arguments():
         max_react_steps=3,
     )
 
-    result, _, _, _ = await agent.act()
+    act_result = await agent.act()
+    result = act_result.final_step.parse_result
     assert result.action == "ok"
 
     final_history = client.last_messages
@@ -328,7 +380,8 @@ async def test_react_agent_records_tool_execution_exception():
         max_react_steps=3,
     )
 
-    result, _, _, _ = await agent.act()
+    act_result = await agent.act()
+    result = act_result.final_step.parse_result
     assert result.action == "ok"
 
     final_history = client.last_messages
@@ -375,7 +428,8 @@ async def test_react_agent_handles_multiple_tool_calls_in_one_turn():
         max_react_steps=3,
     )
 
-    result, _, _, _ = await agent.act()
+    act_result = await agent.act()
+    result = act_result.final_step.parse_result
     assert result.action == "4 and Sunny in NYC"
 
     final_history = client.last_messages
@@ -429,7 +483,8 @@ async def test_react_agent_multi_tool_calls_continue_on_error():
         max_react_steps=3,
     )
 
-    result, _, _, _ = await agent.act()
+    act_result = await agent.act()
+    result = act_result.final_step.parse_result
     assert result.action == "ok"
 
     final_history = client.last_messages
