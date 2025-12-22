@@ -536,6 +536,7 @@ def main() -> None:
         max_budget = args.max_seq_len * len(saw_batch.items)
         budget = args.max_seq_len
         last_ok_budget = None
+        last_ok_micro_batches = None
 
         while budget <= max_budget:
             budget_results, ok, last_res = _run_budget_trials(
@@ -556,6 +557,11 @@ def main() -> None:
                 if min_ok_pow2 is None:
                     min_ok_pow2 = budget
                 last_ok_budget = budget
+                if last_res is not None:
+                    last_ok_micro_batches = last_res.micro_batches
+                    if last_ok_micro_batches == 1:
+                        max_ok = budget
+                        break
                 if budget >= max_budget:
                     max_ok = budget
                     break
@@ -572,31 +578,34 @@ def main() -> None:
             break
 
         if last_ok_budget is not None and first_oom_budget is not None:
-            low = last_ok_budget
-            high = first_oom_budget
-            while high - low > 1:
-                mid = (low + high) // 2
-                budget_results, ok, last_res = _run_budget_trials(
-                    budget=mid,
-                    model=model,
-                    optimizer=optimizer,
-                    algo=algo,
-                    device=device,
-                    pad_token_id=pad_token_id,
-                    max_seq_len=args.max_seq_len,
-                    saw_batch=saw_batch,
-                    warmup_steps=args.warmup_steps,
-                    steps=args.steps,
-                    use_grad_scaler=use_grad_scaler,
-                )
-                results.extend(budget_results)
-                if ok:
-                    low = mid
-                else:
-                    high = mid
-                    if oom_error is None and last_res is not None:
-                        oom_error = last_res.error
-            max_ok = low
+            if last_ok_micro_batches == 1:
+                max_ok = last_ok_budget
+            else:
+                low = last_ok_budget
+                high = first_oom_budget
+                while high - low > 1:
+                    mid = (low + high) // 2
+                    budget_results, ok, last_res = _run_budget_trials(
+                        budget=mid,
+                        model=model,
+                        optimizer=optimizer,
+                        algo=algo,
+                        device=device,
+                        pad_token_id=pad_token_id,
+                        max_seq_len=args.max_seq_len,
+                        saw_batch=saw_batch,
+                        warmup_steps=args.warmup_steps,
+                        steps=args.steps,
+                        use_grad_scaler=use_grad_scaler,
+                    )
+                    results.extend(budget_results)
+                    if ok:
+                        low = mid
+                    else:
+                        high = mid
+                        if oom_error is None and last_res is not None:
+                            oom_error = last_res.error
+                max_ok = low
         elif last_ok_budget is not None and max_ok is None:
             max_ok = last_ok_budget
 
