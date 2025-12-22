@@ -13,7 +13,7 @@ from torch import nn
 from torch.distributed import fsdp
 
 from ludic.training.algorithm import make_sft
-from ludic.training.batching.micro_batching import collate_micro_batches
+from ludic.training.batching.micro_batching import MicroBatch, collate_micro_batches
 from ludic.training.types import SAWBatch, SAWItem
 
 
@@ -52,8 +52,16 @@ def _run_budget_trials(
     warmup_steps: int,
     steps: int,
     use_grad_scaler: bool,
+    scaler: Optional[torch.amp.GradScaler],
 ) -> tuple[List[TrialResult], bool, Optional[TrialResult]]:
     results: List[TrialResult] = []
+    micro_batches = collate_micro_batches(
+        saw_batch.items,
+        pad_token_id=pad_token_id,
+        device=device,
+        micro_token_budget=budget,
+        max_seq_len=max_seq_len,
+    )
     last_res: Optional[TrialResult] = None
     for _ in range(warmup_steps):
         last_res = _run_step(
@@ -66,6 +74,8 @@ def _run_budget_trials(
             max_seq_len=max_seq_len,
             saw_batch=saw_batch,
             use_grad_scaler=use_grad_scaler,
+            micro_batches=micro_batches,
+            scaler=scaler,
         )
         results.append(last_res)
         if not last_res.ok:
@@ -81,6 +91,8 @@ def _run_budget_trials(
             max_seq_len=max_seq_len,
             saw_batch=saw_batch,
             use_grad_scaler=use_grad_scaler,
+            micro_batches=micro_batches,
+            scaler=scaler,
         )
         results.append(last_res)
         if not last_res.ok:
@@ -260,20 +272,24 @@ def _run_step(
     max_seq_len: int,
     saw_batch: SAWBatch,
     use_grad_scaler: bool,
+    micro_batches: Optional[List[MicroBatch]] = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
 ) -> TrialResult:
     model.train()
-    micro_batches = collate_micro_batches(
-        saw_batch.items,
-        pad_token_id=pad_token_id,
-        device=device,
-        micro_token_budget=micro_token_budget,
-        max_seq_len=max_seq_len,
-    )
+    if micro_batches is None:
+        micro_batches = collate_micro_batches(
+            saw_batch.items,
+            pad_token_id=pad_token_id,
+            device=device,
+            micro_token_budget=micro_token_budget,
+            max_seq_len=max_seq_len,
+        )
     total_items = sum(micro.num_items for micro in micro_batches)
     if total_items == 0:
         raise ValueError("Synthetic batch produced no items.")
 
-    scaler = torch.amp.GradScaler(enabled=use_grad_scaler)
+    if use_grad_scaler and scaler is None:
+        scaler = torch.amp.GradScaler(enabled=True)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
@@ -291,6 +307,7 @@ def _run_step(
                 loss, _stats = algo.compute_loss(model, batch)
                 scaled = loss * (micro.num_items / total_items)
                 if use_grad_scaler:
+                    assert scaler is not None
                     scaler.scale(scaled).backward()
                 else:
                     scaled.backward()
@@ -299,6 +316,7 @@ def _run_step(
                     model.set_requires_gradient_sync(True)
 
         if use_grad_scaler:
+            assert scaler is not None
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -347,9 +365,17 @@ def _run_trials(
     warmup_steps: int,
     steps: int,
     use_grad_scaler: bool,
+    scaler: Optional[torch.amp.GradScaler],
 ) -> List[TrialResult]:
     results: List[TrialResult] = []
     for budget in budgets:
+        micro_batches = collate_micro_batches(
+            saw_batch.items,
+            pad_token_id=pad_token_id,
+            device=device,
+            micro_token_budget=budget,
+            max_seq_len=max_seq_len,
+        )
         for _ in range(warmup_steps):
             _run_step(
                 model=model,
@@ -361,6 +387,8 @@ def _run_trials(
                 max_seq_len=max_seq_len,
                 saw_batch=saw_batch,
                 use_grad_scaler=use_grad_scaler,
+                micro_batches=micro_batches,
+                scaler=scaler,
             )
         for _ in range(steps):
             results.append(
@@ -374,6 +402,8 @@ def _run_trials(
                     max_seq_len=max_seq_len,
                     saw_batch=saw_batch,
                     use_grad_scaler=use_grad_scaler,
+                    micro_batches=micro_batches,
+                    scaler=scaler,
                 )
             )
     return results
@@ -502,6 +532,7 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     use_grad_scaler = args.dtype == "fp16" and device.type == "cuda"
+    scaler = torch.amp.GradScaler(enabled=use_grad_scaler) if use_grad_scaler else None
 
     saw_batch = _build_batch(
         num_rollouts=args.num_rollouts,
@@ -532,6 +563,7 @@ def main() -> None:
         max_ok = None
         first_oom_budget = None
         oom_error = None
+        oom_micro_batches = None
 
         max_budget = args.max_seq_len * len(saw_batch.items)
         budget = args.max_seq_len
@@ -551,6 +583,7 @@ def main() -> None:
                 warmup_steps=args.warmup_steps,
                 steps=args.steps,
                 use_grad_scaler=use_grad_scaler,
+                scaler=scaler,
             )
             results.extend(budget_results)
             if ok:
@@ -575,29 +608,33 @@ def main() -> None:
             first_oom_budget = budget
             if last_res is not None:
                 oom_error = last_res.error
+                oom_micro_batches = last_res.micro_batches
             break
 
         if last_ok_budget is not None and first_oom_budget is not None:
-            if last_ok_micro_batches == 1:
+            if last_ok_micro_batches == 1 or (
+                oom_micro_batches is not None and last_ok_micro_batches == oom_micro_batches
+            ):
                 max_ok = last_ok_budget
             else:
                 low = last_ok_budget
                 high = first_oom_budget
                 while high - low > 1:
                     mid = (low + high) // 2
-                    budget_results, ok, last_res = _run_budget_trials(
-                        budget=mid,
-                        model=model,
-                        optimizer=optimizer,
-                        algo=algo,
-                        device=device,
-                        pad_token_id=pad_token_id,
-                        max_seq_len=args.max_seq_len,
-                        saw_batch=saw_batch,
-                        warmup_steps=args.warmup_steps,
-                        steps=args.steps,
-                        use_grad_scaler=use_grad_scaler,
-                    )
+                budget_results, ok, last_res = _run_budget_trials(
+                    budget=mid,
+                    model=model,
+                    optimizer=optimizer,
+                    algo=algo,
+                    device=device,
+                    pad_token_id=pad_token_id,
+                    max_seq_len=args.max_seq_len,
+                    saw_batch=saw_batch,
+                    warmup_steps=args.warmup_steps,
+                    steps=args.steps,
+                    use_grad_scaler=use_grad_scaler,
+                    scaler=scaler,
+                )
                     results.extend(budget_results)
                     if ok:
                         low = mid
@@ -622,6 +659,7 @@ def main() -> None:
             warmup_steps=args.warmup_steps,
             steps=args.steps,
             use_grad_scaler=use_grad_scaler,
+            scaler=scaler,
         )
 
     if not args.fsdp or rank == 0:
