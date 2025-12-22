@@ -74,7 +74,7 @@ def main():
     parser.add_argument(
         "--rollouts-per-update",
         type=int,
-        default=128,
+        default=256,
         help="Total rollouts per update (must be divisible by --group-size).",
     )
     parser.add_argument("--train-steps", type=int, default=20, help="Number of trainer steps; 0 = run until samples are exhausted.")
