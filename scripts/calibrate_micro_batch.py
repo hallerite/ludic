@@ -13,7 +13,7 @@ from torch import nn
 from torch.distributed import fsdp
 
 from ludic.training.algorithm import make_sft
-from ludic.training.batching.micro_batching import collate_micro_batches
+from ludic.training.batching.micro_batching import collate_micro_batches, split_items_by_token_budget
 from ludic.training.types import SAWBatch, SAWItem
 
 
@@ -37,6 +37,34 @@ def _parse_token_budgets(arg: Optional[str]) -> List[int]:
             continue
         out.append(int(part))
     return out
+
+
+def _auto_token_budgets(
+    items: List[SAWItem],
+    *,
+    max_seq_len: int,
+) -> List[int]:
+    if not items:
+        return [max_seq_len]
+    max_budget = max_seq_len * len(items)
+    budgets: List[int] = []
+    budget = max_seq_len
+    while budget <= max_budget:
+        budgets.append(budget)
+        micro_batches = split_items_by_token_budget(
+            items,
+            micro_token_budget=budget,
+            max_seq_len=max_seq_len,
+        )
+        if len(micro_batches) <= 1:
+            break
+        next_budget = budget * 2
+        if next_budget == budget:
+            break
+        budget = min(next_budget, max_budget)
+        if budget == budgets[-1]:
+            break
+    return budgets
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -338,7 +366,7 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None, help="Device (e.g., cuda:0).")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--max-seq-len", type=int, default=1024, help="Max tokens per sample.")
-    parser.add_argument("--micro-token-budget", type=int, default=8192, help="Max padded tokens per micro-batch.")
+    parser.add_argument("--micro-token-budget", type=int, default=None, help="Max padded tokens per micro-batch.")
     parser.add_argument("--token-budgets", type=str, default=None, help="Comma-separated token budgets.")
     parser.add_argument("--min-seq-len", type=int, default=None, help="Min tokens per sample.")
     parser.add_argument("--num-rollouts", type=int, default=8, help="Rollouts per synthetic batch.")
@@ -350,6 +378,12 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--pad-token-id", type=int, default=None)
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument(
+        "--auto-token-budget",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-sweep micro-token budgets (starts at max_seq_len, doubles each step).",
+    )
     parser.add_argument("--lora-path", type=str, default=None, help="Optional LoRA adapter path.")
     parser.add_argument("--lora-rank", type=int, default=0, help="LoRA rank (0 disables).")
     parser.add_argument(
@@ -378,10 +412,6 @@ def main() -> None:
     args = parser.parse_args()
 
     token_budgets = _parse_token_budgets(args.token_budgets)
-    if not token_budgets:
-        if args.micro_token_budget <= 0:
-            raise ValueError("Pass --micro-token-budget or --token-budgets.")
-        token_budgets = [args.micro_token_budget]
 
     if args.num_rollouts <= 0:
         raise ValueError("--num-rollouts must be > 0.")
@@ -459,19 +489,73 @@ def main() -> None:
         seed=args.seed,
     )
 
-    results = _run_trials(
-        token_budgets,
-        model=model,
-        optimizer=optimizer,
-        algo=algo,
-        device=device,
-        pad_token_id=pad_token_id,
-        max_seq_len=args.max_seq_len,
-        saw_batch=saw_batch,
-        warmup_steps=args.warmup_steps,
-        steps=args.steps,
-        use_grad_scaler=use_grad_scaler,
-    )
+    auto_mode = False
+    if token_budgets:
+        budgets = token_budgets
+    elif args.micro_token_budget is not None:
+        if args.micro_token_budget <= 0:
+            raise ValueError("--micro-token-budget must be > 0.")
+        budgets = [args.micro_token_budget]
+    elif args.auto_token_budget:
+        auto_mode = True
+        budgets = _auto_token_budgets(saw_batch.items, max_seq_len=args.max_seq_len)
+    else:
+        raise ValueError("Pass --micro-token-budget, --token-budgets, or enable --auto-token-budget.")
+
+    if auto_mode:
+        results: List[TrialResult] = []
+        for budget in budgets:
+            ok = True
+            for _ in range(args.warmup_steps):
+                res = _run_step(
+                    model=model,
+                    optimizer=optimizer,
+                    algo=algo,
+                    device=device,
+                    pad_token_id=pad_token_id,
+                    micro_token_budget=budget,
+                    max_seq_len=args.max_seq_len,
+                    saw_batch=saw_batch,
+                    use_grad_scaler=use_grad_scaler,
+                )
+                results.append(res)
+                if not res.ok:
+                    ok = False
+                    break
+            if not ok:
+                break
+            for _ in range(args.steps):
+                res = _run_step(
+                    model=model,
+                    optimizer=optimizer,
+                    algo=algo,
+                    device=device,
+                    pad_token_id=pad_token_id,
+                    micro_token_budget=budget,
+                    max_seq_len=args.max_seq_len,
+                    saw_batch=saw_batch,
+                    use_grad_scaler=use_grad_scaler,
+                )
+                results.append(res)
+                if not res.ok:
+                    ok = False
+                    break
+            if not ok:
+                break
+    else:
+        results = _run_trials(
+            budgets,
+            model=model,
+            optimizer=optimizer,
+            algo=algo,
+            device=device,
+            pad_token_id=pad_token_id,
+            max_seq_len=args.max_seq_len,
+            saw_batch=saw_batch,
+            warmup_steps=args.warmup_steps,
+            steps=args.steps,
+            use_grad_scaler=use_grad_scaler,
+        )
 
     if not args.fsdp or rank == 0:
         for res in results:
@@ -484,6 +568,10 @@ def main() -> None:
             if res.error:
                 msg += f" error={res.error}"
             print(msg)
+        if auto_mode:
+            ok_budgets = [r.padded_tokens for r in results if r.ok]
+            if ok_budgets:
+                print(f"max_micro_token_budget_ok={max(ok_budgets)}")
 
     if args.fsdp and dist.is_initialized():
         dist.barrier()
