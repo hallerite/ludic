@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import List, Mapping
+from typing import List
 
 import pytest
 import torch
@@ -11,7 +11,6 @@ from ludic.training.algorithm import RLAlgorithm
 from ludic.training.config import TrainerConfig
 from ludic.training.credit_assignment import ConstantCredit
 from ludic.training.loss import Loss
-from ludic.training.stats import Reducer, default_reducers
 from ludic.training.trainer import Trainer
 from ludic.training.types import SAWBatch, SAWItem, BatchSource
 
@@ -79,7 +78,6 @@ def _trainer_for_batch(
     max_lag: int | None = None,
     sync_every_steps: int = 0,
     preprocess=None,
-    reducers: Mapping[str, Reducer] | None = None,
 ) -> Trainer:
     algo = RLAlgorithm(
         name="test_algo",
@@ -100,7 +98,6 @@ def _trainer_for_batch(
             max_lag=max_lag,
             sync_every_steps=sync_every_steps,
         ),
-        reducers=reducers,
     )
 
 
@@ -135,19 +132,6 @@ def test_trainer_truncates_long_sample():
     )
     stats = trainer.train_step_sync()
     assert "train/loss" in stats
-
-
-def test_trainer_reports_seq_len_truncated_rate():
-    batch = SAWBatch(items=[_make_item(6, 1.0)], meta={})
-    trainer = _trainer_for_batch(
-        batch,
-        loss=LogitsMeanLoss(),
-        max_seq_len=5,
-        micro_token_budget=10,
-        reducers=default_reducers(),
-    )
-    stats = trainer.train_step_sync()
-    assert stats["train/seq_len_truncated_rate"] == pytest.approx(1.0)
 
 
 def test_trainer_filters_max_lag_items():

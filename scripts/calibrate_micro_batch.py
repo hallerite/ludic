@@ -13,7 +13,7 @@ from torch import nn
 from torch.distributed import fsdp
 
 from ludic.training.algorithm import make_sft
-from ludic.training.batching.micro_batching import collate_saw_items, split_items_by_token_budget
+from ludic.training.batching.micro_batching import collate_micro_batches
 from ludic.training.types import SAWBatch, SAWItem
 
 
@@ -37,65 +37,6 @@ def _parse_token_budgets(arg: Optional[str]) -> List[int]:
             continue
         out.append(int(part))
     return out
-
-
-def _run_budget_trials(
-    *,
-    budget: int,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    algo,
-    device: torch.device,
-    pad_token_id: int,
-    max_seq_len: int,
-    saw_batch: SAWBatch,
-    warmup_steps: int,
-    steps: int,
-    use_grad_scaler: bool,
-    scaler: Optional[torch.amp.GradScaler],
-) -> tuple[List[TrialResult], bool, Optional[TrialResult]]:
-    results: List[TrialResult] = []
-    micro_chunks = split_items_by_token_budget(
-        saw_batch.items,
-        micro_token_budget=budget,
-        max_seq_len=max_seq_len,
-    )
-    last_res: Optional[TrialResult] = None
-    for _ in range(warmup_steps):
-        last_res = _run_step(
-            model=model,
-            optimizer=optimizer,
-            algo=algo,
-            device=device,
-            pad_token_id=pad_token_id,
-            micro_token_budget=budget,
-            max_seq_len=max_seq_len,
-            saw_batch=saw_batch,
-            use_grad_scaler=use_grad_scaler,
-            micro_chunks=micro_chunks,
-            scaler=scaler,
-        )
-        results.append(last_res)
-        if not last_res.ok:
-            return results, False, last_res
-    for _ in range(steps):
-        last_res = _run_step(
-            model=model,
-            optimizer=optimizer,
-            algo=algo,
-            device=device,
-            pad_token_id=pad_token_id,
-            micro_token_budget=budget,
-            max_seq_len=max_seq_len,
-            saw_batch=saw_batch,
-            use_grad_scaler=use_grad_scaler,
-            micro_chunks=micro_chunks,
-            scaler=scaler,
-        )
-        results.append(last_res)
-        if not last_res.ok:
-            return results, False, last_res
-    return results, True, last_res
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -144,11 +85,6 @@ def _load_model(
     fsdp_reduce_dtype: torch.dtype,
     fsdp_per_layer: bool,
     gradient_checkpointing: bool,
-    lora_path: Optional[str],
-    lora_rank: int,
-    lora_alpha_mult: float,
-    lora_dropout: float,
-    lora_target_modules: str,
 ) -> nn.Module:
     try:
         from transformers import AutoModelForCausalLM  # type: ignore
@@ -164,27 +100,6 @@ def _load_model(
         load_kwargs["device_map"] = {"": "cpu"}
 
     model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-
-    if lora_path or lora_rank > 0:
-        try:
-            from peft import PeftModel, LoraConfig, TaskType, get_peft_model  # type: ignore
-        except ImportError as exc:
-            raise ImportError(
-                "peft is required for LoRA calibration. Install with: uv sync --extra examples"
-            ) from exc
-        if lora_path:
-            model = PeftModel.from_pretrained(model, lora_path, is_trainable=True)
-        else:
-            lora_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                inference_mode=False,
-                r=lora_rank,
-                lora_alpha=int(lora_rank * lora_alpha_mult),
-                lora_dropout=lora_dropout,
-                bias="none",
-                target_modules=lora_target_modules,
-            )
-            model = get_peft_model(model, lora_config)
 
     if gradient_checkpointing:
         _maybe_enable_gradient_checkpointing(model)
@@ -270,44 +185,37 @@ def _run_step(
     max_seq_len: int,
     saw_batch: SAWBatch,
     use_grad_scaler: bool,
-    micro_chunks: Optional[List[List[SAWItem]]] = None,
-    scaler: Optional[torch.amp.GradScaler] = None,
 ) -> TrialResult:
     model.train()
-    if micro_chunks is None:
-        micro_chunks = split_items_by_token_budget(
-            saw_batch.items,
-            micro_token_budget=micro_token_budget,
-            max_seq_len=max_seq_len,
-        )
-    total_items = sum(len(chunk) for chunk in micro_chunks)
+    micro_batches = collate_micro_batches(
+        saw_batch.items,
+        pad_token_id=pad_token_id,
+        device=device,
+        micro_token_budget=micro_token_budget,
+        max_seq_len=max_seq_len,
+    )
+    total_items = sum(micro.num_items for micro in micro_batches)
     if total_items == 0:
         raise ValueError("Synthetic batch produced no items.")
 
-    if use_grad_scaler and scaler is None:
-        scaler = torch.amp.GradScaler(enabled=True)
+    scaler = torch.amp.GradScaler(enabled=use_grad_scaler)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
 
     start = time.perf_counter()
     try:
-        for idx, chunk in enumerate(micro_chunks):
-            is_last = idx == len(micro_chunks) - 1
+        for idx, micro in enumerate(micro_batches):
+            is_last = idx == len(micro_batches) - 1
             grad_sync_disabled = False
             if isinstance(model, fsdp.FSDPModule) and not is_last:
                 model.set_requires_gradient_sync(False)
                 grad_sync_disabled = True
             try:
-                batch = collate_saw_items(
-                    chunk,
-                    pad_token_id=pad_token_id,
-                    device=device,
-                )
+                batch = micro.tensors
                 loss, _stats = algo.compute_loss(model, batch)
-                scaled = loss * (len(chunk) / total_items)
+                scaled = loss * (micro.num_items / total_items)
                 if use_grad_scaler:
-                    assert scaler is not None
                     scaler.scale(scaled).backward()
                 else:
                     scaled.backward()
@@ -316,7 +224,6 @@ def _run_step(
                     model.set_requires_gradient_sync(True)
 
         if use_grad_scaler:
-            assert scaler is not None
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -330,7 +237,7 @@ def _run_step(
                 ok=False,
                 elapsed_s=0.0,
                 peak_mem_mb=0.0,
-                micro_batches=len(micro_chunks),
+                micro_batches=len(micro_batches),
                 padded_tokens=micro_token_budget,
                 error=str(exc),
             )
@@ -347,7 +254,7 @@ def _run_step(
         ok=True,
         elapsed_s=elapsed,
         peak_mem_mb=peak_mb,
-        micro_batches=len(micro_chunks),
+        micro_batches=len(micro_batches),
         padded_tokens=micro_token_budget,
     )
 
@@ -365,15 +272,9 @@ def _run_trials(
     warmup_steps: int,
     steps: int,
     use_grad_scaler: bool,
-    scaler: Optional[torch.amp.GradScaler],
 ) -> List[TrialResult]:
     results: List[TrialResult] = []
     for budget in budgets:
-        micro_chunks = split_items_by_token_budget(
-            saw_batch.items,
-            micro_token_budget=budget,
-            max_seq_len=max_seq_len,
-        )
         for _ in range(warmup_steps):
             _run_step(
                 model=model,
@@ -385,8 +286,6 @@ def _run_trials(
                 max_seq_len=max_seq_len,
                 saw_batch=saw_batch,
                 use_grad_scaler=use_grad_scaler,
-                micro_chunks=micro_chunks,
-                scaler=scaler,
             )
         for _ in range(steps):
             results.append(
@@ -400,8 +299,6 @@ def _run_trials(
                     max_seq_len=max_seq_len,
                     saw_batch=saw_batch,
                     use_grad_scaler=use_grad_scaler,
-                    micro_chunks=micro_chunks,
-                    scaler=scaler,
                 )
             )
     return results
@@ -415,7 +312,7 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None, help="Device (e.g., cuda:0).")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--max-seq-len", type=int, default=1024, help="Max tokens per sample.")
-    parser.add_argument("--micro-token-budget", type=int, default=None, help="Max padded tokens per micro-batch.")
+    parser.add_argument("--micro-token-budget", type=int, default=8192, help="Max padded tokens per micro-batch.")
     parser.add_argument("--token-budgets", type=str, default=None, help="Comma-separated token budgets.")
     parser.add_argument("--min-seq-len", type=int, default=None, help="Min tokens per sample.")
     parser.add_argument("--num-rollouts", type=int, default=8, help="Rollouts per synthetic batch.")
@@ -427,30 +324,6 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--pad-token-id", type=int, default=None)
     parser.add_argument("--gradient-checkpointing", action="store_true")
-    parser.add_argument(
-        "--auto-token-budget",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Auto-sweep micro-token budgets (starts at max_seq_len, doubles each step, "
-            "then binary-searches the last OK/first OOM range)."
-        ),
-    )
-    parser.add_argument("--lora-path", type=str, default=None, help="Optional LoRA adapter path.")
-    parser.add_argument("--lora-rank", type=int, default=0, help="LoRA rank (0 disables).")
-    parser.add_argument(
-        "--lora-alpha-mult",
-        type=float,
-        default=2.0,
-        help="Multiplier applied to rank to set lora_alpha (alpha = rank * mult).",
-    )
-    parser.add_argument("--lora-dropout", type=float, default=0.0, help="LoRA dropout probability.")
-    parser.add_argument(
-        "--lora-target-modules",
-        type=str,
-        default="all-linear",
-        help="Modules to target for LoRA (e.g., all-linear).",
-    )
     parser.add_argument("--fsdp", action="store_true")
     parser.add_argument("--fsdp-param-dtype", choices=["bf16", "fp16", "fp32"], default=None)
     parser.add_argument("--fsdp-reduce-dtype", choices=["bf16", "fp16", "fp32"], default="fp32")
@@ -464,6 +337,10 @@ def main() -> None:
     args = parser.parse_args()
 
     token_budgets = _parse_token_budgets(args.token_budgets)
+    if not token_budgets:
+        if args.micro_token_budget <= 0:
+            raise ValueError("Pass --micro-token-budget or --token-budgets.")
+        token_budgets = [args.micro_token_budget]
 
     if args.num_rollouts <= 0:
         raise ValueError("--num-rollouts must be > 0.")
@@ -471,10 +348,6 @@ def main() -> None:
         raise ValueError("--steps-per-rollout must be > 0.")
     if args.action_ratio <= 0 or args.action_ratio > 1:
         raise ValueError("--action-ratio must be in (0, 1].")
-    if args.lora_path and args.lora_rank > 0:
-        raise ValueError("Pass either --lora-path or --lora-rank, not both.")
-    if args.lora_rank < 0:
-        raise ValueError("--lora-rank must be >= 0.")
 
     local_rank = args.local_rank
     if local_rank is None:
@@ -502,11 +375,6 @@ def main() -> None:
         fsdp_reduce_dtype=fsdp_reduce_dtype,
         fsdp_per_layer=args.fsdp_per_layer,
         gradient_checkpointing=args.gradient_checkpointing,
-        lora_path=args.lora_path,
-        lora_rank=args.lora_rank,
-        lora_alpha_mult=args.lora_alpha_mult,
-        lora_dropout=args.lora_dropout,
-        lora_target_modules=args.lora_target_modules,
     )
 
     config = getattr(model, "config", None)
@@ -530,7 +398,6 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     use_grad_scaler = args.dtype == "fp16" and device.type == "cuda"
-    scaler = torch.amp.GradScaler(enabled=use_grad_scaler) if use_grad_scaler else None
 
     saw_batch = _build_batch(
         num_rollouts=args.num_rollouts,
@@ -542,123 +409,19 @@ def main() -> None:
         seed=args.seed,
     )
 
-    auto_mode = False
-    if token_budgets:
-        budgets = token_budgets
-    elif args.micro_token_budget is not None:
-        if args.micro_token_budget <= 0:
-            raise ValueError("--micro-token-budget must be > 0.")
-        budgets = [args.micro_token_budget]
-    elif args.auto_token_budget:
-        auto_mode = True
-        budgets = []
-    else:
-        raise ValueError("Pass --micro-token-budget, --token-budgets, or enable --auto-token-budget.")
-
-    if auto_mode:
-        results = []
-        min_ok_pow2 = None
-        max_ok = None
-        first_oom_budget = None
-        oom_error = None
-        oom_micro_batches = None
-
-        max_budget = args.max_seq_len * len(saw_batch.items)
-        budget = args.max_seq_len
-        last_ok_budget = None
-        last_ok_micro_batches = None
-
-        while budget <= max_budget:
-            budget_results, ok, last_res = _run_budget_trials(
-                budget=budget,
-                model=model,
-                optimizer=optimizer,
-                algo=algo,
-                device=device,
-                pad_token_id=pad_token_id,
-                max_seq_len=args.max_seq_len,
-                saw_batch=saw_batch,
-                warmup_steps=args.warmup_steps,
-                steps=args.steps,
-                use_grad_scaler=use_grad_scaler,
-                scaler=scaler,
-            )
-            results.extend(budget_results)
-            if ok:
-                if min_ok_pow2 is None:
-                    min_ok_pow2 = budget
-                last_ok_budget = budget
-                if last_res is not None:
-                    last_ok_micro_batches = last_res.micro_batches
-                    if last_ok_micro_batches == 1:
-                        max_ok = budget
-                        break
-                if budget >= max_budget:
-                    max_ok = budget
-                    break
-                next_budget = min(budget * 2, max_budget)
-                if next_budget == budget:
-                    max_ok = budget
-                    break
-                budget = next_budget
-                continue
-
-            first_oom_budget = budget
-            if last_res is not None:
-                oom_error = last_res.error
-                oom_micro_batches = last_res.micro_batches
-            break
-
-        if last_ok_budget is not None and first_oom_budget is not None:
-            if last_ok_micro_batches == 1 or (
-                oom_micro_batches is not None and last_ok_micro_batches == oom_micro_batches
-            ):
-                max_ok = last_ok_budget
-            else:
-                low = last_ok_budget
-                high = first_oom_budget
-                while high - low > 1:
-                    mid = (low + high) // 2
-                    budget_results, ok, last_res = _run_budget_trials(
-                        budget=mid,
-                        model=model,
-                        optimizer=optimizer,
-                        algo=algo,
-                        device=device,
-                        pad_token_id=pad_token_id,
-                        max_seq_len=args.max_seq_len,
-                        saw_batch=saw_batch,
-                        warmup_steps=args.warmup_steps,
-                        steps=args.steps,
-                        use_grad_scaler=use_grad_scaler,
-                        scaler=scaler,
-                    )
-                    results.extend(budget_results)
-                    if ok:
-                        low = mid
-                    else:
-                        high = mid
-                        if oom_error is None and last_res is not None:
-                            oom_error = last_res.error
-                max_ok = low
-        elif last_ok_budget is not None and max_ok is None:
-            max_ok = last_ok_budget
-
-    else:
-        results = _run_trials(
-            budgets,
-            model=model,
-            optimizer=optimizer,
-            algo=algo,
-            device=device,
-            pad_token_id=pad_token_id,
-            max_seq_len=args.max_seq_len,
-            saw_batch=saw_batch,
-            warmup_steps=args.warmup_steps,
-            steps=args.steps,
-            use_grad_scaler=use_grad_scaler,
-            scaler=scaler,
-        )
+    results = _run_trials(
+        token_budgets,
+        model=model,
+        optimizer=optimizer,
+        algo=algo,
+        device=device,
+        pad_token_id=pad_token_id,
+        max_seq_len=args.max_seq_len,
+        saw_batch=saw_batch,
+        warmup_steps=args.warmup_steps,
+        steps=args.steps,
+        use_grad_scaler=use_grad_scaler,
+    )
 
     if not args.fsdp or rank == 0:
         for res in results:
@@ -671,15 +434,6 @@ def main() -> None:
             if res.error:
                 msg += f" error={res.error}"
             print(msg)
-        if auto_mode:
-            if min_ok_pow2 is not None:
-                print(f"min_micro_token_budget_ok_pow2={min_ok_pow2}")
-            if max_ok is not None:
-                print(f"max_micro_token_budget_ok={max_ok}")
-            if first_oom_budget is not None:
-                print(f"oom_micro_token_budget={first_oom_budget}")
-            if oom_error:
-                print(f"oom_error={oom_error}")
 
     if args.fsdp and dist.is_initialized():
         dist.barrier()

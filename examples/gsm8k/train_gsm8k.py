@@ -74,12 +74,12 @@ def main():
     parser.add_argument(
         "--rollouts-per-update",
         type=int,
-        default=256,
+        default=8,
         help="Total rollouts per update (must be divisible by --group-size).",
     )
     parser.add_argument("--train-steps", type=int, default=20, help="Number of trainer steps; 0 = run until samples are exhausted.")
     parser.add_argument("--max-seq-len", type=int, default=1024, help="Max tokens per sample.")
-    parser.add_argument("--micro-token-budget", type=int, default=16384, help="Max padded tokens per micro-batch.")
+    parser.add_argument("--micro-token-budget", type=int, default=8192, help="Max padded tokens per micro-batch.")
     parser.add_argument("--max-completion-tokens", type=int, default=512, help="Max completion tokens per rollout.")
     parser.add_argument("--group-size", type=int, default=8, help="Group size for grouped advantages.")
     parser.add_argument(
@@ -91,7 +91,7 @@ def main():
     parser.add_argument("--train-temperature", type=float, default=1.0, help="Sampling temperature for training rollouts.")
     parser.add_argument("--eval-every", type=int, default=10, help="Eval every N train steps.")
     parser.add_argument("--eval-before-start", action="store_true", default=True, help="Run eval once before training begins.")
-    parser.add_argument("--eval-limit", type=int, default=1000, help="Number of test samples for eval.")
+    parser.add_argument("--eval-limit", type=int, default=750, help="Number of test samples for eval.")
     parser.add_argument("--eval-concurrency", type=int, default=64)
     parser.add_argument("--eval-temperature", type=float, default=0.0, help="Sampling temperature for eval passes.")
     parser.add_argument("--rollout-log", type=str, default="gsm8k_train_rollouts.jsonl")
@@ -240,7 +240,9 @@ def main():
         "train/correct_rate",
         "train/parse_err_rate",
         "train/completion_truncated_rate",
+        "train/incomplete_completion_rate",
         "train/seq_len_truncated_rate",
+        "train/seq_len_retained_frac",
         "train/avg_completion_length",
         "train/total_completion_tokens",
         "eval/accuracy",

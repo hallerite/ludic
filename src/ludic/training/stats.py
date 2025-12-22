@@ -40,11 +40,21 @@ def default_reducers() -> Mapping[str, Reducer]:
             normalize_by="samples",
             as_percent=True,
         ),
+        "incomplete_completion_rate": Reducer(
+            kind="count_true",
+            source="incomplete_completion",
+            normalize_by="samples",
+            as_percent=True,
+        ),
         "seq_len_truncated_rate": Reducer(
             kind="count_true",
             source="seq_len_truncated",
             normalize_by="samples",
             as_percent=True,
+        ),
+        "seq_len_retained_frac": Reducer(
+            kind="mean",
+            source="seq_len_retained_frac",
         ),
     }
 

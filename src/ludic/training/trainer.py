@@ -19,7 +19,7 @@ from ludic.training.checkpoint import CheckpointConfig, CheckpointManager
 from ludic.training.algorithm import RLAlgorithm
 from ludic.training.loggers import TrainingLogger
 from ludic.training.config import TrainerConfig
-from ludic.training.batching.micro_batching import collate_saw_items, split_items_by_token_budget
+from ludic.training.batching.micro_batching import collate_micro_batches
 from ludic.training.stats import aggregate_stats, Reducer
 from ludic.eval.evaluator import Evaluator
 from ludic.training.types import SAWBatch, BatchSource
@@ -506,34 +506,29 @@ class Trainer:
 
         all_saw_batches.append(saw_batch)
 
-        micro_chunks = split_items_by_token_budget(
+        micro_batches = collate_micro_batches(
             saw_batch.items,
+            pad_token_id=self.cfg.pad_token_id,
+            device=device,
             micro_token_budget=micro_token_budget,
             max_seq_len=max_seq_len,
         )
-        # Use the post-truncation items for stats aggregation.
-        processed_items = [item for chunk in micro_chunks for item in chunk]
-        saw_batch.items = processed_items
-        total_items = len(processed_items)
+        total_items = sum(micro.num_items for micro in micro_batches)
         if total_items == 0:
             raise ValueError("Macro-batch contains no items after preprocessing.")
 
         # ---- 2) Accumulation Loop (Micro-Steps) -------------------------
-        for micro_step_idx, chunk in enumerate(micro_chunks):
-            item_count = len(chunk)
+        for micro_step_idx, micro in enumerate(micro_batches):
+            item_count = micro.num_items
             logger.debug(
                 "[Micro-step %s/%s] Processing %s SAWItems.",
                 micro_step_idx + 1,
-                len(micro_chunks),
+                len(micro_batches),
                 item_count,
             )
 
             # ---- 2a) Collate into tensors ------------------------------
-            batch_tensors = collate_saw_items(
-                chunk,
-                pad_token_id=self.cfg.pad_token_id,
-                device=device,
-            )
+            batch_tensors = micro.tensors
 
             input_shape = batch_tensors["input_ids"].shape
             logger.debug(
@@ -545,7 +540,7 @@ class Trainer:
 
             # ---- 2b) FSDP2 gradient sync control ----------------------
             # We only sync (all-reduce) gradients on the *last* micro-batch
-            is_last_micro = (micro_step_idx == len(micro_chunks) - 1)
+            is_last_micro = (micro_step_idx == len(micro_batches) - 1)
             grad_sync_disabled = False
             if isinstance(self.model, fsdp.FSDPModule) and not is_last_micro:
                 self.model.set_requires_gradient_sync(False)
@@ -618,7 +613,7 @@ class Trainer:
             all_micro_stats,
             all_saw_batches,
             reducers=self.reducers,
-            micro_batch_sizes=[len(chunk) for chunk in micro_chunks],
+            micro_batch_sizes=[micro.num_items for micro in micro_batches],
         )
         if grad_norm is not None:
             final_stats["grad_norm"] = float(grad_norm)
