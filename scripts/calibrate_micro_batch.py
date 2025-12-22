@@ -85,6 +85,11 @@ def _load_model(
     fsdp_reduce_dtype: torch.dtype,
     fsdp_per_layer: bool,
     gradient_checkpointing: bool,
+    lora_path: Optional[str],
+    lora_rank: int,
+    lora_alpha_mult: float,
+    lora_dropout: float,
+    lora_target_modules: str,
 ) -> nn.Module:
     try:
         from transformers import AutoModelForCausalLM  # type: ignore
@@ -100,6 +105,27 @@ def _load_model(
         load_kwargs["device_map"] = {"": "cpu"}
 
     model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+
+    if lora_path or lora_rank > 0:
+        try:
+            from peft import PeftModel, LoraConfig, TaskType, get_peft_model  # type: ignore
+        except ImportError as exc:
+            raise ImportError(
+                "peft is required for LoRA calibration. Install with: uv sync --extra examples"
+            ) from exc
+        if lora_path:
+            model = PeftModel.from_pretrained(model, lora_path, is_trainable=True)
+        else:
+            lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                inference_mode=False,
+                r=lora_rank,
+                lora_alpha=int(lora_rank * lora_alpha_mult),
+                lora_dropout=lora_dropout,
+                bias="none",
+                target_modules=lora_target_modules,
+            )
+            model = get_peft_model(model, lora_config)
 
     if gradient_checkpointing:
         _maybe_enable_gradient_checkpointing(model)
@@ -324,6 +350,21 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--pad-token-id", type=int, default=None)
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--lora-path", type=str, default=None, help="Optional LoRA adapter path.")
+    parser.add_argument("--lora-rank", type=int, default=0, help="LoRA rank (0 disables).")
+    parser.add_argument(
+        "--lora-alpha-mult",
+        type=float,
+        default=2.0,
+        help="Multiplier applied to rank to set lora_alpha (alpha = rank * mult).",
+    )
+    parser.add_argument("--lora-dropout", type=float, default=0.0, help="LoRA dropout probability.")
+    parser.add_argument(
+        "--lora-target-modules",
+        type=str,
+        default="all-linear",
+        help="Modules to target for LoRA (e.g., all-linear).",
+    )
     parser.add_argument("--fsdp", action="store_true")
     parser.add_argument("--fsdp-param-dtype", choices=["bf16", "fp16", "fp32"], default=None)
     parser.add_argument("--fsdp-reduce-dtype", choices=["bf16", "fp16", "fp32"], default="fp32")
@@ -348,6 +389,10 @@ def main() -> None:
         raise ValueError("--steps-per-rollout must be > 0.")
     if args.action_ratio <= 0 or args.action_ratio > 1:
         raise ValueError("--action-ratio must be in (0, 1].")
+    if args.lora_path and args.lora_rank > 0:
+        raise ValueError("Pass either --lora-path or --lora-rank, not both.")
+    if args.lora_rank < 0:
+        raise ValueError("--lora-rank must be >= 0.")
 
     local_rank = args.local_rank
     if local_rank is None:
@@ -375,6 +420,11 @@ def main() -> None:
         fsdp_reduce_dtype=fsdp_reduce_dtype,
         fsdp_per_layer=args.fsdp_per_layer,
         gradient_checkpointing=args.gradient_checkpointing,
+        lora_path=args.lora_path,
+        lora_rank=args.lora_rank,
+        lora_alpha_mult=args.lora_alpha_mult,
+        lora_dropout=args.lora_dropout,
+        lora_target_modules=args.lora_target_modules,
     )
 
     config = getattr(model, "config", None)
