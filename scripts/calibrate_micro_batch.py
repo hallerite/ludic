@@ -13,7 +13,7 @@ from torch import nn
 from torch.distributed import fsdp
 
 from ludic.training.algorithm import make_sft
-from ludic.training.batching.micro_batching import MicroBatch, collate_micro_batches
+from ludic.training.batching.micro_batching import collate_saw_items, split_items_by_token_budget
 from ludic.training.types import SAWBatch, SAWItem
 
 
@@ -55,10 +55,8 @@ def _run_budget_trials(
     scaler: Optional[torch.amp.GradScaler],
 ) -> tuple[List[TrialResult], bool, Optional[TrialResult]]:
     results: List[TrialResult] = []
-    micro_batches = collate_micro_batches(
+    micro_chunks = split_items_by_token_budget(
         saw_batch.items,
-        pad_token_id=pad_token_id,
-        device=device,
         micro_token_budget=budget,
         max_seq_len=max_seq_len,
     )
@@ -74,7 +72,7 @@ def _run_budget_trials(
             max_seq_len=max_seq_len,
             saw_batch=saw_batch,
             use_grad_scaler=use_grad_scaler,
-            micro_batches=micro_batches,
+            micro_chunks=micro_chunks,
             scaler=scaler,
         )
         results.append(last_res)
@@ -91,7 +89,7 @@ def _run_budget_trials(
             max_seq_len=max_seq_len,
             saw_batch=saw_batch,
             use_grad_scaler=use_grad_scaler,
-            micro_batches=micro_batches,
+            micro_chunks=micro_chunks,
             scaler=scaler,
         )
         results.append(last_res)
@@ -272,19 +270,17 @@ def _run_step(
     max_seq_len: int,
     saw_batch: SAWBatch,
     use_grad_scaler: bool,
-    micro_batches: Optional[List[MicroBatch]] = None,
+    micro_chunks: Optional[List[List[SAWItem]]] = None,
     scaler: Optional[torch.amp.GradScaler] = None,
 ) -> TrialResult:
     model.train()
-    if micro_batches is None:
-        micro_batches = collate_micro_batches(
+    if micro_chunks is None:
+        micro_chunks = split_items_by_token_budget(
             saw_batch.items,
-            pad_token_id=pad_token_id,
-            device=device,
             micro_token_budget=micro_token_budget,
             max_seq_len=max_seq_len,
         )
-    total_items = sum(micro.num_items for micro in micro_batches)
+    total_items = sum(len(chunk) for chunk in micro_chunks)
     if total_items == 0:
         raise ValueError("Synthetic batch produced no items.")
 
@@ -296,16 +292,20 @@ def _run_step(
 
     start = time.perf_counter()
     try:
-        for idx, micro in enumerate(micro_batches):
-            is_last = idx == len(micro_batches) - 1
+        for idx, chunk in enumerate(micro_chunks):
+            is_last = idx == len(micro_chunks) - 1
             grad_sync_disabled = False
             if isinstance(model, fsdp.FSDPModule) and not is_last:
                 model.set_requires_gradient_sync(False)
                 grad_sync_disabled = True
             try:
-                batch = micro.tensors
+                batch = collate_saw_items(
+                    chunk,
+                    pad_token_id=pad_token_id,
+                    device=device,
+                )
                 loss, _stats = algo.compute_loss(model, batch)
-                scaled = loss * (micro.num_items / total_items)
+                scaled = loss * (len(chunk) / total_items)
                 if use_grad_scaler:
                     assert scaler is not None
                     scaler.scale(scaled).backward()
@@ -330,7 +330,7 @@ def _run_step(
                 ok=False,
                 elapsed_s=0.0,
                 peak_mem_mb=0.0,
-                micro_batches=len(micro_batches),
+                micro_batches=len(micro_chunks),
                 padded_tokens=micro_token_budget,
                 error=str(exc),
             )
@@ -347,7 +347,7 @@ def _run_step(
         ok=True,
         elapsed_s=elapsed,
         peak_mem_mb=peak_mb,
-        micro_batches=len(micro_batches),
+        micro_batches=len(micro_chunks),
         padded_tokens=micro_token_budget,
     )
 
@@ -369,10 +369,8 @@ def _run_trials(
 ) -> List[TrialResult]:
     results: List[TrialResult] = []
     for budget in budgets:
-        micro_batches = collate_micro_batches(
+        micro_chunks = split_items_by_token_budget(
             saw_batch.items,
-            pad_token_id=pad_token_id,
-            device=device,
             micro_token_budget=budget,
             max_seq_len=max_seq_len,
         )
@@ -387,7 +385,7 @@ def _run_trials(
                 max_seq_len=max_seq_len,
                 saw_batch=saw_batch,
                 use_grad_scaler=use_grad_scaler,
-                micro_batches=micro_batches,
+                micro_chunks=micro_chunks,
                 scaler=scaler,
             )
         for _ in range(steps):
@@ -402,7 +400,7 @@ def _run_trials(
                     max_seq_len=max_seq_len,
                     saw_batch=saw_batch,
                     use_grad_scaler=use_grad_scaler,
-                    micro_batches=micro_batches,
+                    micro_chunks=micro_chunks,
                     scaler=scaler,
                 )
             )

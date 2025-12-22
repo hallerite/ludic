@@ -39,67 +39,62 @@ def collate_saw_items(
 
     lengths = [len(it.input_ids) for it in items]
     max_len = max(lengths)
+    batch_size = len(items)
 
-    input_ids_list: List[Tensor] = []
-    attn_mask_list: List[Tensor] = []
-    action_mask_list: List[Tensor] = []
-    weights_list: List[Tensor] = []
+    input_ids = torch.full(
+        (batch_size, max_len),
+        pad_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+    attention_mask = torch.zeros(
+        (batch_size, max_len),
+        dtype=torch.long,
+        device=device,
+    )
+    action_mask = torch.zeros(
+        (batch_size, max_len),
+        dtype=torch.float32,
+        device=device,
+    )
+    weights = torch.empty((batch_size,), dtype=torch.float32, device=device)
 
-    for it in items:
+    for b, it in enumerate(items):
         L = len(it.input_ids)
-
-        ids = torch.full((max_len,), pad_token_id, dtype=torch.long)
-        am = torch.zeros((max_len,), dtype=torch.long)
-        actm = torch.zeros((max_len,), dtype=torch.float32)
-
-        ids[:L] = torch.tensor(it.input_ids, dtype=torch.long)
-        am[:L] = torch.tensor(it.attention_mask, dtype=torch.long)
-        actm[:L] = torch.tensor(it.action_mask, dtype=torch.float32)
-
-        input_ids_list.append(ids)
-        attn_mask_list.append(am)
-        action_mask_list.append(actm)
-        weights_list.append(torch.tensor(it.weight, dtype=torch.float32))
-
-    # actor_logps is optional; required for ratio objectives (PPO/GRPO).
-    old_logp_action: List[Optional[float]] = []
-    actor_logps_tokens: List[Optional[List[float]]] = []
-    for it in items:
-        actor = it.actor_logps
-        actor_logps_tokens.append(None if actor is None else list(actor.token_logps))
-        old_logp_action.append(None if actor is None else float(sum(float(v) for v in actor.token_logps)))
+        input_ids[b, :L] = torch.as_tensor(it.input_ids, dtype=torch.long, device=device)
+        attention_mask[b, :L] = torch.as_tensor(it.attention_mask, dtype=torch.long, device=device)
+        action_mask[b, :L] = torch.as_tensor(it.action_mask, dtype=torch.float32, device=device)
+        weights[b] = float(it.weight)
 
     batch: Dict[str, Tensor] = {
-        "input_ids": torch.stack(input_ids_list, dim=0).to(device),
-        "attention_mask": torch.stack(attn_mask_list, dim=0).to(device),
-        "action_mask": torch.stack(action_mask_list, dim=0).to(device),
-        "weight": torch.stack(weights_list, dim=0).to(device),
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "action_mask": action_mask,
+        "weight": weights,
     }
 
-    if any(v is not None for v in old_logp_action):
-        if any(v is None for v in old_logp_action):
+    # actor_logps is optional; required for ratio objectives (PPO/GRPO).
+    actors = [it.actor_logps for it in items]
+    if any(actor is not None for actor in actors):
+        if any(actor is None for actor in actors):
             raise ValueError(
                 "Mixed presence of actor_logps; either provide it for all samples or none."
             )
-        assert all(v is not None for v in actor_logps_tokens)
-
-        # Optional token-level actor logps aligned to token positions.
-        # Shape: [B, T], zeros outside action region / padding.
-        actor_logps_batch = torch.zeros((len(items), max_len), dtype=torch.float32, device=device)
-        for b, it in enumerate(items):
-            token_logps = actor_logps_tokens[b]
-            assert token_logps is not None
-            action_positions = [i for i, m in enumerate(it.action_mask) if int(m) == 1]
-            if len(token_logps) != len(action_positions):
+        actor_logps_batch = torch.zeros((batch_size, max_len), dtype=torch.float32, device=device)
+        old_logp_action = torch.empty((batch_size,), dtype=torch.float32, device=device)
+        for b, (it, actor) in enumerate(zip(items, actors)):
+            assert actor is not None
+            token_logps = torch.as_tensor(actor.token_logps, dtype=torch.float32, device=device)
+            positions = torch.nonzero(action_mask[b] > 0.0, as_tuple=False).flatten()
+            if token_logps.numel() != positions.numel():
                 raise ValueError(
                     "Length mismatch between actor_logps and the number of action tokens."
                 )
-            for lp, pos in zip(token_logps, action_positions):
-                actor_logps_batch[b, pos] = float(lp)
+            actor_logps_batch[b, positions] = token_logps
+            old_logp_action[b] = token_logps.sum()
 
         batch["actor_logps"] = actor_logps_batch
-        tensor_vals = [float(v) for v in old_logp_action]  # type: ignore[arg-type]
-        batch["old_logp_action"] = torch.tensor(tensor_vals, dtype=torch.float32, device=device)
+        batch["old_logp_action"] = old_logp_action
     return batch
 
 
@@ -158,7 +153,11 @@ def split_items_by_token_budget(
             f"micro_token_budget ({micro_token_budget}) must be >= max_seq_len ({max_seq_len})."
         )
 
-    processed_items = [_truncate_item(it, max_seq_len) for it in items]
+    max_item_len = max(len(it.input_ids) for it in items)
+    if max_item_len <= max_seq_len:
+        processed_items = items
+    else:
+        processed_items = [_truncate_item(it, max_seq_len) for it in items]
     order = sorted(range(len(processed_items)), key=lambda i: len(processed_items[i].input_ids))
     sorted_items = [processed_items[i] for i in order]
 
