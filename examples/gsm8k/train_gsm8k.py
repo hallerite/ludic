@@ -44,7 +44,7 @@ from ludic.training import (
     EnvSpec,
     ProtocolSpec,
 )
-from ludic.training import Reducer, RichLiveLogger, PrintLogger, TeeLogger, WandbLogger
+from ludic.training import Reducer, RichLiveLogger, PrintLogger, TeeLogger, WandbLogger, default_reducers
 
 
 def load_gsm8k(split: str, limit: int | None) -> List[Dict[str, Any]]:
@@ -71,9 +71,16 @@ def main():
     parser.add_argument("--split", default="train")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--concurrency", type=int, default=64)
-    parser.add_argument("--batch-size", type=int, default=4, help="Rollout requests per batch source call")
+    parser.add_argument(
+        "--rollouts-per-update",
+        type=int,
+        default=8,
+        help="Total rollouts per update (must be divisible by --group-size).",
+    )
     parser.add_argument("--train-steps", type=int, default=20, help="Number of trainer steps; 0 = run until samples are exhausted.")
-    parser.add_argument("--grad-accum-steps", type=int, default=8, help="Gradient accumulation steps.")
+    parser.add_argument("--max-seq-len", type=int, default=1024, help="Max tokens per sample.")
+    parser.add_argument("--micro-token-budget", type=int, default=8192, help="Max padded tokens per micro-batch.")
+    parser.add_argument("--max-completion-tokens", type=int, default=512, help="Max completion tokens per rollout.")
     parser.add_argument("--group-size", type=int, default=8, help="Group size for grouped advantages.")
     parser.add_argument(
         "--system-prompt",
@@ -96,6 +103,12 @@ def main():
     )
     parser.add_argument("--final-save", action="store_true", help="Save a final checkpoint after training completes.")
     args = parser.parse_args()
+    if args.rollouts_per_update <= 0:
+        raise ValueError("--rollouts-per-update must be > 0.")
+    if args.rollouts_per_update % args.group_size != 0:
+        raise ValueError("--rollouts-per-update must be divisible by --group-size.")
+    if args.max_completion_tokens > args.max_seq_len:
+        raise ValueError("--max-completion-tokens must be <= --max-seq-len.")
 
     rollout_log_path = os.path.abspath(args.rollout_log)
     os.makedirs(os.path.dirname(rollout_log_path) or ".", exist_ok=True)
@@ -153,13 +166,17 @@ def main():
         jsonl_path=rollout_log_path,
     )
     train_inference = InferenceSpec(
-        sampling=SamplingParams(temperature=args.train_temperature, max_tokens=512),
+        sampling=SamplingParams(
+            temperature=args.train_temperature,
+            max_tokens=args.max_completion_tokens,
+        ),
         # Ask vLLM for token IDs + chosen-token logprobs so GSPO can use rollout-time behavior logprobs.
         return_=ReturnSpec.for_rl(top_logprobs_k=1),
     )
+    base_requests = args.rollouts_per_update // args.group_size
     requests_fn = make_dataset_queue_requests_fn(
         samples_q,
-        batch_size=args.batch_size,
+        batch_size=base_requests,
         env_kind="gsm8k",
         protocol_kind="single_agent",
         inference=train_inference,
@@ -183,7 +200,8 @@ def main():
     # Trainer
     cfg = TrainerConfig(
         model_device="cuda" if torch.cuda.is_available() else "cpu",
-        grad_accum_steps=args.grad_accum_steps,
+        max_seq_len=args.max_seq_len,
+        micro_token_budget=args.micro_token_budget,
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
         eval_at_start=bool(args.eval_before_start and eval_samples),
@@ -214,12 +232,17 @@ def main():
             source="completion_length",
         ),
     }
+    reducers = {**default_reducers(), **reducers}
 
     logger_keys = [
         "train/loss",
         "train/avg_total_reward",
         "train/correct_rate",
         "train/parse_err_rate",
+        "train/completion_truncated_rate",
+        "train/incomplete_completion_rate",
+        "train/seq_len_truncated_rate",
+        "train/seq_len_retained_frac",
         "train/avg_completion_length",
         "train/total_completion_tokens",
         "eval/accuracy",
@@ -294,7 +317,10 @@ def main():
                         env_seed=idx,
                         sampling_seed=idx,
                         inference=InferenceSpec(
-                            sampling=SamplingParams(temperature=args.eval_temperature, max_tokens=512),
+                            sampling=SamplingParams(
+                                temperature=args.eval_temperature,
+                                max_tokens=args.max_completion_tokens,
+                            ),
                             return_=ReturnSpec.for_eval(return_token_ids=True),
                         ),
                         num_episodes=1,

@@ -208,6 +208,8 @@ class BatchSource(Protocol):
 
     Trainer only depends on this interface and does not care where the
     data comes from (online rollouts, replay buffer, branching search, etc.).
+    The returned SAWBatch is treated as a macro-batch and split into
+    micro-batches for gradient accumulation.
     """
 
     async def next_batch(self) -> SAWBatch:

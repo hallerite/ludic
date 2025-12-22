@@ -1,0 +1,36 @@
+from __future__ import annotations
+
+import pytest
+
+from ludic.training.stats import aggregate_stats
+from ludic.training.types import SAWBatch, SAWItem
+
+
+def _item() -> SAWItem:
+    return SAWItem(
+        input_ids=[1, 2, 3],
+        attention_mask=[1, 1, 1],
+        action_mask=[0, 1, 1],
+        weight=1.0,
+        meta={},
+    )
+
+
+def test_aggregate_stats_weights_micro_batches():
+    micro_stats = [
+        {"loss": 1.0, "logp_mean": -1.0},
+        {"loss": 3.0, "logp_mean": -3.0},
+    ]
+    saw_batches = [
+        SAWBatch(
+            items=[_item(), _item()],
+            meta={"num_rollouts": 2, "avg_total_reward": 0.0, "avg_completion_length": 3.0},
+        )
+    ]
+    out = aggregate_stats(
+        micro_stats,
+        saw_batches,
+        micro_batch_sizes=[1, 3],
+    )
+    assert out["loss"] == pytest.approx(2.5)
+    assert out["logp_mean"] == pytest.approx(-2.5)

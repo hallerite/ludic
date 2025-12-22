@@ -23,6 +23,8 @@ VLLM_PORT = 8000
 VLLM_GROUP_PORT = 51216 
 REDIS_URL = "redis://localhost:6379/0"
 QUEUE_KEY = "ludic_tictactoe_queue"
+MAX_SEQ_LEN = 1024
+MICRO_TOKEN_BUDGET = 8192
 
 logging.basicConfig(level=logging.INFO)
 console = Console()
@@ -95,7 +97,8 @@ def main():
         cfg=TrainerConfig(
             model_device="cuda:0",
             lr=1e-4,
-            grad_accum_steps=1,
+            max_seq_len=MAX_SEQ_LEN,
+            micro_token_budget=MICRO_TOKEN_BUDGET,
             sync_every_steps=1,
             max_lag=2
         )

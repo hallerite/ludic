@@ -27,14 +27,17 @@ In another terminal, run the training script.
 Assuming you run it from the top-level of the repository, we need to add `environments/` into our Python path.
 Example:
 ```bash
-CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/gsm8k/train_gsm8k.py --model Qwen/Qwen2.5-0.5B-Instruct
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/gsm8k/train_gsm8k.py \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --micro-token-budget 16384 \
+  --max-seq-len 1024
 ```
 
 Notes:
 - `PYTHONPATH=.` ensures local imports resolve.
 - Defaults connect to vLLM at `127.0.0.1:8000`; override `--host/--port` if you run it elsewhere.
-- Tweak batch size, concurrency, and limits via flags like `--batch-size`, `--concurrency`, `--limit`, `--train-steps`, `--grad-accum-steps`, `--group-size`, `--eval-every`, `--eval-limit`, `--eval-temperature`, and `--logger`.
-- Tune `--limit`, `--concurrency`, `--train-steps`, and `--grad-accum-steps` to fit your budget/VRAM.
+- Tweak rollouts, concurrency, and limits via flags like `--rollouts-per-update`, `--concurrency`, `--limit`, `--train-steps`, `--micro-token-budget`, `--max-seq-len`, `--group-size`, `--eval-every`, `--eval-limit`, `--eval-temperature`, and `--logger`.
+- Tune `--limit`, `--concurrency`, `--train-steps`, and `--micro-token-budget` to fit your budget/VRAM.
 - Training logs include loss, reward, avg_completion_length, and reducer stats (correct/parse-error rates, token totals).
 - Checkpoints are written to `checkpoints_gsm8k/` by default.
 - Training uses a boxed-answer parser (`boxed_parser`) and a small system prompt (`"First, think step by step. Then put your final answer inside \\boxed{...}."` by default).

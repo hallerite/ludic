@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from ludic.training.loss import ClippedSurrogateLoss, TokenClippedSurrogateLoss
-from ludic.training.trainer import _collate_saw_items
+from ludic.training.batching.micro_batching import collate_saw_items
 from ludic.training.types import SAWItem, SAWBatch, ActorTokenLogps, SampleAttachments
 from ludic.training.algorithm import RLAlgorithm, validate_actor_logps, make_gspo, make_grpo
 from ludic.training.credit_assignment import MonteCarloReturn
@@ -56,7 +56,7 @@ def test_collate_sums_behavior_logprobs():
             attachments=SampleAttachments(actor_logps=ActorTokenLogps(token_logps=[-1.0, -2.0])),
         ),
     ]
-    batch = _collate_saw_items(items, pad_token_id=0, device=torch.device("cpu"))
+    batch = collate_saw_items(items, pad_token_id=0, device=torch.device("cpu"))
     assert "old_logp_action" in batch
     assert "actor_logps" in batch
     expected = torch.tensor([-3.0, -3.0], dtype=torch.float32)
@@ -73,7 +73,7 @@ def test_collate_mixed_actor_logps_raises():
         make_item([0, 2, 1], [0, 1, 1], meta={}),  # missing
     ]
     with pytest.raises(ValueError):
-        _collate_saw_items(items, pad_token_id=0, device=torch.device("cpu"))
+        collate_saw_items(items, pad_token_id=0, device=torch.device("cpu"))
 
 
 def test_ppopreprocess_requires_actor_logps():

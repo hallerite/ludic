@@ -1,6 +1,12 @@
 from .rollout_engine import RolloutEngine
 from .synced_batching import RolloutBatchSource
 from .offline import OfflineBatchSource, make_chat_template_step_to_item
+from .micro_batching import (
+    MicroBatch,
+    collate_saw_items,
+    split_items_by_token_budget,
+    collate_micro_batches,
+)
 try:
     from .pipeline import PipelineBatchSource, run_pipeline_actor
 except ImportError:
@@ -25,6 +31,10 @@ __all__ = [
     "OfflineBatchSource",
     "PipelineBatchSource",
     "run_pipeline_actor",
+    "MicroBatch",
+    "collate_saw_items",
+    "split_items_by_token_budget",
+    "collate_micro_batches",
     "RequestStrategy",
     "IdentityStrategy",
     "GRPORequestStrategy",

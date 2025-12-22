@@ -7,7 +7,7 @@ Small end-to-end RL run that fine-tunes a model with LoRA on a toy Tic-Tac-Toe e
 We provide [`hallerite/Qwen2.5-7B-TTT`](https://huggingface.co/hallerite/Qwen2.5-7B-TTT), a cold-start checkpoint created via:
 
 1. **Rejection sampling**: Used `generate_synth_data.py` to generate episodes with `Qwen/Qwen2.5-7B-Instruct`, filtered to 1124 winning trajectories (see `data/tictactoe_sft_train_data.jsonl`)
-2. **SFT**: Trained for 25 steps with effective batch size 32 (batch_size=4 × grad_accum=2 × world_size=2)
+2. **SFT**: Trained for 25 steps with effective batch size 32 (batch_size per rank × world_size)
 
 This model understands the `<think>...</think><move>...</move>` format and the `[TRUNCATED]` convention used by `TruncatedThinkingContext`.
 
@@ -22,12 +22,14 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. uv run python -m ludic.inference.vllm_server
 ### 2) Train (GPU1)
 ```bash
 CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/tic_tac_toe/train_tic_tac_toe.py \
-  --ctx truncated
+  --ctx truncated \
+  --micro-token-budget 8192 \
+  --max-seq-len 1024
 ```
 - Uses `GRPORequestStrategy` + `GroupNormalizedReturn`, LoRA on the HF model, and a strict `<think>...</think><move>...</move>` parser.
 - Samples 50/50 agent_starts=True/False so the policy practices both as first and second player.
 - Use `--final-save` to force a final checkpoint at the end of training (in addition to periodic saves).
-- Tweak `--group-size`, `--concurrency`, `--train-steps`, `--train-temperature`, `--batch-size`, `--max-steps-per-episode`, and `--grad-accum-steps` as needed.
+- Tweak `--group-size`, `--concurrency`, `--train-steps`, `--train-temperature`, `--rollouts-per-update`, `--max-steps-per-episode`, `--max-seq-len`, and `--micro-token-budget` as needed.
 - Logger options: `--logger rich`, `--logger wandb`, or `--logger rich,wandb` (W&B uses `WANDB_*` env vars).
 
 ### 3) Evaluate (optional)
@@ -85,7 +87,8 @@ PYTHONPATH=. uv run torchrun --nproc_per_node=2 examples/tic_tac_toe/sft_tic_tac
   --data data/tictactoe_sft_train_data.jsonl \
   --epochs 1 \
   --batch-size 4 \
-  --grad-accum 2
+  --micro-token-budget 8192 \
+  --max-seq-len 1024
 ```
 - Uses `OfflineBatchSource` + `make_sft()` (uniform weight NLL)
 - Checkpoints saved to `checkpoints_tictactoe_fsdp2/`

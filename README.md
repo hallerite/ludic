@@ -50,6 +50,12 @@ If you care about truncation semantics (env time limits vs protocol cutoffs vs m
 - `train/step` and `eval/step` are used by loggers to annotate panels and runs.
 - For W&B logging, set `WANDB_PROJECT` to your preferred project name; if unset, it defaults to `Ludic`.
 
+### Training Knobs (Macro vs Micro)
+
+- `rollouts_per_update`: number of rollouts per trainer step (must be divisible by `group_size` for GRPO-style grouping).
+- `max_seq_len`: maximum token length for any single sample; trainer raises if exceeded.
+- `micro_token_budget`: max padded tokens per micro-batch; the collator buckets + splits a macro-batch to fit this budget.
+
 ### Examples at a glance
 
 - Tic-Tac-Toe (`examples/tic_tac_toe/`): a small env that’s useful for iterating on the full stack without paying a huge sampling bill.

@@ -24,7 +24,7 @@ class PipelineBatchSource(BatchSource):
     Pulls completed, pre-processed SAWItems from a Redis queue.
     
     This decouples the Trainer from the generation latency. The Trainer
-    simply blocks on the queue until data arrives.
+    simply blocks on the queue until a macro-batch is assembled.
     """
     def __init__(
         self, 

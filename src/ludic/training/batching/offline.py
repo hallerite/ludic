@@ -231,7 +231,7 @@ class OfflineBatchSource(BatchSource):
         step_to_item: Function that converts (rollout, step, weight) -> SAWItem.
             This is where tokenization and any preprocessing happens.
         credit_assigner: Computes per-step weights.
-        batch_size: Number of SAWItems per batch (per rank in distributed mode).
+        batch_size: Number of SAWItems per macro-batch (per rank in distributed mode).
         shuffle: Whether to shuffle samples each epoch.
         sample_filter: Optional filter to drop samples.
         seed: Random seed for shuffling.

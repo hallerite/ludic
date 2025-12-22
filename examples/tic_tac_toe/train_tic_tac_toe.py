@@ -43,7 +43,7 @@ from ludic.training import (
     GRPORequestStrategy,
     ReinforceLoss,
 )
-from ludic.training import Reducer, RichLiveLogger, PrintLogger, TeeLogger, WandbLogger
+from ludic.training import Reducer, RichLiveLogger, PrintLogger, TeeLogger, WandbLogger, default_reducers
 
 # STRICT: require <think>...</think> then exactly one <move>...</move>.
 # Success reward is set to 0.0 so multiple turns do not gain extra parser reward.
@@ -63,7 +63,7 @@ def make_start_flags(agent_starts_as: str, count: int) -> List[bool]:
 
 def build_requests_fn(
     rng: torch.Generator,
-    batch_size: int,
+    num_requests: int,
     inference: InferenceSpec,
     agent_starts_as: str,
 ):
@@ -79,10 +79,10 @@ def build_requests_fn(
 
     def _fn() -> List[RolloutRequest]:
         reqs: List[RolloutRequest] = []
-        if agent_starts_as == "mixed" and batch_size == 1:
+        if agent_starts_as == "mixed" and num_requests == 1:
             start_flags = [_next_mixed_start()]
         else:
-            start_flags = make_start_flags(agent_starts_as, batch_size)
+            start_flags = make_start_flags(agent_starts_as, num_requests)
         perm = torch.randperm(len(start_flags), generator=rng).tolist()
         for idx in perm:
             agent_starts = bool(start_flags[idx])
@@ -110,7 +110,12 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--seed", type=int, default=0, help="Base RNG seed for sampling episode seeds.")
     parser.add_argument("--concurrency", type=int, default=64)
-    parser.add_argument("--batch-size", type=int, default=1, help="Rollout requests per batch source call.")
+    parser.add_argument(
+        "--rollouts-per-update",
+        type=int,
+        default=8,
+        help="Total rollouts per update (must be divisible by --group-size).",
+    )
     parser.add_argument("--train-steps", type=int, default=30, help="Number of trainer steps.")
     parser.add_argument("--max-steps-per-episode", type=int, default=5)
     parser.add_argument("--group-size", type=int, default=8, help="Group size for grouped advantages (GRPO-style).")
@@ -138,7 +143,9 @@ def main():
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_tictactoe", help="Checkpoint output directory.")
     parser.add_argument("--checkpoint-every", type=int, default=10, help="Checkpoint every N steps (0 to disable).")
     parser.add_argument("--max-to-keep", type=int, default=2, help="Max checkpoints to keep.")
-    parser.add_argument("--grad-accum-steps", type=int, default=6, help="Gradient accumulation steps.")
+    parser.add_argument("--max-seq-len", type=int, default=1024, help="Max tokens per sample.")
+    parser.add_argument("--micro-token-budget", type=int, default=8192, help="Max padded tokens per micro-batch.")
+    parser.add_argument("--max-completion-tokens", type=int, default=512, help="Max completion tokens per rollout.")
     parser.add_argument("--ctx", choices=["full", "truncated"], default="full",
                         help="Context strategy: 'full' (FullDialog) or 'truncated' (TruncatedThinkingContext)")
     parser.add_argument("--final-save", action="store_true", help="Save a final checkpoint after training completes.")
@@ -151,6 +158,12 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.rollouts_per_update <= 0:
+        raise ValueError("--rollouts-per-update must be > 0.")
+    if args.rollouts_per_update % args.group_size != 0:
+        raise ValueError("--rollouts-per-update must be divisible by --group-size.")
+    if args.max_completion_tokens > args.max_seq_len:
+        raise ValueError("--max-completion-tokens must be <= --max-seq-len.")
 
     rollout_log_path = os.path.abspath(args.rollout_log)
     os.makedirs(os.path.dirname(rollout_log_path) or ".", exist_ok=True)
@@ -233,10 +246,14 @@ def main():
         jsonl_path=rollout_log_path,
     )
     train_inference = InferenceSpec(
-        sampling=SamplingParams(temperature=args.train_temperature, max_tokens=250),
+        sampling=SamplingParams(
+            temperature=args.train_temperature,
+            max_tokens=args.max_completion_tokens,
+        ),
         return_=ReturnSpec.for_eval(return_token_ids=True),
     )
-    base_requests_fn = build_requests_fn(rng, args.batch_size, train_inference, args.agent_starts_as)
+    base_requests = args.rollouts_per_update // args.group_size
+    base_requests_fn = build_requests_fn(rng, base_requests, train_inference, args.agent_starts_as)
     # Expand each logical request into a group with shared env seed and diverse sampling seeds.
     def requests_fn() -> List[RolloutRequest]:
         return GRPORequestStrategy(group_size=args.group_size).expand(base_requests_fn())
@@ -251,7 +268,8 @@ def main():
     # Trainer
     cfg = TrainerConfig(
         model_device="cuda" if torch.cuda.is_available() else "cpu",
-        grad_accum_steps=args.grad_accum_steps,
+        max_seq_len=args.max_seq_len,
+        micro_token_budget=args.micro_token_budget,
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
         lr=5e-5,
@@ -325,6 +343,7 @@ def main():
             source="completion_length",
         ),
     }
+    reducers = {**default_reducers(), **reducers}
 
     logger_keys = [
         "train/loss",
@@ -336,6 +355,10 @@ def main():
         "train/illegal_rate",
         "train/parse_error_rate",
         "train/truncated_rate",
+        "train/completion_truncated_rate",
+        "train/incomplete_completion_rate",
+        "train/seq_len_truncated_rate",
+        "train/seq_len_retained_frac",
         "train/avg_prompt_length",
         "train/avg_completion_length",
         "train/total_completion_tokens",
@@ -414,7 +437,10 @@ def main():
                 env_seed=int(seed),
                 sampling_seed=int(seed),
                 inference=InferenceSpec(
-                    sampling=SamplingParams(temperature=args.eval_temperature, max_tokens=250),
+                sampling=SamplingParams(
+                    temperature=args.eval_temperature,
+                    max_tokens=args.max_completion_tokens,
+                ),
                     return_=ReturnSpec.for_eval(return_token_ids=True),
                 ),
                 meta={"eval_seed": seed, "agent_starts": agent_starts},
