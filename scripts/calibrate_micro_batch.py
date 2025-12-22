@@ -619,20 +619,20 @@ def main() -> None:
                 high = first_oom_budget
                 while high - low > 1:
                     mid = (low + high) // 2
-                budget_results, ok, last_res = _run_budget_trials(
-                    budget=mid,
-                    model=model,
-                    optimizer=optimizer,
-                    algo=algo,
-                    device=device,
-                    pad_token_id=pad_token_id,
-                    max_seq_len=args.max_seq_len,
-                    saw_batch=saw_batch,
-                    warmup_steps=args.warmup_steps,
-                    steps=args.steps,
-                    use_grad_scaler=use_grad_scaler,
-                    scaler=scaler,
-                )
+                    budget_results, ok, last_res = _run_budget_trials(
+                        budget=mid,
+                        model=model,
+                        optimizer=optimizer,
+                        algo=algo,
+                        device=device,
+                        pad_token_id=pad_token_id,
+                        max_seq_len=args.max_seq_len,
+                        saw_batch=saw_batch,
+                        warmup_steps=args.warmup_steps,
+                        steps=args.steps,
+                        use_grad_scaler=use_grad_scaler,
+                        scaler=scaler,
+                    )
                     results.extend(budget_results)
                     if ok:
                         low = mid
