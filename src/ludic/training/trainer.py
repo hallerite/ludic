@@ -615,7 +615,7 @@ class Trainer:
             all_micro_stats,
             all_saw_batches,
             reducers=self.reducers,
-            micro_batch_sizes=[micro.num_items for micro in micro_batches],
+            micro_batch_sizes=[len(chunk) for chunk in micro_chunks],
         )
         if grad_norm is not None:
             final_stats["grad_norm"] = float(grad_norm)
