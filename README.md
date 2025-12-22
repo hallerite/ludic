@@ -40,7 +40,7 @@ If you want to find your way around quickly, there are two main things in here: 
 - `environments/`: small runnable environments and configs you can import from, or execute directly when you just want to play with an env in isolation.
 - `data/`: small datasets and artifacts used by some examples.
 - `tests/`: unit/integration tests (pytest markers include `integration` and `gpu`).
-- `scripts/`: standalone utilities (for instance `push_to_hub.py` for uploading checkpoints to the HuggingFace Hub).
+- `scripts/`: standalone utilities (e.g., `calibrate_micro_batch.py` for micro-batch sizing; see `scripts/README.md`).
 
 If you care about truncation semantics (env time limits vs protocol cutoffs vs model finish reasons), read `CONSIDERATIONS.md`.
 
