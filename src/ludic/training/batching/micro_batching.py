@@ -121,6 +121,9 @@ def _truncate_item(item: SAWItem, max_seq_len: int) -> SAWItem:
     meta["seq_len_original"] = length
     meta["seq_len_retained"] = len(input_ids)
     meta["seq_len_retained_frac"] = float(len(input_ids)) / float(length) if length > 0 else 1.0
+    meta["truncated"] = True
+    if meta.get("truncation_reason") is None:
+        meta["truncation_reason"] = "max_seq_len"
     if "completion_length" in meta:
         meta["completion_length"] = action_tokens
     if "prompt_length" in meta:

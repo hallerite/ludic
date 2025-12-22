@@ -16,7 +16,7 @@ def keep_all(item: SAWItem) -> bool:
 
 
 def drop_truncated(item: SAWItem) -> bool:
-    """Drop samples from truncated steps (keep non-truncated)."""
+    """Drop samples marked truncated (env/protocol or seq-len truncation)."""
     return not item.meta.get("truncated", False)
 
 

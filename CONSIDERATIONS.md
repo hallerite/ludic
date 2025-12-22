@@ -46,13 +46,14 @@ There are multiple "things that look like truncation" in the system. For correct
   - `Step.info["incomplete_completion"] = True` is set (and `finish_reason` is preserved in `Step.info`)
   - the raw truncated assistant message is still appended to the agent context, and the agent also receives the synthetic feedback observation for the next turn
 - **Training sees truncation:** `RolloutEngine.generate_batch()` now propagates `Step.truncated` and `Step.terminated` into `SAWItem.meta`, along with `episode_truncated` and `truncation_reason` from `Rollout.meta`.
+- **Training-time sequence truncation:** micro-batching caps sequences at `max_seq_len`, sets `seq_len_truncated`/`seq_len_*`, and marks `SAWItem.meta["truncated"]=True` with `truncation_reason="max_seq_len"` when no episode-level reason is present.
 
 ### Definitions
 
 Three concepts are kept separate:
 
 - `terminated`: the environment reached a true terminal state (success/failure terminal).
-- `truncated`: the environment (or protocol) ended an episode due to a time limit / external cutoff (not necessarily terminal in the MDP sense).
+- `truncated`: the environment (or protocol) ended an episode due to a time limit / external cutoff (not necessarily terminal in the MDP sense). In training metadata, this can also be set when sequences are capped at `max_seq_len` (see `seq_len_truncated`).
   - `truncation_reason = "max_steps"`: protocol time limit hit
   - `truncation_reason = "env"`: environment-initiated truncation
 - `llm_finish_reason`: the model stopped generating for some reason (`stop`, `length`, `tool_calls`, etc.).

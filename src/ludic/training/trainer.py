@@ -511,7 +511,10 @@ class Trainer:
             micro_token_budget=micro_token_budget,
             max_seq_len=max_seq_len,
         )
-        total_items = sum(len(chunk) for chunk in micro_chunks)
+        # Use the post-truncation items for stats aggregation.
+        processed_items = [item for chunk in micro_chunks for item in chunk]
+        saw_batch.items = processed_items
+        total_items = len(processed_items)
         if total_items == 0:
             raise ValueError("Macro-batch contains no items after preprocessing.")
 
