@@ -13,7 +13,7 @@ from torch import nn
 from torch.distributed import fsdp
 
 from ludic.training.algorithm import make_sft
-from ludic.training.batching.micro_batching import collate_micro_batches, split_items_by_token_budget
+from ludic.training.batching.micro_batching import collate_micro_batches
 from ludic.training.types import SAWBatch, SAWItem
 
 
@@ -39,32 +39,53 @@ def _parse_token_budgets(arg: Optional[str]) -> List[int]:
     return out
 
 
-def _auto_token_budgets(
-    items: List[SAWItem],
+def _run_budget_trials(
     *,
+    budget: int,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    algo,
+    device: torch.device,
+    pad_token_id: int,
     max_seq_len: int,
-) -> List[int]:
-    if not items:
-        return [max_seq_len]
-    max_budget = max_seq_len * len(items)
-    budgets: List[int] = []
-    budget = max_seq_len
-    while budget <= max_budget:
-        budgets.append(budget)
-        micro_batches = split_items_by_token_budget(
-            items,
+    saw_batch: SAWBatch,
+    warmup_steps: int,
+    steps: int,
+    use_grad_scaler: bool,
+) -> tuple[List[TrialResult], bool, Optional[TrialResult]]:
+    results: List[TrialResult] = []
+    last_res: Optional[TrialResult] = None
+    for _ in range(warmup_steps):
+        last_res = _run_step(
+            model=model,
+            optimizer=optimizer,
+            algo=algo,
+            device=device,
+            pad_token_id=pad_token_id,
             micro_token_budget=budget,
             max_seq_len=max_seq_len,
+            saw_batch=saw_batch,
+            use_grad_scaler=use_grad_scaler,
         )
-        if len(micro_batches) <= 1:
-            break
-        next_budget = budget * 2
-        if next_budget == budget:
-            break
-        budget = min(next_budget, max_budget)
-        if budget == budgets[-1]:
-            break
-    return budgets
+        results.append(last_res)
+        if not last_res.ok:
+            return results, False, last_res
+    for _ in range(steps):
+        last_res = _run_step(
+            model=model,
+            optimizer=optimizer,
+            algo=algo,
+            device=device,
+            pad_token_id=pad_token_id,
+            micro_token_budget=budget,
+            max_seq_len=max_seq_len,
+            saw_batch=saw_batch,
+            use_grad_scaler=use_grad_scaler,
+        )
+        results.append(last_res)
+        if not last_res.ok:
+            return results, False, last_res
+    return results, True, last_res
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -382,7 +403,10 @@ def main() -> None:
         "--auto-token-budget",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Auto-sweep micro-token budgets (starts at max_seq_len, doubles each step).",
+        help=(
+            "Auto-sweep micro-token budgets (starts at max_seq_len, doubles each step, "
+            "then binary-searches the last OK/first OOM range)."
+        ),
     )
     parser.add_argument("--lora-path", type=str, default=None, help="Optional LoRA adapter path.")
     parser.add_argument("--lora-rank", type=int, default=0, help="LoRA rank (0 disables).")
@@ -498,50 +522,84 @@ def main() -> None:
         budgets = [args.micro_token_budget]
     elif args.auto_token_budget:
         auto_mode = True
-        budgets = _auto_token_budgets(saw_batch.items, max_seq_len=args.max_seq_len)
+        budgets = []
     else:
         raise ValueError("Pass --micro-token-budget, --token-budgets, or enable --auto-token-budget.")
 
     if auto_mode:
-        results: List[TrialResult] = []
-        for budget in budgets:
-            ok = True
-            for _ in range(args.warmup_steps):
-                res = _run_step(
+        results = []
+        min_ok_pow2 = None
+        max_ok = None
+        first_oom_budget = None
+        oom_error = None
+
+        max_budget = args.max_seq_len * len(saw_batch.items)
+        budget = args.max_seq_len
+        last_ok_budget = None
+
+        while budget <= max_budget:
+            budget_results, ok, last_res = _run_budget_trials(
+                budget=budget,
+                model=model,
+                optimizer=optimizer,
+                algo=algo,
+                device=device,
+                pad_token_id=pad_token_id,
+                max_seq_len=args.max_seq_len,
+                saw_batch=saw_batch,
+                warmup_steps=args.warmup_steps,
+                steps=args.steps,
+                use_grad_scaler=use_grad_scaler,
+            )
+            results.extend(budget_results)
+            if ok:
+                if min_ok_pow2 is None:
+                    min_ok_pow2 = budget
+                last_ok_budget = budget
+                if budget >= max_budget:
+                    max_ok = budget
+                    break
+                next_budget = min(budget * 2, max_budget)
+                if next_budget == budget:
+                    max_ok = budget
+                    break
+                budget = next_budget
+                continue
+
+            first_oom_budget = budget
+            if last_res is not None:
+                oom_error = last_res.error
+            break
+
+        if last_ok_budget is not None and first_oom_budget is not None:
+            low = last_ok_budget
+            high = first_oom_budget
+            while high - low > 1:
+                mid = (low + high) // 2
+                budget_results, ok, last_res = _run_budget_trials(
+                    budget=mid,
                     model=model,
                     optimizer=optimizer,
                     algo=algo,
                     device=device,
                     pad_token_id=pad_token_id,
-                    micro_token_budget=budget,
                     max_seq_len=args.max_seq_len,
                     saw_batch=saw_batch,
+                    warmup_steps=args.warmup_steps,
+                    steps=args.steps,
                     use_grad_scaler=use_grad_scaler,
                 )
-                results.append(res)
-                if not res.ok:
-                    ok = False
-                    break
-            if not ok:
-                break
-            for _ in range(args.steps):
-                res = _run_step(
-                    model=model,
-                    optimizer=optimizer,
-                    algo=algo,
-                    device=device,
-                    pad_token_id=pad_token_id,
-                    micro_token_budget=budget,
-                    max_seq_len=args.max_seq_len,
-                    saw_batch=saw_batch,
-                    use_grad_scaler=use_grad_scaler,
-                )
-                results.append(res)
-                if not res.ok:
-                    ok = False
-                    break
-            if not ok:
-                break
+                results.extend(budget_results)
+                if ok:
+                    low = mid
+                else:
+                    high = mid
+                    if oom_error is None and last_res is not None:
+                        oom_error = last_res.error
+            max_ok = low
+        elif last_ok_budget is not None and max_ok is None:
+            max_ok = last_ok_budget
+
     else:
         results = _run_trials(
             budgets,
@@ -569,9 +627,14 @@ def main() -> None:
                 msg += f" error={res.error}"
             print(msg)
         if auto_mode:
-            ok_budgets = [r.padded_tokens for r in results if r.ok]
-            if ok_budgets:
-                print(f"max_micro_token_budget_ok={max(ok_budgets)}")
+            if min_ok_pow2 is not None:
+                print(f"min_micro_token_budget_ok_pow2={min_ok_pow2}")
+            if max_ok is not None:
+                print(f"max_micro_token_budget_ok={max_ok}")
+            if first_oom_budget is not None:
+                print(f"oom_micro_token_budget={first_oom_budget}")
+            if oom_error:
+                print(f"oom_error={oom_error}")
 
     if args.fsdp and dist.is_initialized():
         dist.barrier()
