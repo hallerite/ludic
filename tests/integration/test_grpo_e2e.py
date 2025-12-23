@@ -139,7 +139,7 @@ async def test_grpo_e2e_seed_grouping_and_credit() -> None:
 
     saw_batch = await batch_source.next_batch()
 
-    assert saw_batch.meta["num_rollouts"] == len(seed_groups) * group_size
+    assert saw_batch.meta["target_rollouts"] == len(seed_groups) * group_size
     rollouts: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for item in saw_batch.items:
         meta = item.meta

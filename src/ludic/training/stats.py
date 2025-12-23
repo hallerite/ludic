@@ -20,7 +20,7 @@ class Reducer:
               or a callable that accepts SAWItem and returns a value.
     - transform: optional post-processing of the raw value (e.g., lambda v: v == "win").
     - normalize_by: None | "samples" | "rollouts" — override denominator to
-      normalize by total samples or total rollouts.
+      normalize by total samples or total target rollouts.
     - as_percent: if True, callers may display this metric as a percentage.
     """
 
@@ -82,7 +82,8 @@ def aggregate_stats(
 
     Core outputs (always present):
         - num_samples: total SAWItems across batches
-        - num_rollouts: total agent trajectories across batches
+        - target_rollouts: total agent trajectories across batches
+        - effective_rollouts: rollouts with at least one post-preprocess item
         - avg_total_reward: item-weighted average of batch.meta["avg_total_reward"]
         - avg_completion_length: item-weighted average of batch.meta["avg_completion_length"]
     Plus any keys produced by `reducers`.
@@ -98,7 +99,8 @@ def aggregate_stats(
     sum_counts: Dict[str, int] = {}
     sum_keys = {
         "num_samples",
-        "num_rollouts",
+        "target_rollouts",
+        "effective_rollouts",
         "total_completion_tokens",
     }
     weights: Optional[List[float]] = None
@@ -140,7 +142,8 @@ def aggregate_stats(
 
     # 2) Batch metadata stats
     total_samples = 0.0
-    total_rollouts = 0.0
+    total_target_rollouts = 0.0
+    total_effective_rollouts = 0.0
     total_reward_sum = 0.0
     total_completion_len = 0.0
 
@@ -150,10 +153,14 @@ def aggregate_stats(
 
         # Each batch has N rollouts (agent trajectories)
         batch_rollouts = float(
-            batch.meta.get("num_rollouts")
+            batch.meta.get("target_rollouts")
             or batch.meta.get("batch_size", 0.0)  # fallback for older producers
         )
-        total_rollouts += batch_rollouts
+        total_target_rollouts += batch_rollouts
+        effective_rollouts = batch.meta.get("effective_rollouts")
+        if effective_rollouts is None:
+            effective_rollouts = batch_rollouts
+        total_effective_rollouts += float(effective_rollouts)
 
         # Weighted reward average
         avg_reward = float(batch.meta.get("avg_total_reward", 0.0))
@@ -164,7 +171,8 @@ def aggregate_stats(
         total_completion_len += avg_completion_len * num_items
 
     agg_stats["num_samples"] = total_samples
-    agg_stats["num_rollouts"] = total_rollouts
+    agg_stats["target_rollouts"] = total_target_rollouts
+    agg_stats["effective_rollouts"] = total_effective_rollouts
 
     if total_samples > 0:
         agg_stats["avg_total_reward"] = total_reward_sum / total_samples
@@ -200,7 +208,7 @@ def aggregate_stats(
             if reducer.normalize_by == "samples":
                 denom = total_samples
             elif reducer.normalize_by == "rollouts":
-                denom = total_rollouts
+                denom = total_target_rollouts
             else:
                 denom = None
 

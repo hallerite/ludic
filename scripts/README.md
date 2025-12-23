@@ -22,7 +22,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. uv run python scripts/calibrate_micro_batch.
   --model /path/to/model \
   --dtype bf16 \
   --max-seq-len 1024 \
-  --num-rollouts 64 \
+  --target-rollouts 64 \
   --gradient-checkpointing
 ```
 
@@ -41,7 +41,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. uv run python scripts/calibrate_micro_batch.
   --model /path/to/model \
   --dtype bf16 \
   --max-seq-len 1024 \
-  --num-rollouts 64 \
+  --target-rollouts 64 \
   --token-budgets 8192,12288,16384,24576
 ```
 
@@ -52,7 +52,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. uv run python scripts/calibrate_micro_batch.
   --model /path/to/model \
   --dtype bf16 \
   --max-seq-len 1024 \
-  --num-rollouts 64 \
+  --target-rollouts 64 \
   --micro-token-budget 12288
 ```
 
@@ -68,7 +68,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. uv run python scripts/calibrate_micro_batch.
   --lora-path /path/to/adapter_dir \
   --dtype bf16 \
   --max-seq-len 1024 \
-  --num-rollouts 64
+  --target-rollouts 64
 ```
 
 Create a LoRA adapter on the fly:
@@ -82,7 +82,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. uv run python scripts/calibrate_micro_batch.
   --lora-target-modules all-linear \
   --dtype bf16 \
   --max-seq-len 1024 \
-  --num-rollouts 64
+  --target-rollouts 64
 ```
 
 Notes:
@@ -98,6 +98,6 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. torchrun --nproc_per_node=1 scripts/calibrat
   --model /path/to/model \
   --dtype bf16 \
   --max-seq-len 1024 \
-  --num-rollouts 64 \
+  --target-rollouts 64 \
   --fsdp
 ```

@@ -112,6 +112,29 @@ def validate_actor_logps(
     return saw_batch
 
 
+def drop_zero_weight_samples(
+    saw_batch: SAWBatch,
+    *,
+    eps: float = 1e-4,
+) -> SAWBatch:
+    """
+    Drop samples with near-zero credit weight before collation.
+    """
+    if eps < 0:
+        raise ValueError("eps must be >= 0.")
+    items = [it for it in saw_batch.items if abs(float(it.weight)) > eps]
+    saw_batch.items = items
+    return saw_batch
+
+
+def compose_preprocess(*fns: PreprocessFn) -> PreprocessFn:
+    def _composed(batch: SAWBatch) -> SAWBatch:
+        for fn in fns:
+            batch = fn(batch)
+        return batch
+    return _composed
+
+
 # ---------------------------------------------------------------------------
 # Presets: REINFORCE and REINFORCE+baseline
 # ---------------------------------------------------------------------------
@@ -120,6 +143,8 @@ def validate_actor_logps(
 def make_reinforce(
     *,
     gamma: float = 1.0,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
     name: str = "reinforce",
 ) -> RLAlgorithm:
     """
@@ -132,14 +157,21 @@ def make_reinforce(
     The orchestrator will use this algorithm's `credit_assigner` (MonteCarloReturn)
     to compute G_t per step, store it in SAWItem.weight, and collate that
     into `batch["weight"]` for the loss.
+
+    Set drop_zero_weight=True to drop zero-advantage samples before collation.
     """
     credit_assigner: CreditAssigner = MonteCarloReturn(gamma=gamma)
     loss: Loss = ReinforceLoss()
+
+    preprocess = None
+    if drop_zero_weight:
+        preprocess = lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps)
 
     return RLAlgorithm(
         name=name,
         credit_assigner=credit_assigner,
         loss=loss,
+        preprocess=preprocess,
     )
 
 
@@ -148,6 +180,8 @@ def make_reinforce_baseline(
     gamma: float = 1.0,
     name: str = "reinforce_baseline",
     normalize_adv: bool = False,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
 ) -> RLAlgorithm:
     """
     REINFORCE with batch-mean baseline:
@@ -163,16 +197,23 @@ def make_reinforce_baseline(
 
     If `normalize_adv=True`, A_t is additionally normalized to zero mean /
     unit variance within the batch before being used in the loss.
+
+    Set drop_zero_weight=True to drop zero-advantage samples before collation.
     """
     credit_assigner: CreditAssigner = MonteCarloReturn(gamma=gamma)
     loss: Loss = ReinforceBaselineLoss(
         normalize=normalize_adv,
     )
 
+    preprocess = None
+    if drop_zero_weight:
+        preprocess = lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps)
+
     return RLAlgorithm(
         name=name,
         credit_assigner=credit_assigner,
         loss=loss,
+        preprocess=preprocess,
     )
 
 
@@ -185,6 +226,8 @@ def make_grpo(
     clip_eps_high: float = 0.27,
     length_normalize: bool = False,
     ratio_clip: Optional[float] = None,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
     name: str = "grpo",
 ) -> RLAlgorithm:
     """
@@ -210,6 +253,8 @@ def make_grpo(
     Note: For the clipped ratio objective, we need behavior-policy logprobs.
     This preset installs a preprocessor that validates
     `item.actor_logps` is present.
+
+    drop_zero_weight defaults to True to skip zero-advantage samples.
     """
     credit_assigner: CreditAssigner = GroupNormalizedReturn(
         group_size=group_size,
@@ -222,7 +267,11 @@ def make_grpo(
         length_normalize=length_normalize,
         ratio_clip=ratio_clip,
     )
-    preprocess = validate_actor_logps
+    preprocess_fns = []
+    if drop_zero_weight:
+        preprocess_fns.append(lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps))
+    preprocess_fns.append(validate_actor_logps)
+    preprocess = compose_preprocess(*preprocess_fns)
 
     return RLAlgorithm(
         name=name,
@@ -241,6 +290,8 @@ def make_gspo(
     clip_eps_high: float = 4e-4,
     length_normalize: bool = True,
     ratio_clip: Optional[float] = None,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
     name: str = "gspo",
 ) -> RLAlgorithm:
     """
@@ -249,6 +300,8 @@ def make_gspo(
     This mirrors GRPO's group-normalized advantages but uses a sequence-level
     importance ratio. With length_normalize=True, this matches the geometric
     mean ratio used in the GSPO paper (https://arxiv.org/abs/2507.18071).
+
+    drop_zero_weight defaults to True to skip zero-advantage samples.
     """
     credit_assigner: CreditAssigner = GroupNormalizedReturn(
         group_size=group_size,
@@ -261,7 +314,11 @@ def make_gspo(
         length_normalize=length_normalize,
         ratio_clip=ratio_clip,
     )
-    preprocess = validate_actor_logps
+    preprocess_fns = []
+    if drop_zero_weight:
+        preprocess_fns.append(lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps))
+    preprocess_fns.append(validate_actor_logps)
+    preprocess = compose_preprocess(*preprocess_fns)
 
     return RLAlgorithm(
         name=name,
