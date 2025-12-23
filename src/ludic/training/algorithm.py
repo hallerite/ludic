@@ -226,7 +226,7 @@ def make_grpo(
     clip_eps_high: float = 0.27,
     length_normalize: bool = False,
     ratio_clip: Optional[float] = None,
-    drop_zero_weight: bool = True,
+    drop_zero_weight: bool = False,
     drop_zero_weight_eps: float = 1e-4,
     name: str = "grpo",
 ) -> RLAlgorithm:
@@ -290,7 +290,7 @@ def make_gspo(
     clip_eps_high: float = 4e-4,
     length_normalize: bool = True,
     ratio_clip: Optional[float] = None,
-    drop_zero_weight: bool = True,
+    drop_zero_weight: bool = False,
     drop_zero_weight_eps: float = 1e-4,
     name: str = "gspo",
 ) -> RLAlgorithm:
