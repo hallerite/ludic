@@ -271,7 +271,8 @@ class Trainer:
         world_size = dist.get_world_size()
         sum_keys = {
             "num_samples",
-            "num_rollouts",
+            "target_rollouts",
+            "effective_rollouts",
             "total_completion_tokens",
         }
         has_num_samples = "num_samples" in stats
@@ -500,6 +501,16 @@ class Trainer:
             # If the batch is empty (e.g. all stale), drop it and fetch another.
             if not saw_batch.items:
                 continue
+
+            rollout_ids = {
+                item.meta.get("rollout_id")
+                for item in saw_batch.items
+                if item.meta.get("rollout_id") is not None
+            }
+            if rollout_ids:
+                saw_batch.meta["effective_rollouts"] = len(rollout_ids)
+            else:
+                saw_batch.meta["effective_rollouts"] = len(saw_batch.items)
 
             # Batch has valid items, proceed to collation
             break

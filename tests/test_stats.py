@@ -24,7 +24,7 @@ def test_aggregate_stats_weights_micro_batches():
     saw_batches = [
         SAWBatch(
             items=[_item(), _item()],
-            meta={"num_rollouts": 2, "avg_total_reward": 0.0, "avg_completion_length": 3.0},
+            meta={"target_rollouts": 2, "avg_total_reward": 0.0, "avg_completion_length": 3.0},
         )
     ]
     out = aggregate_stats(
@@ -34,3 +34,16 @@ def test_aggregate_stats_weights_micro_batches():
     )
     assert out["loss"] == pytest.approx(2.5)
     assert out["logp_mean"] == pytest.approx(-2.5)
+
+
+def test_aggregate_stats_uses_effective_rollouts_when_present():
+    micro_stats = [{"loss": 1.0}]
+    saw_batches = [
+        SAWBatch(
+            items=[_item(), _item()],
+            meta={"target_rollouts": 3, "effective_rollouts": 1},
+        )
+    ]
+    out = aggregate_stats(micro_stats, saw_batches)
+    assert out["target_rollouts"] == pytest.approx(3.0)
+    assert out["effective_rollouts"] == pytest.approx(1.0)

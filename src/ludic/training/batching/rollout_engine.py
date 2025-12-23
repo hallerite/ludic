@@ -482,9 +482,9 @@ class RolloutEngine:
         completion_lengths: List[int] = [comp_len for (_item, _p, comp_len) in items_with_lengths]
 
         # ---- Build batch-level metadata -----------------------------------
-        # Note: num_rollouts reflects total number of *agent trajectories*, not global env episodes.
+        # Note: target_rollouts reflects total number of *agent trajectories*, not global env episodes.
         meta = {
-            "num_rollouts": len(rollouts),
+            "target_rollouts": len(rollouts),
             "num_samples_before_filter": num_before_filter,
             "num_samples": num_after_filter,
             "num_samples_filtered": num_filtered,

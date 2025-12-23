@@ -368,7 +368,7 @@ def main():
         "eval/parse_error_rate",
         "eval/truncated_rate",
         "eval/avg_completion_tokens",
-        "train/num_rollouts",
+        "train/target_rollouts",
         "train/num_samples",
     ]
 

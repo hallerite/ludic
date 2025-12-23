@@ -410,7 +410,7 @@ def main() -> None:
             "eval/accuracy",
             "eval/parse_error_rate",
             "eval/avg_completion_tokens",
-            "train/num_rollouts",
+            "train/target_rollouts",
             "train/num_samples",
         ]
         console_logger = None

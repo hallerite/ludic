@@ -210,7 +210,7 @@ def _load_model(
 
 def _build_batch(
     *,
-    num_rollouts: int,
+    target_rollouts: int,
     steps_per_rollout: int,
     seq_len: int,
     min_seq_len: int,
@@ -222,7 +222,7 @@ def _build_batch(
     g.manual_seed(seed)
 
     items: List[SAWItem] = []
-    for rollout_idx in range(num_rollouts):
+    for rollout_idx in range(target_rollouts):
         for step_idx in range(steps_per_rollout):
             if min_seq_len >= seq_len:
                 length = seq_len
@@ -251,7 +251,7 @@ def _build_batch(
     avg_completion = sum(it.meta["completion_length"] for it in items) / len(items)
     avg_prompt = sum(it.meta["prompt_length"] for it in items) / len(items)
     meta = {
-        "num_rollouts": num_rollouts,
+        "target_rollouts": target_rollouts,
         "num_samples": len(items),
         "avg_completion_length": avg_completion,
         "avg_prompt_length": avg_prompt,
@@ -418,7 +418,7 @@ def main() -> None:
     parser.add_argument("--micro-token-budget", type=int, default=None, help="Max padded tokens per micro-batch.")
     parser.add_argument("--token-budgets", type=str, default=None, help="Comma-separated token budgets.")
     parser.add_argument("--min-seq-len", type=int, default=None, help="Min tokens per sample.")
-    parser.add_argument("--num-rollouts", type=int, default=8, help="Rollouts per synthetic batch.")
+    parser.add_argument("--target-rollouts", type=int, default=8, help="Target rollouts per synthetic batch.")
     parser.add_argument("--steps-per-rollout", type=int, default=1)
     parser.add_argument("--action-ratio", type=float, default=0.5, help="Fraction of action tokens.")
     parser.add_argument("--seed", type=int, default=0)
@@ -465,8 +465,8 @@ def main() -> None:
 
     token_budgets = _parse_token_budgets(args.token_budgets)
 
-    if args.num_rollouts <= 0:
-        raise ValueError("--num-rollouts must be > 0.")
+    if args.target_rollouts <= 0:
+        raise ValueError("--target-rollouts must be > 0.")
     if args.steps_per_rollout <= 0:
         raise ValueError("--steps-per-rollout must be > 0.")
     if args.action_ratio <= 0 or args.action_ratio > 1:
@@ -533,7 +533,7 @@ def main() -> None:
     scaler = torch.amp.GradScaler(enabled=use_grad_scaler) if use_grad_scaler else None
 
     saw_batch = _build_batch(
-        num_rollouts=args.num_rollouts,
+        target_rollouts=args.target_rollouts,
         steps_per_rollout=args.steps_per_rollout,
         seq_len=args.max_seq_len,
         min_seq_len=min_seq_len,

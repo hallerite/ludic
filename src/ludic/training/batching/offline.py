@@ -382,7 +382,7 @@ class OfflineBatchSource(BatchSource):
         return len(self._dataloader)
 
     @property
-    def num_rollouts(self) -> int:
+    def target_rollouts(self) -> int:
         """Number of rollouts loaded."""
         return len(self._rollouts)
 
