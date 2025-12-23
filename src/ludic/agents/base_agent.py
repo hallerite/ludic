@@ -4,43 +4,136 @@ from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 import torch
 
-from ludic.types import SamplingArgs, Observation, Info, Message
+from ludic.types import Observation, Info, Message, ChatResponse, TokenTrace
 from ludic.inference.client import ChatClient
-from ludic.inference.sampling import SamplingConfig, resolve_sampling_args
+from ludic.inference.request import ChatCompletionRequest, InferenceSpec, ToolRequest
 from ludic.context.base import ContextStrategy
 from ludic.parsers import Parser, ParseResult
+
+_DEFAULT_INCOMPLETE_FEEDBACK = (
+    "Your response was cut off because it exceeded the token limit. "
+    "Please provide a shorter, more concise response."
+)
+
+_TOKEN_TRACE_KEYS = {
+    "prompt_token_ids",
+    "completion_token_ids",
+    "completion_logprobs",
+}
+
+
+def _strip_token_trace_info(info: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Remove token-trace fields from client info to avoid duplicating large arrays.
+    """
+    if not info:
+        return {}
+    stripped = dict(info)
+    for key in _TOKEN_TRACE_KEYS:
+        stripped.pop(key, None)
+
+    raw = stripped.get("raw_response")
+    if isinstance(raw, dict):
+        raw = dict(raw)
+        raw.pop("prompt_token_ids", None)
+        choices = raw.get("choices")
+        if isinstance(choices, list):
+            new_choices = []
+            for choice in choices:
+                if isinstance(choice, dict):
+                    choice = dict(choice)
+                    choice.pop("token_ids", None)
+                    choice.pop("logprobs", None)
+                new_choices.append(choice)
+            raw["choices"] = new_choices
+        stripped["raw_response"] = raw
+    return stripped
+
 
 class Agent:
     """
     A stateful, logical actor that bundles inference, context, and parsing.
-    
+
     It holds a reference to a (potentially shared) ChatClient and manages
     its own internal state via its ContextStrategy.
     """
+
     name: str = "agent"
 
     def __init__(
-        self, 
-        *, 
-        client: ChatClient, 
+        self,
+        *,
+        client: ChatClient,
         model: str,
         ctx: ContextStrategy,
-        parser: Parser
+        parser: Parser,
+        reject_incomplete_completions: bool = True,
+        incomplete_completion_penalty: float = -0.1,
+        incomplete_completion_feedback: str = _DEFAULT_INCOMPLETE_FEEDBACK,
     ) -> None:
         """
         Initializes the Agent.
-        
+
         Args:
             client: The ChatClient for inference.
             model: The model name this agent should use.
             ctx: An instance of a ContextStrategy for managing memory.
             parser: An instance of a Parser for decoding actions.
+            reject_incomplete_completions: If True, completions that hit max_tokens
+                (finish_reason="length") are treated as parse failures with feedback.
+            incomplete_completion_penalty: Reward penalty for incomplete completions.
+            incomplete_completion_feedback: Feedback message shown to agent when
+                its completion is cut off.
         """
         self._client = client
         self._model = model
         self._ctx = ctx
         self._parser = parser
+        self._reject_incomplete = reject_incomplete_completions
+        self._incomplete_penalty = incomplete_completion_penalty
+        self._incomplete_feedback = incomplete_completion_feedback
         self.last_info: Dict[str, Any] = {}
+
+    async def _infer_once(
+        self,
+        *,
+        messages: List[Message],
+        inference: Optional[InferenceSpec] = None,
+        sampling_seed: Optional[int] = None,
+        tools: Optional[ToolRequest] = None,
+        timeout_s: Optional[float] = None,
+    ) -> Tuple[ChatResponse, Dict[str, Any], Dict[str, Any], Optional[TokenTrace]]:
+        """
+        Shared single inference helper.
+
+        Builds a ChatCompletionRequest, runs the client call (optionally with timeout),
+        strips token traces from the JSON info, and returns a TokenTrace separately.
+        """
+        inf = inference or InferenceSpec()
+        req = ChatCompletionRequest(
+            model=self._model,
+            messages=messages,
+            sampling=inf.sampling,
+            return_=inf.return_,
+            seed=sampling_seed,
+            tools=tools,
+            extensions=inf.extensions,
+        )
+        coro = self._client.complete(req)
+        if timeout_s is None:
+            resp, client_info = await coro
+        else:
+            resp, client_info = await asyncio.wait_for(coro, timeout=timeout_s)
+
+        public_info: Dict[str, Any] = _strip_token_trace_info(client_info)
+        last_info: Dict[str, Any] = dict(public_info)
+        # Store prompt and completion for logging/training
+        last_info["chat_prompt_messages"] = messages
+        last_info["chat_completion"] = {"role": "assistant", "content": resp.text}
+        resp.merge_into_info(last_info)
+
+        self.last_info = last_info
+        return resp, public_info, last_info, resp.to_trace()
 
     def reset(self, system_prompt: Optional[str] = None) -> None:
         """Resets the agent's internal context."""
@@ -56,53 +149,55 @@ class Agent:
 
     async def act(
         self,
-        sampling_args: SamplingArgs,
+        inference: Optional[InferenceSpec] = None,
+        sampling_seed: Optional[int] = None,
         timeout_s: Optional[float] = None,
-    ) -> Tuple[ParseResult, str, Dict[str, Any]]:
+    ) -> Tuple[ParseResult, str, Dict[str, Any], Optional[TokenTrace]]:
         """
         Runs the think -> act -> parse cycle based on current context.
-        
+
         This method does *not* take obs/info, as those are fed to the
         agent via on_env_reset() and on_after_step().
-        
+
         Args:
-            sampling_args: The sampling configuration for this step.
+            inference: The inference configuration for this step.
+            sampling_seed: Optional per-request seed for backend sampling.
             timeout_s: Optional timeout for the inference call.
-            
+
         Returns:
-            A tuple of (ParseResult, raw_action_text, client_info_dict).
+            A tuple of (ParseResult, raw_action_text, client_info_dict, token_trace).
         """
         # 1. Think (prepare prompt messages from context)
         messages: List[Message] = self._ctx.on_before_act()
-        
-        # 2. Act (run inference)
-        sampling: SamplingConfig = resolve_sampling_args(sampling_args)
-        coro = self._client.complete(
-            model=self._model,
-            messages=messages,
-            sampling=sampling,
-        )
-        if timeout_s is None:
-            resp, client_info = await coro
-        else:
-            resp, client_info = await asyncio.wait_for(coro, timeout=timeout_s)
 
-        self.last_info = dict(client_info)
-        
-        # Also merge token IDs from the response if they exist
-        if resp.prompt_token_ids is not None:
-            self.last_info["prompt_token_ids"] = resp.prompt_token_ids
-        if resp.completion_token_ids is not None:
-            self.last_info["completion_token_ids"] = resp.completion_token_ids
-        
+        # 2. Act (run inference)
+        resp, _client_info, last_info, token_trace = await self._infer_once(
+            messages=messages,
+            inference=inference,
+            sampling_seed=sampling_seed,
+            timeout_s=timeout_s,
+        )
+
         # 3. Update memory with the agent's own response
         self._ctx.on_after_act(resp)
-        
-        # 4. Parse (format the raw text action)
+
         raw_action = resp.text
+
+        # 4. Check for incomplete completion (hit max_tokens)
+        if self._reject_incomplete and resp.finish_reason == "length":
+            parse_result = ParseResult(
+                action=None,
+                reward=self._incomplete_penalty,
+                obs=self._incomplete_feedback,
+            )
+            # Mark this in info for downstream tracking
+            last_info["incomplete_completion"] = True
+            return parse_result, raw_action, last_info, token_trace
+
+        # 5. Parse (format the raw text action)
         parse_result = self._parser(raw_action)
-        
-        return parse_result, raw_action, self.last_info
+
+        return parse_result, raw_action, last_info, token_trace
 
     def push_policy_update(
         self,

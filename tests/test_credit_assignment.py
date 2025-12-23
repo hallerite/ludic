@@ -16,12 +16,15 @@ def _make_rollout(
     *,
     prompt: str = "prompt_default",
     rewards: list[float],
-    request_meta: dict = {},
+    group_id: str | None = None,
 ) -> Rollout:
     """
     Creates a simple rollout with the given params.
     The rollout's total_reward will be the sum of the rewards list.
     """
+    request_meta = {}
+    if group_id is not None:
+        request_meta["group_id"] = group_id
     rollout = Rollout(id=id, meta={"request_meta": request_meta})
     obs = prompt  # First prev_obs is the prompt
 
@@ -118,20 +121,21 @@ def test_per_step_reward():
 
 # ---- GroupNormalizedReturn Tests ----
 
-def test_group_normalized_return_groups_by_prompt_not_meta():
+def test_group_normalized_return_groups_by_group_id():
     """
-    Tests that rollouts are grouped by their first step's 'prev_obs' (the prompt)
-    and NOT by their 'request_meta', which might differ.
+    Tests that rollouts are grouped by their group_id in request_meta,
+    not by prompt content.
     """
-    # Group A: "prompt_A". Total rewards are 10.0 and 20.0
-    r1 = _make_rollout("r1", prompt="prompt_A", rewards=[10.0], request_meta={"id": 1})
-    r2 = _make_rollout("r2", prompt="prompt_A", rewards=[20.0], request_meta={"id": 2})
-    
-    # Group B: "prompt_B". Total reward is 5.0
-    r3 = _make_rollout("r3", prompt="prompt_B", rewards=[5.0], request_meta={"id": 3})
+    # Group A: group_id="group_A". Total rewards are 10.0 and 20.0
+    r1 = _make_rollout("r1", prompt="prompt_A", rewards=[10.0], group_id="group_A")
+    r2 = _make_rollout("r2", prompt="prompt_A", rewards=[20.0], group_id="group_A")
 
-    assigner = GroupNormalizedReturn(normalize_adv=False)
-    weights = assigner.compute([r1, r2, r3])
+    # Group B: group_id="group_B". Total reward is 5.0 and 15.0
+    r3 = _make_rollout("r3", prompt="prompt_A", rewards=[5.0], group_id="group_B")  # same prompt!
+    r4 = _make_rollout("r4", prompt="prompt_A", rewards=[15.0], group_id="group_B")
+
+    assigner = GroupNormalizedReturn(group_size=2, normalize_adv=False)
+    weights = assigner.compute([r1, r2, r3, r4])
 
     # Group A: rewards=[10, 20], mean=15.0
     # Adv(r1) = 10.0 - 15.0 = -5.0
@@ -139,10 +143,12 @@ def test_group_normalized_return_groups_by_prompt_not_meta():
     assert weights[("r1", 0)] == pytest.approx(-5.0)
     assert weights[("r2", 0)] == pytest.approx(5.0)
 
-    # Group B: rewards=[5], mean=5.0
-    # Adv(r3) = 5.0 - 5.0 = 0.0
-    assert weights[("r3", 0)] == pytest.approx(0.0)
-    assert len(weights) == 3
+    # Group B: rewards=[5, 15], mean=10.0
+    # Adv(r3) = 5.0 - 10.0 = -5.0
+    # Adv(r4) = 15.0 - 10.0 = 5.0
+    assert weights[("r3", 0)] == pytest.approx(-5.0)
+    assert weights[("r4", 0)] == pytest.approx(5.0)
+    assert len(weights) == 4
 
 
 def test_group_normalized_return_handles_zero_std_dev():
@@ -150,18 +156,18 @@ def test_group_normalized_return_handles_zero_std_dev():
     Tests that normalization works correctly when all rewards in a
     group are identical (std_dev = 0), avoiding division by zero.
     """
-    # Group A: "prompt_A". All rewards are 10.0
-    r1 = _make_rollout("r1", prompt="prompt_A", rewards=[10.0])
-    r2 = _make_rollout("r2", prompt="prompt_A", rewards=[10.0])
+    # Group A: All rewards are 10.0
+    r1 = _make_rollout("r1", prompt="prompt_A", rewards=[10.0], group_id="group_A")
+    r2 = _make_rollout("r2", prompt="prompt_A", rewards=[10.0], group_id="group_A")
 
-    assigner = GroupNormalizedReturn(normalize_adv=True)
+    assigner = GroupNormalizedReturn(group_size=2, normalize_adv=True)
     weights = assigner.compute([r1, r2])
 
     # Group A: rewards=[10, 10], mean=10.0
     # Adv(pre-norm) = [0.0, 0.0]
     # StdDev = 0.0
     # Adv(post-norm) = 0.0 / (0.0 + 1e-8) = 0.0
-    
+
     adv1 = weights[("r1", 0)]
     adv2 = weights[("r2", 0)]
 
@@ -173,3 +179,58 @@ def test_group_normalized_return_handles_zero_std_dev():
     assert adv1 == pytest.approx(0.0)
     assert adv2 == pytest.approx(0.0)
     assert len(weights) == 2
+
+
+def test_group_normalized_return_positive_only_clips_negatives():
+    """
+    Tests that positive_only clips negative advantages to zero (no punishment).
+    """
+    r1 = _make_rollout("r1", prompt="prompt_A", rewards=[1.0], group_id="group_A")
+    r2 = _make_rollout("r2", prompt="prompt_A", rewards=[0.0], group_id="group_A")
+
+    assigner = GroupNormalizedReturn(group_size=2, normalize_adv=False, positive_only=True)
+    weights = assigner.compute([r1, r2])
+
+    # Rewards [1.0, 0.0] -> baseline 0.5 -> raw advantages [0.5, -0.5]
+    # positive_only -> [0.5, 0.0]
+    assert weights[("r1", 0)] == pytest.approx(0.5)
+    assert weights[("r2", 0)] == pytest.approx(0.0)
+    assert len(weights) == 2
+
+
+def test_group_normalized_return_requires_group_id():
+    """
+    Tests that missing group_id raises a clear error.
+    """
+    # No group_id set
+    r1 = _make_rollout("r1", prompt="prompt_A", rewards=[10.0])
+
+    assigner = GroupNormalizedReturn(group_size=1)
+
+    with pytest.raises(ValueError, match="missing group_id"):
+        assigner.compute([r1])
+
+
+def test_group_normalized_return_group_size_mismatch():
+    """
+    Tests that group_size mismatch raises a clear error.
+    """
+    r1 = _make_rollout("r1", prompt="prompt_A", rewards=[10.0], group_id="group_A")
+    r2 = _make_rollout("r2", prompt="prompt_A", rewards=[20.0], group_id="group_A")
+    r3 = _make_rollout("r3", prompt="prompt_A", rewards=[30.0], group_id="group_A")  # 3 in group
+
+    assigner = GroupNormalizedReturn(group_size=4)  # but expect 4
+
+    with pytest.raises(ValueError, match="Group size mismatch"):
+        assigner.compute([r1, r2, r3])
+
+
+def test_group_normalized_return_invalid_group_size():
+    """
+    Tests that invalid group_size raises at construction.
+    """
+    with pytest.raises(ValueError, match="group_size must be positive"):
+        GroupNormalizedReturn(group_size=0)
+
+    with pytest.raises(ValueError, match="group_size must be positive"):
+        GroupNormalizedReturn(group_size=-1)

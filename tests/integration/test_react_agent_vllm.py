@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import pytest
 from transformers import AutoTokenizer  # Only for verification
-from typing import Tuple
 
 from ludic.inference.vllm_client import VLLMChatClient
+from ludic.inference import InferenceSpec, SamplingParams, ReturnSpec
 from ludic.agents.react_agent import ReActAgent
 from ludic.context.full_dialog import FullDialog
-from ludic.parsers import ParseResult
+from tests._mocks import _mock_parser
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -42,15 +42,11 @@ async def test_react_agent_vllm_tool_call_loop(
     4. Agent must: Think -> Call Tool -> See 'BLUE-42' -> Output Final Answer.
     """
     
-    # 1. Setup the Agent
-    def simple_parser(text: str) -> ParseResult:
-        return ParseResult(action=text, reward=0.0, obs=None)
-
     agent = ReActAgent(
         client=vllm_client,
         model=vllm_model_name,
         ctx=FullDialog(),
-        parser=simple_parser,
+        parser=_mock_parser,
         tools=[get_secret_code],
         max_react_steps=3
     )
@@ -69,8 +65,11 @@ async def test_react_agent_vllm_tool_call_loop(
     agent.on_env_reset("What is the secret code for the blue hint?", {})
 
     print("\n--- Starting ReAct Loop ---")
-    parse_result, raw_text, info = await agent.act(
-        sampling_args={"temperature": 0.0, "max_tokens": 256}
+    parse_result, raw_text, info, token_trace = await agent.act(
+        inference=InferenceSpec(
+            sampling=SamplingParams(temperature=0.0, max_tokens=256),
+            return_=ReturnSpec.for_eval(return_token_ids=True),
+        )
     )
     print(f"--- Final Output ---\n{raw_text}\n--------------------")
 
@@ -91,11 +90,11 @@ async def test_react_agent_vllm_tool_call_loop(
 
     # 5. Debug: Print ACTUAL Model Input (Decoded Token IDs)
     print("\n" + "="*60)
-    print(" ACTUAL MODEL INPUT (Decoded prompt_token_ids)")
+    print(" ACTUAL MODEL INPUT (Decoded prompt token IDs)")
     print("="*60)
     
-    # The updated ReActAgent forces return_token_ids=True, so info has them.
-    prompt_ids = info.get("prompt_token_ids")
+    # The ReActAgent forces return_token_ids=True, so a token trace should be available.
+    prompt_ids = token_trace.prompt_token_ids if token_trace is not None else None
     
     if prompt_ids:
         try:
@@ -111,7 +110,7 @@ async def test_react_agent_vllm_tool_call_loop(
         except Exception as e:
             print(f"⚠️ Could not decode token IDs: {e}")
     else:
-        print("⚠️ No prompt_token_ids found in response info.")
+        print("⚠️ No token trace found in response.")
 
     print("="*60 + "\n")
 

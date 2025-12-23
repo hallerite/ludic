@@ -3,7 +3,8 @@ from abc import ABC, abstractmethod
 from typing import Optional, List
 
 from ludic.envs.env import LudicEnv
-from ludic.types import Rollout, SamplingArgs
+from ludic.types import Rollout
+from ludic.inference.request import InferenceSpec
 
 class InteractionProtocol(ABC):
     """
@@ -19,8 +20,9 @@ class InteractionProtocol(ABC):
         *,
         env: LudicEnv,
         max_steps: int,
-        seed: Optional[int] = None,
-        sampling_args: Optional[SamplingArgs] = None,
+        env_seed: Optional[int] = None,
+        sampling_seed: Optional[int] = None,
+        inference: Optional[InferenceSpec] = None,
         timeout_s: Optional[float] = None,
     ) -> List[Rollout]:
         """
@@ -30,8 +32,9 @@ class InteractionProtocol(ABC):
         Args:
             env: The environment instance to run against.
             max_steps: Maximum number of steps for the episode.
-            seed: Optional seed for env.reset().
-            sampling_args: Optional sampling config for this run.
+            env_seed: Optional seed for env.reset().
+            sampling_seed: Optional seed for backend sampling.
+            inference: Optional inference config for this run.
             timeout_s: Optional timeout for each agent.act() call.
         """
         ...

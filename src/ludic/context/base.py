@@ -101,3 +101,7 @@ class ContextStrategy(ABC):
     @property
     def messages(self) -> List[Message]:
         return list(self._messages)
+
+    @property
+    def default_system_prompt(self) -> Optional[str]:
+        return self._default_system_prompt

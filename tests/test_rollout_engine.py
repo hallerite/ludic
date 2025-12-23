@@ -5,13 +5,14 @@ from typing import Any, Dict, List, Tuple, Optional
 
 import pytest
 
-from ludic.agent import Agent
+from ludic.agents.base_agent import Agent
 from ludic.inference.client import ChatResponse
 from ludic.interaction.base import InteractionProtocol
 from ludic.interaction.single_agent import SingleAgentSyncProtocol
 from ludic.context.full_dialog import FullDialog
 from ludic.envs.env import LudicEnv
-from ludic.inference.sampling import SamplingConfig
+from ludic.inference.request import ChatCompletionRequest, InferenceSpec, ReturnSpec
+from ludic.inference.sampling import SamplingParams
 
 from ludic.training.batching import (
     RolloutEngine,
@@ -23,7 +24,8 @@ from ludic.training.types import (
     RolloutRequest,
 )
 from ludic.training.credit_assignment import MonteCarloReturn
-from ludic.types import Rollout, SamplingArgs, Step
+from ludic.training.filters import drop_truncated
+from ludic.types import Rollout, Step
 
 from tests._mocks import MockClient, _mock_parser, MockAgent
 
@@ -41,10 +43,7 @@ class TokenClient(MockClient):
 
     async def complete(
         self,
-        *,
-        model: str,
-        messages: List[Dict[str, str]],
-        sampling: SamplingConfig,
+        request: ChatCompletionRequest,
         **kwargs,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
         # Prompt is "some prompt", completion is "1".
@@ -54,7 +53,7 @@ class TokenClient(MockClient):
             prompt_token_ids=[10, 11],
             completion_token_ids=[12, 13, 14],
         )
-        return resp, {"used_args": sampling.to_openai_kwargs()}
+        return resp, {"used_request": request.to_dict()}
 
 
 class ConstantCreditAssigner:
@@ -74,12 +73,10 @@ class ConstantCreditAssigner:
         return out
 
 
-def fake_tokenize(text: str) -> List[int]:
-    """
-    Extremely dumb tokenizer for retokenize=True path:
-    converts each character to its ord().
-    """
-    return [ord(c) for c in text]
+DEFAULT_INFERENCE = InferenceSpec(
+    sampling=SamplingParams(temperature=0.0, max_tokens=16),
+    return_=ReturnSpec.for_eval(return_token_ids=True),
+)
 
 # ---------------------------------------------------------------------
 # Mock Protocol that produces MULTIPLE rollouts per run()
@@ -92,8 +89,9 @@ class MultiTraceMockProtocol(InteractionProtocol):
         *,
         env: LudicEnv,
         max_steps: int,
-        seed: Optional[int] = None,
-        sampling_args: Optional[SamplingArgs] = None,
+        env_seed: Optional[int] = None,
+        sampling_seed: Optional[int] = None,
+        inference: Optional[InferenceSpec] = None,
         timeout_s: Optional[float] = None,
     ) -> List[Rollout]:
         # Simulate Agent A
@@ -397,12 +395,11 @@ async def test_generate_batch_uses_model_token_ids_when_available(
         credit_assigner=credit_assigner,
         timeout_s=None,
         concurrency=1,
-        retokenize=False,  # MUST not retokenize; should use model IDs
     )
 
     # Single rollout, single step
-    assert batch.meta["batch_size"] == 1
-    assert batch.meta["total_items"] == 1
+    assert batch.meta["target_rollouts"] == 1
+    assert batch.meta["num_samples"] == 1
     # Env gives +1 reward when guess is correct
     assert batch.meta["avg_total_reward"] == pytest.approx(1.0)
 
@@ -422,7 +419,7 @@ async def test_generate_batch_uses_model_token_ids_when_available(
 
 
 # ---------------------------------------------------------------------
-# generate_batch: missing token IDs and retokenize behaviour
+# generate_batch: missing token IDs
 # ---------------------------------------------------------------------
 
 
@@ -448,72 +445,14 @@ async def test_generate_batch_raises_if_no_token_ids_and_no_retokenize(
         num_episodes=1,
     )
 
-    with pytest.raises(ValueError, match="Missing model token IDs"):
+    with pytest.raises(ValueError, match="Missing rollout-time token trace"):
         await engine.generate_batch(
             requests=[request],
             max_steps=2,
             credit_assigner=credit_assigner,
             timeout_s=None,
             concurrency=1,
-            retokenize=False,
         )
-
-
-@pytest.mark.asyncio
-async def test_generate_batch_retokenize_path_uses_custom_tokenizer(
-    env_registry,
-    mock_agent,
-) -> None:
-    protocol_registry = {
-        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=mock_agent)
-    }
-    
-    engine = RolloutEngine(
-        env_registry=env_registry,
-        protocol_registry=protocol_registry,
-    )
-
-    # Use a real credit assigner here just to check it integrates fine
-    credit_assigner = MonteCarloReturn(gamma=1.0)
-
-    request = RolloutRequest(
-        env=EnvSpec(kind="mock", kwargs={"max_steps": 1, "target": "1"}),
-        protocol=ProtocolSpec(kind="mock_protocol"),
-        num_episodes=1,
-    )
-
-    batch = await engine.generate_batch(
-        requests=[request],
-        max_steps=2,
-        credit_assigner=credit_assigner,
-        timeout_s=None,
-        concurrency=1,
-        retokenize=True,
-        tokenize=fake_tokenize,
-    )
-
-    assert batch.meta["batch_size"] == 1
-    assert batch.meta["total_items"] == 1
-    assert batch.meta["avg_total_reward"] == pytest.approx(1.0)
-
-    assert len(batch.items) == 1
-    item = batch.items[0]
-
-    # State text is the initial observation from MockEnv.reset()
-    state_text = "Reply with '1' to finish."
-    state_len = len(state_text)
-
-    # We used per-character ord() tokenization
-    assert item.input_ids[:state_len] == [ord(c) for c in state_text]
-
-    # Action is "1" from MockClient; so last token should be ord("1")
-    assert item.input_ids[-1] == ord("1")
-
-    # Action mask should be 0 over state region, 1 over action region
-    assert all(v == 0 for v in item.action_mask[:state_len])
-    assert all(v == 1 for v in item.action_mask[state_len:])
-
-    assert item.weight == pytest.approx(batch.items[0].weight)
 
 
 # ---------------------------------------------------------------------
@@ -524,10 +463,15 @@ async def test_generate_batch_retokenize_path_uses_custom_tokenizer(
 @pytest.mark.asyncio
 async def test_rollout_batch_source_next_batch_integration(
     env_registry,
-    mock_agent,
 ) -> None:
+    agent = Agent(
+        client=TokenClient(),
+        model="mock",
+        ctx=FullDialog(),
+        parser=_mock_parser,
+    )
     protocol_registry = {
-        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=mock_agent)
+        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent)
     }
     
     engine = RolloutEngine(
@@ -544,6 +488,7 @@ async def test_rollout_batch_source_next_batch_integration(
                 env=EnvSpec(kind="mock", kwargs={"max_steps": 2, "target": "1"}),
                 protocol=ProtocolSpec(kind="mock_protocol"),
                 num_episodes=2,
+                inference=DEFAULT_INFERENCE,
                 meta={"batch_source": True},
             )
         ]
@@ -555,19 +500,232 @@ async def test_rollout_batch_source_next_batch_integration(
         max_steps=3,
         timeout_s=None,
         concurrency=2,
-        retokenize=True,
-        tokenize=fake_tokenize,
     )
 
     saw_batch = await batch_source.next_batch()
 
     # We asked for num_episodes=2 => 2 rollouts; each should have at least 1 step
-    assert saw_batch.meta["batch_size"] == 2
-    assert saw_batch.meta["total_items"] >= 2
+    assert saw_batch.meta["target_rollouts"] == 2
+    assert saw_batch.meta["num_samples"] >= 2
 
     # All items should carry rollout metadata including request_meta
-    assert len(saw_batch.items) == saw_batch.meta["total_items"]
+    assert len(saw_batch.items) == saw_batch.meta["num_samples"]
     for item in saw_batch.items:
         assert item.meta.get("request_meta", {}).get("batch_source") is True
         assert "rollout_id" in item.meta
         assert "step_index" in item.meta
+
+
+@pytest.mark.asyncio
+async def test_rollout_batch_source_passes_sample_filter(
+    env_registry,
+) -> None:
+    agent = Agent(
+        client=TokenClient(),
+        model="mock",
+        ctx=FullDialog(),
+        parser=_mock_parser,
+    )
+    protocol_registry = {
+        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent)
+    }
+
+    engine = RolloutEngine(
+        env_registry=env_registry,
+        protocol_registry=protocol_registry,
+    )
+
+    credit_assigner = MonteCarloReturn()
+
+    def requests_fn() -> List[RolloutRequest]:
+        return [
+            RolloutRequest(
+                env=EnvSpec(kind="mock", kwargs={"max_steps": 10, "target": "win"}),
+                protocol=ProtocolSpec(kind="mock_protocol"),
+                num_episodes=1,
+                inference=DEFAULT_INFERENCE,
+            )
+        ]
+
+    batch_source = RolloutBatchSource(
+        orchestrator=engine,
+        credit_assigner=credit_assigner,
+        requests_fn=requests_fn,
+        max_steps=3,
+        sample_filter=drop_truncated,
+    )
+
+    batch = await batch_source.next_batch()
+
+    assert batch.meta["num_samples_before_filter"] == 3
+    assert batch.meta["num_samples"] == 2
+    assert all(item.meta.get("truncated") is False for item in batch.items)
+
+
+@pytest.mark.asyncio
+async def test_saw_item_contains_truncation_flags(
+    env_registry,
+) -> None:
+    """
+    SAWItem.meta should contain 'truncated' and 'terminated' flags
+    propagated from the Step, as well as episode-level truncation info
+    from Rollout.meta.
+    """
+
+    agent = Agent(
+        client=TokenClient(),
+        model="mock",
+        ctx=FullDialog(),
+        parser=_mock_parser,
+    )  # Never terminates the env since it never outputs target="win"
+    protocol_registry = {
+        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent),
+    }
+
+    engine = RolloutEngine(
+        env_registry=env_registry,
+        protocol_registry=protocol_registry,
+    )
+
+    credit_assigner = MonteCarloReturn()
+
+    requests = [
+        RolloutRequest(
+            env=EnvSpec(kind="mock", kwargs={"max_steps": 10, "target": "win"}),
+            protocol=ProtocolSpec(kind="mock_protocol"),
+            num_episodes=1,
+            inference=DEFAULT_INFERENCE,
+        )
+    ]
+
+    # max_steps=3 means we'll truncate at step 3
+    batch = await engine.generate_batch(
+        requests=requests,
+        max_steps=3,
+        credit_assigner=credit_assigner,
+    )
+
+    assert len(batch.items) == 3
+
+    # First two steps: not truncated, not terminated
+    for i in range(2):
+        item = batch.items[i]
+        assert item.meta.get("truncated") is False
+        assert item.meta.get("terminated") is False
+
+    # Last step: truncated due to max_steps
+    last_item = batch.items[-1]
+    assert last_item.meta.get("truncated") is True
+    assert last_item.meta.get("terminated") is False
+    assert last_item.meta.get("truncation_reason") == "max_steps"
+
+    # Episode-level truncation info
+    assert last_item.meta.get("episode_truncated") is True
+
+
+@pytest.mark.asyncio
+async def test_generate_batch_applies_sample_filter_and_updates_counts(
+    env_registry,
+) -> None:
+    agent = Agent(
+        client=TokenClient(),
+        model="mock",
+        ctx=FullDialog(),
+        parser=_mock_parser,
+    )  # Never terminates the env since it never outputs target="win"
+    protocol_registry = {
+        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent),
+    }
+
+    engine = RolloutEngine(
+        env_registry=env_registry,
+        protocol_registry=protocol_registry,
+    )
+
+    credit_assigner = MonteCarloReturn()
+
+    requests = [
+        RolloutRequest(
+            env=EnvSpec(kind="mock", kwargs={"max_steps": 10, "target": "win"}),
+            protocol=ProtocolSpec(kind="mock_protocol"),
+            num_episodes=1,
+            inference=DEFAULT_INFERENCE,
+        )
+    ]
+
+    batch = await engine.generate_batch(
+        requests=requests,
+        max_steps=3,
+        credit_assigner=credit_assigner,
+        sample_filter=drop_truncated,
+    )
+
+    assert batch.meta["num_samples_before_filter"] == 3
+    assert batch.meta["num_samples"] == 2
+    assert batch.meta["num_samples_filtered"] == 1
+    assert len(batch.items) == 2
+    assert all(item.meta.get("truncated") is False for item in batch.items)
+
+
+@pytest.mark.asyncio
+async def test_avg_completion_length_respects_filtered_items(
+    env_registry,
+) -> None:
+    class SeqClient(MockClient):
+        def __init__(self, texts: List[str]) -> None:
+            super().__init__(text=texts[0])
+            self._texts = list(texts)
+            self._i = 0
+
+        async def complete(  # type: ignore[override]
+            self,
+            request: ChatCompletionRequest,
+            **kwargs,
+        ) -> Tuple[ChatResponse, Dict[str, Any]]:
+            text = self._texts[min(self._i, len(self._texts) - 1)]
+            self._i += 1
+            completion_ids = list(range(100, 100 + len(text)))
+            return (
+                ChatResponse(
+                    text=text,
+                    prompt_token_ids=[1, 2],
+                    completion_token_ids=completion_ids,
+                ),
+                {"used_request": request.to_dict()},
+            )
+
+    agent = Agent(
+        client=SeqClient(["a", "bb", "ccc"]),
+        model="mock",
+        ctx=FullDialog(),
+        parser=_mock_parser,
+    )
+    protocol_registry = {
+        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent),
+    }
+
+    engine = RolloutEngine(
+        env_registry=env_registry,
+        protocol_registry=protocol_registry,
+    )
+
+    credit_assigner = MonteCarloReturn()
+    requests = [
+        RolloutRequest(
+            env=EnvSpec(kind="mock", kwargs={"max_steps": 10, "target": "win"}),
+            protocol=ProtocolSpec(kind="mock_protocol"),
+            num_episodes=1,
+            inference=DEFAULT_INFERENCE,
+        )
+    ]
+
+    # Keep only the first step so avg_completion_length should match len("a") == 1.
+    batch = await engine.generate_batch(
+        requests=requests,
+        max_steps=3,
+        credit_assigner=credit_assigner,
+        sample_filter=lambda item: item.meta.get("step_index") == 0,
+    )
+
+    assert batch.meta["num_samples"] == 1
+    assert batch.meta["avg_completion_length"] == pytest.approx(1.0)

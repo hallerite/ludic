@@ -20,7 +20,7 @@ class TruncatedThinkingContext(FullDialog):
     def __init__(
         self, 
         system_prompt: str | None = None,
-        placeholder: str = "... [TRUNCATED THOUGHTS] ...",
+        placeholder: str = "[TRUNCATED]",
     ) -> None:
         super().__init__(system_prompt=system_prompt)
         self.placeholder = placeholder

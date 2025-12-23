@@ -1,5 +1,6 @@
 import torch
 from typing import Mapping, List, Optional
+from collections.abc import Callable
 from ludic.distributed.interfaces import (
     PolicyPublisher, 
     ControlPlane, 
@@ -57,3 +58,56 @@ class BroadcastPolicyPublisher(PolicyPublisher):
         
         # 5. Finalize (e.g., reset prefix cache, bump version)
         self.control.finalize_update()
+
+
+class Rank0OnlyPublisher(PolicyPublisher):
+    """
+    PolicyPublisher wrapper that only publishes on rank 0.
+
+    - If torch.distributed is not initialized, it behaves like rank 0.
+    - Inner publisher is constructed lazily to avoid rank>0 side effects
+      (e.g., NCCL init, network connections).
+
+    Why this exists:
+      In multi-process training (DDP/FSDP2), *every rank* constructs a Trainer.
+      But "publish weights to a serving runtime" is a singleton side-effect:
+      you typically want only rank 0 to talk to the runtime (HTTP/NCCL).
+
+      This wrapper lets you pass a publisher object on all ranks (so training
+      code doesn't need per-rank conditionals), while ensuring:
+        - only rank 0 actually calls the inner publisher
+        - non-rank0 ranks never even construct the inner publisher (important
+          when publisher construction requires resources that only rank 0 has,
+          e.g. a vLLM weight-update client with an initialized NCCL communicator)
+    """
+
+    def __init__(
+        self,
+        make_inner: Callable[[], PolicyPublisher],
+        *,
+        enabled: bool = True,
+    ) -> None:
+        self._make_inner = make_inner
+        self._enabled = enabled
+        self._inner: PolicyPublisher | None = None
+
+    def _is_rank0(self) -> bool:
+        try:
+            import torch.distributed as dist
+        except Exception:
+            return True
+        if not (dist.is_available() and dist.is_initialized()):
+            return True
+        return dist.get_rank() == 0
+
+    def _get_inner(self) -> PolicyPublisher:
+        if self._inner is None:
+            self._inner = self._make_inner()
+        return self._inner
+
+    def publish(self, state_dict: Mapping[str, torch.Tensor], version: Optional[int] = None) -> None:
+        if not self._enabled:
+            return
+        if not self._is_rank0():
+            return
+        self._get_inner().publish(state_dict, version=version)

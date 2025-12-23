@@ -1,4 +1,3 @@
-import pytest
 from ludic.context.truncated_thinking import TruncatedThinkingContext
 
 def test_truncates_valid_format():

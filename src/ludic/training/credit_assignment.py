@@ -9,27 +9,6 @@ from ludic.types import Rollout
 from ludic.training.types import RolloutStepKey
 
 
-# ---- Helper for Grouping (FIXED) ----
-
-def _group_rollouts_by_prompt(
-    rollouts: List[Rollout],
-) -> Dict[str, List[Rollout]]:
-    """
-    Groups rollouts by their initial observation (prompt).
-    This is the 'q' in the GRPO paper and is the correct way
-    to group rollouts for group-normalized advantage.
-    """
-    groups: Dict[str, List[Rollout]] = defaultdict(list)
-    for r in rollouts:
-        if not r.steps:
-            continue  # Skip empty rollouts
-        
-        # The first observation is the prompt
-        prompt_key = r.steps[0].prev_obs
-        groups[prompt_key].append(r)
-    return groups
-
-
 # ---- Credit Assigners ----
 
 @dataclass
@@ -37,31 +16,54 @@ class GroupNormalizedReturn:
     """
     Computes advantage as (Episodic Return - Group-Mean Episodic Return).
 
-    This is the core advantage estimation for GRPO. It assumes:
-    1.  A "group" of rollouts corresponds to multiple outputs for a
-        single prompt.
-    2.  All rollouts from the same prompt are grouped by their
-        identical `rollout.steps[0].prev_obs`.
-    3.  The `total_reward` of a rollout is the scalar score from the
-        Reward Model.
-    4.  All tokens in a single rollout (output) receive the same
-        advantage value.
+    This is the core advantage estimation for GRPO.
+
+    Contract:
+    - Rollouts must have `group_id` in `rollout.meta["request_meta"]["group_id"]`.
+    - Each group must have exactly `group_size` rollouts.
+    - Raises ValueError if either condition is violated.
+
+    Args:
+        group_size: Number of rollouts per group.
+        normalize_adv: Whether to normalize advantages to zero mean / unit std
+            within each group.
+        positive_only: If True, clip negative advantages to 0 so only
+            rewarding trajectories receive credit (no punishments).
     """
+    group_size: int
     normalize_adv: bool = False
+    positive_only: bool = False
+
+    def __post_init__(self):
+        if self.group_size <= 0:
+            raise ValueError(f"group_size must be positive, got {self.group_size}")
 
     def compute(
         self,
         rollouts: List[Rollout],
     ) -> Dict[RolloutStepKey, float]:
-        
-        out: Dict[RolloutStepKey, float] = {}
-        
-        # Group by the initial prompt
-        groups = _group_rollouts_by_prompt(rollouts)
 
-        for _, group_rollouts in groups.items():
-            if not group_rollouts:
-                continue
+        out: Dict[RolloutStepKey, float] = {}
+
+        # Group by group_id from request meta
+        groups: Dict[str, List[Rollout]] = defaultdict(list)
+        for r in rollouts:
+            group_id = r.meta.get("request_meta", {}).get("group_id")
+            if group_id is None:
+                raise ValueError(
+                    f"Rollout {r.id} missing group_id in meta['request_meta']. "
+                    "GroupNormalizedReturn requires each rollout to have a group_id."
+                )
+            groups[group_id].append(r)
+
+        for group_id, group_rollouts in groups.items():
+            # Validate group size
+            actual_size = len(group_rollouts)
+            if actual_size != self.group_size:
+                raise ValueError(
+                    f"Group size mismatch for group_id={group_id}: "
+                    f"expected {self.group_size}, got {actual_size}."
+                )
 
             # 1. Get total reward (RM score) for each rollout in the group
             rewards = torch.tensor(
@@ -74,6 +76,9 @@ class GroupNormalizedReturn:
 
             # 3. Compute advantages (A_i = R_i - b)
             advantages = rewards - baseline
+
+            if self.positive_only:
+                advantages = torch.clamp(advantages, min=0.0)
 
             # 4. (Optional) Normalize advantages (zero mean, unit std)
             if self.normalize_adv:
@@ -177,5 +182,37 @@ class EpisodicReturn:
             for step in r.steps:
                 key: RolloutStepKey = (r.id, step.index)
                 out[key] = R_ep
+
+        return out
+
+
+@dataclass
+class ConstantCredit:
+    """
+    Assigns a constant weight to every step in every rollout.
+
+    This is the credit assignment for SFT / behavioral cloning:
+    all actions are treated equally (weight=1.0 by default).
+
+    Can also be used for AWR-style offline RL by setting the constant
+    to exp(advantage / temperature) externally, though typically you'd
+    use a more sophisticated assigner for that.
+
+    Args:
+        value: The constant weight to assign to all steps. Default 1.0.
+    """
+
+    value: float = 1.0
+
+    def compute(
+        self,
+        rollouts: List[Rollout],
+    ) -> Dict[RolloutStepKey, float]:
+        out: Dict[RolloutStepKey, float] = {}
+
+        for r in rollouts:
+            for step in r.steps:
+                key: RolloutStepKey = (r.id, step.index)
+                out[key] = self.value
 
         return out

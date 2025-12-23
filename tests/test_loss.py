@@ -12,6 +12,8 @@ from ludic.training.loss import (
     compute_logp_action,
     ReinforceLoss,
     ReinforceBaselineLoss,
+    ClippedSurrogateLoss,
+    TokenClippedSurrogateLoss,
     CompositeLoss,
     LossTerm,
 )
@@ -47,12 +49,41 @@ def test_compute_logp_action():
     # State = pos 0, Action = pos 1, 2
     action_mask = torch.tensor([[0, 1, 1]], dtype=torch.float32)
 
-    expected_logp_action = torch.tensor([-0.2645], dtype=torch.float32)
+    # With causal shift, tokens at positions 1 and 2 are scored.
+    expected_logp_action = torch.tensor([-4.5518], dtype=torch.float32)
 
     logp_action = compute_logp_action(logits, input_ids, action_mask)
 
     assert logp_action.shape == (1,)
     assert torch.allclose(logp_action, expected_logp_action, atol=1e-3)
+
+
+def test_compute_logp_action_multitoken_and_norm():
+    """
+    Verifies causal shift when the action spans multiple tokens, and length normalization.
+    """
+    logits = torch.tensor([[
+        [0.0, 0.0],  # predicts token at pos 1
+        [1.0, 0.0],  # predicts token at pos 2
+        [0.0, 2.0],  # predicts token at pos 3
+        [3.0, 0.0],  # unused (no target after final token)
+    ]], dtype=torch.float32)
+
+    input_ids = torch.tensor([[0, 1, 0, 1]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 0, 1, 1]], dtype=torch.float32)
+
+    # Manual expectation: only positions 2 and 3 are actions, scored with logits at 1 and 2.
+    logp = torch.log_softmax(logits[:, :-1, :], dim=-1)  # [1, 3, 2]
+    expected = logp[0, 1, 0] + logp[0, 2, 1]  # action tokens at ids 0 and 1
+
+    logp_action = compute_logp_action(logits, input_ids, action_mask)
+    assert logp_action.shape == (1,)
+    assert torch.allclose(logp_action, expected.unsqueeze(0), atol=1e-4)
+
+    logp_action_norm = compute_logp_action(
+        logits, input_ids, action_mask, length_normalize=True
+    )
+    assert torch.allclose(logp_action_norm, expected.unsqueeze(0) / 2, atol=1e-4)
 
 
 # ---- test_reinforce_loss ----
@@ -70,16 +101,17 @@ def test_reinforce_loss():
         "weight": torch.tensor([2.0], dtype=torch.float32), # Advantages
     }
 
-    # logp_action = logp[0, 1, 0] = -0.127
+    # With causal shift, only position 0 logits are used to score token at pos 1
+    # logp_action = logp[0, 0, 0] = -1.3133
     # advantages = 2.0
-    # loss = - (adv * logp_action).mean() = - (2.0 * -0.127) = 0.254
-    expected_loss = 0.254
+    # loss = - (adv * logp_action).mean() = - (2.0 * -1.3133) = 2.6266
+    expected_loss = 2.6266
 
     loss, stats = loss_fn.compute(logits, batch)
 
     assert torch.allclose(loss, torch.tensor(expected_loss), atol=1e-3)
     assert stats["adv_mean"] == pytest.approx(2.0)
-    assert stats["logp_mean"] == pytest.approx(-0.127, abs=1e-3)
+    assert stats["logp_mean"] == pytest.approx(-1.3133, abs=1e-3)
 
 
 # ---- test_reinforce_baseline_loss ----
@@ -90,8 +122,8 @@ def test_reinforce_baseline_loss(normalize):
 
     # B=2, T=2, V=2
     logits = torch.tensor([
-        [[1.0, 2.0], [3.0, 1.0]], # logp(id=1,0 | mask=0,1) = -0.127
-        [[1.0, 2.0], [1.0, 2.0]], # logp(id=0,0 | mask=0,1) = -1.313
+        [[1.0, 2.0], [3.0, 1.0]],  # sample 0: logp(id=0 | pos0) = -1.313
+        [[2.0, 1.0], [1.0, 2.0]],  # sample 1: logp(id=0 | pos0) = -0.313
     ], dtype=torch.float32)
 
     batch = {
@@ -100,7 +132,8 @@ def test_reinforce_baseline_loss(normalize):
         "weight": torch.tensor([1.5, 0.5], dtype=torch.float32), # Raw returns
     }
 
-    # logp_actions = [-0.127, -1.313]
+    # With causal shift, both samples score the token at position 1 using logits from position 0
+    # logp_actions = [-1.313, -0.313]
     # raw_returns = [1.5, 0.5]
     # baseline = raw_returns.mean() = 1.0
     # advantages = [1.5 - 1.0, 0.5 - 1.0] = [0.5, -0.5]
@@ -109,15 +142,15 @@ def test_reinforce_baseline_loss(normalize):
         # std = advantages.std(unbiased=False) = 0.5
         # advantages = [0.5 / 0.5, -0.5 / 0.5] = [1.0, -1.0]
         # loss = - (advantages * logp_action).mean()
-        # loss = - ([1.0, -1.0] * [-0.127, -1.313]).mean()
-        # loss = - ([-0.127, 1.313]).mean() = - (1.186 / 2) = -0.593
-        expected_loss = -0.593
+        # loss = - ([1.0, -1.0] * [-1.313, -0.313]).mean()
+        # loss = - ([-1.313, 0.313]).mean() = 0.5
+        expected_loss = 0.5
     else:
         # advantages = [0.5, -0.5]
         # loss = - (advantages * logp_action).mean()
-        # loss = - ([0.5, -0.5] * [-0.127, -1.313]).mean()
-        # loss = - ([-0.0635, 0.6565]).mean() = - (0.593 / 2) = -0.2965
-        expected_loss = -0.2965
+        # loss = - ([0.5, -0.5] * [-1.313, -0.313]).mean()
+        # loss = - ([-0.6565, 0.1565]).mean() = 0.25
+        expected_loss = 0.25
 
     loss, stats = loss_fn.compute(logits, batch)
 
@@ -128,6 +161,128 @@ def test_reinforce_baseline_loss(normalize):
     else:
         assert stats["adv_mean"] == pytest.approx(0.0) # mean is 0 before norm too
 
+
+# ---- test_gspo_loss_length_normalize ----
+
+def test_gspo_loss_length_normalize_affects_ratio():
+    logits = torch.tensor([[
+        [0.0, 0.0],  # predicts token at pos 1
+        [2.0, 0.0],  # predicts token at pos 2
+        [0.0, 0.0],  # unused
+    ]], dtype=torch.float32)
+    input_ids = torch.tensor([[0, 1, 0]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1, 1]], dtype=torch.float32)
+    batch = {
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([1.0], dtype=torch.float32),
+        "old_logp_action": torch.tensor([0.0], dtype=torch.float32),
+    }
+
+    loss_fn = ClippedSurrogateLoss(clip_eps_low=1.0, clip_eps_high=1.0, length_normalize=False)
+    loss, _ = loss_fn.compute(logits, batch)
+
+    logp = torch.log_softmax(logits[:, :-1, :], dim=-1)
+    expected_logp_action = logp[0, 0, 1] + logp[0, 1, 0]
+    expected_loss = -torch.exp(expected_logp_action)
+    assert torch.allclose(loss, expected_loss, atol=1e-4)
+
+    loss_norm, _ = ClippedSurrogateLoss(
+        clip_eps_low=1.0,
+        clip_eps_high=1.0,
+        length_normalize=True,
+    ).compute(logits, batch)
+    expected_loss_norm = -torch.exp(expected_logp_action / 2)
+    assert torch.allclose(loss_norm, expected_loss_norm, atol=1e-4)
+
+
+def test_gspo_loss_upper_clip_positive_advantage():
+    logits = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+    input_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1]], dtype=torch.float32)
+
+    logp_action = compute_logp_action(logits, input_ids, action_mask)
+    ratio_target = 2.0
+    old_logp_action = logp_action - torch.log(torch.tensor(ratio_target))
+
+    batch = {
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([1.0], dtype=torch.float32),
+        "old_logp_action": old_logp_action,
+    }
+
+    loss_fn = ClippedSurrogateLoss(clip_eps_low=0.1, clip_eps_high=0.1)
+    loss, _ = loss_fn.compute(logits, batch)
+    assert torch.allclose(loss, torch.tensor(-1.1), atol=1e-4)
+
+
+def test_gspo_loss_lower_clip_negative_advantage():
+    logits = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+    input_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1]], dtype=torch.float32)
+
+    logp_action = compute_logp_action(logits, input_ids, action_mask)
+    ratio_target = 0.5
+    old_logp_action = logp_action - torch.log(torch.tensor(ratio_target))
+
+    batch = {
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([-1.0], dtype=torch.float32),
+        "old_logp_action": old_logp_action,
+    }
+
+    loss_fn = ClippedSurrogateLoss(clip_eps_low=0.2, clip_eps_high=0.2)
+    loss, _ = loss_fn.compute(logits, batch)
+    assert torch.allclose(loss, torch.tensor(0.8), atol=1e-4)
+
+
+def test_gspo_loss_ratio_clip_truncation():
+    logits = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+    input_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1]], dtype=torch.float32)
+
+    logp_action = compute_logp_action(logits, input_ids, action_mask)
+    ratio_target = 10.0
+    old_logp_action = logp_action - torch.log(torch.tensor(ratio_target))
+
+    batch = {
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([1.0], dtype=torch.float32),
+        "old_logp_action": old_logp_action,
+    }
+
+    loss_fn = ClippedSurrogateLoss(
+        clip_eps_low=10.0,
+        clip_eps_high=10.0,
+        ratio_clip=2.0,
+    )
+    loss, _ = loss_fn.compute(logits, batch)
+    assert torch.allclose(loss, torch.tensor(-2.0), atol=1e-4)
+
+
+def test_grpo_token_loss_upper_clip():
+    logits = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+    input_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1]], dtype=torch.float32)
+
+    token_logp = torch.log_softmax(logits[:, :-1, :], dim=-1)[0, 0, 1]
+    ratio_target = 2.0
+    actor_logp = token_logp - torch.log(torch.tensor(ratio_target))
+    actor_logps = torch.tensor([[0.0, float(actor_logp)]], dtype=torch.float32)
+
+    batch = {
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([1.0], dtype=torch.float32),
+        "actor_logps": actor_logps,
+    }
+
+    loss_fn = TokenClippedSurrogateLoss(clip_eps_low=0.1, clip_eps_high=0.1)
+    loss, _ = loss_fn.compute(logits, batch)
+    assert torch.allclose(loss, torch.tensor(-1.1), atol=1e-4)
 
 # ---- test_composite_loss ----
 
@@ -149,7 +304,7 @@ def test_composite_loss():
     composite_loss = CompositeLoss(terms=[term1, term2])
 
     # These inputs don't matter since the mock losses ignore them
-    dummy_logits = torch.empty(0)
+    dummy_logits = torch.zeros((1, 2, 3), dtype=torch.float32)
     dummy_batch = {}
 
     loss, stats = composite_loss.compute(dummy_logits, dummy_batch)

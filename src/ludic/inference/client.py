@@ -1,26 +1,23 @@
 from __future__ import annotations
-from typing import Any, Dict, List, Mapping, Optional, Protocol, Tuple
+from typing import Any, Dict, Mapping, Optional, Protocol, Tuple
 
 import torch  # type: ignore
 
-from ludic.types import Message, ChatResponse
-from ludic.inference.sampling import SamplingConfig
+from ludic.types import ChatResponse
+from ludic.inference.request import ChatCompletionRequest
 
 class ChatClient(Protocol):
     """
     Backend contract.
-      - accepts a fully-resolved SamplingConfig (defaults already applied)
-      - maps SamplingConfig -> backend kwargs
+      - accepts a typed request object
+      - maps request -> backend kwargs
       - executes the call and returns (ChatResponse, info)
       - can atomically push a set of parameter tensors to the runtime
     """
 
     async def complete(
         self,
-        *,
-        model: str,
-        messages: List[Message],
-        sampling: SamplingConfig,
+        request: ChatCompletionRequest,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
         ...
 

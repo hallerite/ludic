@@ -56,12 +56,133 @@ def compose_parsers(*parsers: Parser) -> Parser:
 
 
 # ---------------------------------------------------------------------
-# Strict CoT <think>...</think> prefix parser
+# XML parser factory
 # ---------------------------------------------------------------------
 
-def cot_prefix_parser(raw: str) -> ParseResult:
+def xml_parser(
+    tag: str,
+    *,
+    exact: bool = False,
+    kind: str = "inner",
+    success_reward: float = 0.1,
+    error_reward: float = -1.0,
+) -> Parser:
     """
-    STRICT CoT prefix parser.
+    Create a Parser based on an XML-ish tag contract.
+
+    Args:
+        tag: Tag name (e.g. "move" for <move>...</move>).
+        exact: If True, require the entire output to be exactly one tag
+            (aside from surrounding whitespace). If False, succeed if the tag
+            appears anywhere in the text.
+        kind:
+            - "inner": return the inner text inside <tag>...</tag>
+            - "remainder_after_prefix": require the output start with <tag>...</tag>
+              and return the remainder after the closing tag (must be non-empty).
+    """
+    tag_re = re.escape(tag)
+
+    if kind == "inner":
+        if exact:
+            pattern = re.compile(
+                rf"^\s*<{tag_re}>(.*?)</{tag_re}>\s*$",
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            expectation = f"Expected output to be exactly <{tag}>...</{tag}> (and nothing else)."
+        else:
+            pattern = re.compile(
+                rf"<{tag_re}>(.*?)</{tag_re}>",
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            expectation = f"Expected <{tag}>...</{tag}>."
+
+        def _p(raw: str) -> ParseResult:
+            try:
+                m = pattern.search(raw)
+                if not m:
+                    raise ValueError(expectation)
+
+                inner = m.group(1).strip()
+                if not inner:
+                    raise ValueError(f"Empty <{tag}> tag.")
+
+                return ParseResult(action=inner, reward=success_reward, obs=None)
+
+            except Exception as e:
+                return ParseResult(
+                    action=None,
+                    reward=error_reward,
+                    obs=f"Invalid action format: {e}",
+                )
+
+        return _p
+
+    if kind == "remainder_after_prefix":
+        if exact:
+            raise ValueError("exact=True is not supported for kind='remainder_after_prefix'")
+
+        pattern = re.compile(
+            rf"^\s*<{tag_re}>(.*?)</{tag_re}>\s*(.+)$",
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        expectation = f"Expected '<{tag}>...</{tag}>' prefix followed by content."
+
+        def _p(raw: str) -> ParseResult:
+            try:
+                m = pattern.match(raw)
+                if not m:
+                    raise ValueError(expectation)
+
+                remainder = m.group(2).strip()
+                if not remainder:
+                    raise ValueError(f"Missing content after </{tag}>.")
+
+                return ParseResult(action=remainder, reward=success_reward, obs=None)
+
+            except Exception as e:
+                return ParseResult(
+                    action=None,
+                    reward=error_reward,
+                    obs=f"Invalid action format: {e}",
+                )
+
+        return _p
+
+    raise ValueError(f"Unknown kind={kind!r}")
+
+
+def xml_tag_parser(
+    tag: str,
+    *,
+    exact: bool = False,
+    success_reward: float = 0.1,
+    error_reward: float = -1.0,
+) -> Parser:
+    """
+    Create a Parser that extracts the inner text inside <tag>...</tag>.
+
+    Notes:
+        If exact=False, this succeeds if the tag appears anywhere in the text
+        (e.g. "The answer is <move>A1</move>"). If exact=True, the output must
+        be exactly one tag (aside from surrounding whitespace).
+    """
+    return xml_parser(
+        tag,
+        exact=exact,
+        kind="inner",
+        success_reward=success_reward,
+        error_reward=error_reward,
+    )
+
+
+def think_prefix_parser(
+    raw: str,
+    *,
+    success_reward: float = 0.1,
+    error_reward: float = -1.0,
+) -> ParseResult:
+    """
+    STRICT <think>...</think> prefix parser.
 
     Required:
         <think> ... </think> ANSWER
@@ -69,51 +190,88 @@ def cot_prefix_parser(raw: str) -> ParseResult:
     Output:
         action = ANSWER
     """
-    try:
-        pattern = re.compile(
-            r"^\s*<think>(.*?)</think>\s*(.+)$",
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        m = pattern.match(raw)
-        if not m:
-            raise ValueError("Expected '<think>...</think>' prefix followed by answer.")
+    return xml_parser(
+        "think",
+        kind="remainder_after_prefix",
+        success_reward=success_reward,
+        error_reward=error_reward,
+    )(raw)
 
-        answer = m.group(2).strip()
-        if not answer:
-            raise ValueError("Missing answer after </think>.")
 
-        return ParseResult(action=answer, reward=0.0, obs=None)
-
-    except Exception as e:
-        return ParseResult(
-            action=None,
-            reward=-1.0,
-            obs=f"Invalid CoT structure: {e}",
-        )
+# Backwards-friendly alias for readability in older examples/tests.
+cot_prefix_parser = think_prefix_parser
 
 
 # ---------------------------------------------------------------------
-# Strict XML <move>...</move> parser
+# Strict \boxed{...} answer parser
 # ---------------------------------------------------------------------
 
-def xml_move_parser(raw: str) -> ParseResult:
+def extract_last_boxed_content(raw: str) -> Optional[str]:
     """
-    STRICT parser for <move>...</move>.
+    Extract the content of the last LaTeX \\boxed{...} occurrence.
+
+    Supports nested braces inside the boxed content (e.g. \\boxed{\\frac{1}{2}}).
+    Returns None if no well-formed \\boxed{...} is found.
+    """
+    matches = list(re.finditer(r"\\boxed\s*\{", raw))
+    if not matches:
+        return None
+
+    def _parse_braced(start_brace_idx: int) -> Optional[str]:
+        if start_brace_idx >= len(raw) or raw[start_brace_idx] != "{":
+            return None
+
+        depth = 0
+        i = start_brace_idx
+        while i < len(raw):
+            ch = raw[i]
+            prev = raw[i - 1] if i > 0 else ""
+
+            if ch == "{" and prev != "\\":
+                depth += 1
+            elif ch == "}" and prev != "\\":
+                depth -= 1
+                if depth == 0:
+                    return raw[start_brace_idx + 1 : i]
+            i += 1
+        return None
+
+    # Prefer the last occurrence (the model may include intermediate boxes).
+    for m in reversed(matches):
+        inner = _parse_braced(m.end() - 1)
+        if inner is not None:
+            return inner
+    return None
+
+
+def boxed_parser(
+    raw: str,
+    *,
+    success_reward: float = 0.1,
+    error_reward: float = -1.0,
+) -> ParseResult:
+    """
+    STRICT parser that requires the final answer to appear inside \\boxed{...}.
+
+    Rewards:
+        Defaults to +0.1 on success and -1.0 on failure; override via keyword
+        args or functools.partial for custom parser instances.
     """
     try:
-        m = re.search(r"<move>(.*?)</move>", raw, flags=re.DOTALL | re.IGNORECASE)
-        if not m:
-            raise ValueError("Expected <move>...</move>.")
+        inner = extract_last_boxed_content(raw)
+        if inner is None:
+            raise ValueError("Expected \\boxed{...} with the final answer.")
 
-        inner = m.group(1).strip()
+        inner = inner.strip()
         if not inner:
-            raise ValueError("Empty <move> tag.")
+            raise ValueError("Empty \\boxed{} content.")
 
-        return ParseResult(action=inner, reward=0.0, obs=None)
+        # Positive intrinsic reward for good formatting
+        return ParseResult(action=inner, reward=success_reward, obs=None)
 
     except Exception as e:
         return ParseResult(
             action=None,
-            reward=-1.0,
-            obs=f"Invalid action format: {e}",
+            reward=error_reward,
+            obs=f"Invalid boxed answer: {e}",
         )

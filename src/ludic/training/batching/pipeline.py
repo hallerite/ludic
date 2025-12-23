@@ -3,7 +3,6 @@ from __future__ import annotations
 import pickle
 import logging
 import asyncio
-import redis
 from typing import List, Callable, Optional
 from dataclasses import replace
 
@@ -13,7 +12,6 @@ from ludic.training.types import (
     SAWItem, 
     RolloutRequest, 
     CreditAssigner,
-    TokenizeFn
 )
 from ludic.inference.client import VersionedClient
 from .rollout_engine import RolloutEngine
@@ -26,7 +24,7 @@ class PipelineBatchSource(BatchSource):
     Pulls completed, pre-processed SAWItems from a Redis queue.
     
     This decouples the Trainer from the generation latency. The Trainer
-    simply blocks on the queue until data arrives.
+    simply blocks on the queue until a macro-batch is assembled.
     """
     def __init__(
         self, 
@@ -35,6 +33,13 @@ class PipelineBatchSource(BatchSource):
         batch_size: int = 4,
         poll_timeout: int = 1
     ):
+        try:
+            import redis  # type: ignore
+        except ImportError as exc:
+            raise ImportError(
+                "PipelineBatchSource requires the 'redis' package. Install with: uv sync --extra pipelinerl"
+            ) from exc
+
         self.r = redis.from_url(redis_url)
         self.queue_key = queue_key
         self.batch_size = batch_size
@@ -73,7 +78,8 @@ class PipelineBatchSource(BatchSource):
             avg_reward = total_r / len(items)
 
         meta = {
-            "batch_size": len(items),
+            "target_rollouts": len(items),
+            "num_samples": len(items),
             "avg_total_reward": avg_reward,
             "source": "pipeline_redis"
         }
@@ -93,8 +99,6 @@ async def run_pipeline_actor(
     queue_key: str = "ludic_queue",
     max_steps: int = 10,
     concurrency: int = 4,
-    retokenize: bool = False,
-    tokenize: Optional[TokenizeFn] = None,
     client: Optional[VersionedClient] = None,
 ):
     """
@@ -105,6 +109,13 @@ async def run_pipeline_actor(
     4. Delegate generation AND collation to the shared Engine.
     5. Push the resulting SAWItems to Redis.
     """
+    try:
+        import redis  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            "run_pipeline_actor requires the 'redis' package. Install with: uv sync --extra pipelinerl"
+        ) from exc
+
     r_conn = redis.from_url(redis_url)
     logger.info(f"Pipeline Actor connected to Redis at {redis_url}")
     
@@ -140,8 +151,6 @@ async def run_pipeline_actor(
                 max_steps=max_steps,
                 credit_assigner=credit_assigner,
                 concurrency=concurrency,
-                retokenize=retokenize,
-                tokenize=tokenize
             )
         except Exception as e:
             logger.error(f"Error in actor generation loop: {e}")

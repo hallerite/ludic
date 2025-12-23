@@ -6,7 +6,8 @@ from typing import Optional, Tuple, List, Dict, Any
 import pytest
 
 from ludic.envs.single_agent_env import SingleAgentEnv
-from ludic.types import Observation, Info, StepOutcome, SamplingArgs
+from ludic.types import Observation, Info, StepOutcome
+from ludic.inference import InferenceSpec, SamplingParams, ReturnSpec
 from ludic.training.types import (
     RolloutRequest,
     ProtocolSpec,
@@ -86,166 +87,80 @@ class SeedableMockEnv(SingleAgentEnv):
 @pytest.mark.asyncio
 async def test_grpo_e2e_seed_grouping_and_credit() -> None:
     """
-    Tests the full GRPO data pipeline:
-    1. GRPORequestStrategy expands N requests to N*G.
-    2. RolloutEngine uses env_seed for reset() and sampling_seed for act().
-    3. The Env is deterministic on env_seed (same obs).
-    4. The *Mock* Agent is deterministic on sampling_seed (different actions).
-    5. GroupNormalizedReturn computes advantages based on the seed groups.
+    End-to-end grouped rollout + credit assignment:
+    - GRPORequestStrategy expands requests into groups.
+    - Env seed controls reset obs; sampling seed controls agent action.
+    - GroupNormalizedReturn assigns normalized group advantages.
     """
+    group_size = 2
+    seed_groups = (100, 200)
+    base_seeds = (9000, 8000)
 
-    # ---- 1. Arrange ----
+    env_registry = {"env": lambda **kwargs: SeedableMockEnv(correct_action="A")}
 
-    N_GROUPS = 2
-    G_PER_GROUP = 2
-    seed_group_A = 100
-    seed_group_B = 200
-    env_registry = {
-        "env_A": lambda **kwargs: SeedableMockEnv(correct_action="A"),
-        "env_B": lambda **kwargs: SeedableMockEnv(correct_action="B"),
-    }
-    # ctx_registry is no longer needed here
+    seed_to_action_map = {}
+    for base_seed in base_seeds:
+        seed_to_action_map[base_seed] = "A"
+        seed_to_action_map[base_seed + 1] = "Z"
 
-    base_seed_A = 9000
-    base_seed_B = 8000
+    credit_assigner = GroupNormalizedReturn(group_size=group_size, normalize_adv=True)
 
-    # This map defines the *guaranteed* agent behavior
-    seed_to_action_map = {
-        base_seed_A + 0: "A",  # Group A, Rollout 0 -> Correct (1.0)
-        base_seed_A + 1: "Z",  # Group A, Rollout 1 -> Incorrect (-0.1)
-        base_seed_B + 0: "B",  # Group B, Rollout 0 -> Correct (1.0)
-        base_seed_B + 1: "Y",  # Group B, Rollout 1 -> Incorrect (-0.1)
-    }
-
-    # Use the new SeedableMockAgent
-    # agent = SeedableMockAgent(seed_map=seed_to_action_map) # <-- Removed
-
-    credit_assigner = GroupNormalizedReturn(normalize_adv=True)
-
-    # --- Create the Protocol Factory ---
-    # This creates a new agent worker for each concurrent rollout
     def create_protocol() -> InteractionProtocol:
         agent = SeedableMockAgent(seed_map=seed_to_action_map)
         return SingleAgentSyncProtocol(agent=agent)
-    # -----------------------------------
-    
-    protocol_registry = {
-        "grpo_protocol": create_protocol
-    }
 
-    engine = RolloutEngine(
-        protocol_registry=protocol_registry,
-        env_registry=env_registry,
-    )
+    protocol_registry = {"grpo_protocol": create_protocol}
+    engine = RolloutEngine(protocol_registry=protocol_registry, env_registry=env_registry)
 
     def make_expanded_requests() -> List[RolloutRequest]:
-        # 1. Define Base Requests
-        s_args_A: SamplingArgs = {
-            "temperature": 0.7,
-            "max_tokens": 5,
-            "seed": base_seed_A,
-            "extras": {"extra_body": {"return_token_ids": True}},
-        }
-        s_args_B: SamplingArgs = {
-            "temperature": 0.7,
-            "max_tokens": 5,
-            "seed": base_seed_B,
-            "extras": {"extra_body": {"return_token_ids": True}},
-        }
-
-        req_A = RolloutRequest(
-            env=EnvSpec(kind="env_A", kwargs={}),
-            protocol=ProtocolSpec(kind="grpo_protocol", kwargs={}),
-            seed=seed_group_A,  # Force env seed for Group A
-            sampling_args=s_args_A,
+        inference = InferenceSpec(
+            sampling=SamplingParams(temperature=0.7, max_tokens=5),
+            return_=ReturnSpec.for_eval(return_token_ids=True),
         )
-        req_B = RolloutRequest(
-            env=EnvSpec(kind="env_B", kwargs={}),
-            protocol=ProtocolSpec(kind="grpo_protocol", kwargs={}),
-            seed=seed_group_B,  # Force env seed for Group B
-            sampling_args=s_args_B,
-        )
-        
-        # 2. Expand using GRPO Strategy
-        strategy = GRPORequestStrategy(group_size=G_PER_GROUP)
-        return strategy.expand([req_A, req_B])
+        base_requests = [
+            RolloutRequest(
+                env=EnvSpec(kind="env", kwargs={}),
+                protocol=ProtocolSpec(kind="grpo_protocol", kwargs={}),
+                env_seed=seed,
+                sampling_seed=base_seed,
+                inference=inference,
+            )
+            for seed, base_seed in zip(seed_groups, base_seeds)
+        ]
+        strategy = GRPORequestStrategy(group_size=group_size)
+        return strategy.expand(base_requests)
 
-    # NOTE: We use the STANDARD RolloutBatchSource, effectively injecting
-    # the GRPO logic via the expansion function above.
     batch_source = RolloutBatchSource(
         orchestrator=engine,
         credit_assigner=credit_assigner,
         requests_fn=make_expanded_requests,
         max_steps=3,
-        retokenize=False,
-        tokenize=None,
     )
-
-    # ---- 2. Act ----
 
     saw_batch = await batch_source.next_batch()
 
-    # ---- 3. Assert ----
-
-    assert saw_batch.meta["batch_size"] == N_GROUPS * G_PER_GROUP
-    assert len(saw_batch.items) == N_GROUPS * G_PER_GROUP
-
-    rollouts: Dict[str, Dict[str, Any]] = defaultdict(dict)
+    assert saw_batch.meta["target_rollouts"] == len(seed_groups) * group_size
+    rollouts: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for item in saw_batch.items:
-        rollout_id = item.meta["rollout_id"]
-        rollouts[rollout_id]["id"] = rollout_id
-        rollouts[rollout_id]["used_seed"] = item.meta["engine"]["used_seed"]
-        rollouts[rollout_id]["prev_obs"] = item.meta["prev_obs"]
-        rollouts[rollout_id]["reward"] = item.meta["reward"]
-        rollouts[rollout_id]["weight"] = item.weight
+        meta = item.meta
+        rollouts[meta["engine"]["env_seed"]].append(
+            {
+                "sampling_seed": meta["engine"]["sampling_seed"],
+                "prev_obs": meta["prev_obs"],
+                "reward": meta["reward"],
+                "weight": item.weight,
+            }
+        )
 
-        assert "prompt_token_ids" in item.meta
-        assert "completion_token_ids" in item.meta
-        assert item.meta["engine"]["protocol_kind"] == "grpo_protocol"
-
-    rollout_list = list(rollouts.values())
-    assert len(rollout_list) == 4
-
-    # --- Assert 1: Correct Grouping by Env Seed ---
-    seeds_seen = {r["used_seed"] for r in rollout_list}
-    assert seeds_seen == {seed_group_A, seed_group_B}
-
-    rollouts_in_A = [r for r in rollout_list if r["used_seed"] == seed_group_A]
-    rollouts_in_B = [r for r in rollout_list if r["used_seed"] == seed_group_B]
-
-    assert len(rollouts_in_A) == G_PER_GROUP
-    assert len(rollouts_in_B) == G_PER_GROUP
-
-    # --- Assert 2: Deterministic Env Start ---
-    obs_A = {r["prev_obs"] for r in rollouts_in_A}
-    assert len(obs_A) == 1
-    assert f"seed {seed_group_A}" in list(obs_A)[0]
-    assert "Correct action is A" in list(obs_A)[0]
-
-    obs_B = {r["prev_obs"] for r in rollouts_in_B}
-    assert len(obs_B) == 1
-    assert f"seed {seed_group_B}" in list(obs_B)[0]
-    assert "Correct action is B" in list(obs_B)[0]
-
-    assert obs_A != obs_B
-
-    # --- Assert 3: Deterministic Agent Actions ---
-    rewards_A = {r["reward"] for r in rollouts_in_A}
-    rewards_B = {r["reward"] for r in rollouts_in_B}
-
-    assert rewards_A == {1.0, -0.1}
-    assert rewards_B == {1.0, -0.1}
-
-    # --- Assert 4: Correct Credit Assignment ---
-    # Group A: rewards = [1.0, -0.1].
-    #   mean = 0.45, adv = [0.55, -0.55], std = 0.55, norm_adv = [1.0, -1.0]
-    weights_A = {r["weight"] for r in rollouts_in_A}
-    assert len(weights_A) == 2
-    assert 1.0 in {round(w, 4) for w in weights_A}
-    assert -1.0 in {round(w, 4) for w in weights_A}
-
-    # Group B: rewards = [1.0, -0.1]. Same calculation.
-    weights_B = {r["weight"] for r in rollouts_in_B}
-    assert len(weights_B) == 2
-    assert 1.0 in {round(w, 4) for w in weights_B}
-    assert -1.0 in {round(w, 4) for w in weights_B}
+    assert set(rollouts) == set(seed_groups)
+    for seed, base_seed in zip(seed_groups, base_seeds):
+        group = rollouts[seed]
+        assert len(group) == group_size
+        assert {r["sampling_seed"] for r in group} == {base_seed, base_seed + 1}
+        obs = {r["prev_obs"] for r in group}
+        assert len(obs) == 1
+        assert f"seed {seed}" in next(iter(obs))
+        rewards = sorted(r["reward"] for r in group)
+        assert rewards == [-0.1, 1.0]
+        weights = sorted(round(r["weight"], 4) for r in group)
+        assert weights == [-1.0, 1.0]

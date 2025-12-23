@@ -1,15 +1,30 @@
 [project]
 name = "ludic"
+authors = [
+    {name = "hallerite", email = "me@hallerite.com"},
+]
+description = "Ludic - The LLM-RL library for the age of experience"
 version = "0.1.0"
-description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = "~=3.12.0"
 dependencies = [
+    "aiohttp>=3.13.2",
+    "beartype>=0.22.9",
+    "jaxtyping>=0.3.4",
     "openai>=2.7.1",
     "peft>=0.18.0",
     "rich>=14.2.0",
     "torch>=2.8.0",
-    "vllm>=0.10.0",
+    "vllm>=0.13.0",
+]
+
+[project.optional-dependencies]
+pipelinerl = [
+    "redis>=7.1.0",
+]
+examples = [
+    "datasets==4.4.1", # pinned to the versions in uv.lock that are known to work
+    "math-verify==0.8.0", # pinned to the versions in uv.lock that are known to work
 ]
 
 [build-system]
@@ -17,21 +32,27 @@ requires = ["uv_build>=0.9.5,<0.10.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
-dev = [
-    "mypy>=1.18.2",
+test = [
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",
+]
+lint = [
     "ruff>=0.14.5",
 ]
-pipelinerl = [
-    "aiohttp>=3.13.2",
-    "redis>=7.1.0",
+typing = [
+    "ty>=0.0.5",
+]
+dev = [
+    { include-group = "test" },
+    { include-group = "lint" },
+    { include-group = "typing" },
 ]
 
 [tool.pytest.ini_options]
 markers = [
     "integration: marks tests as integration tests",
-    "gpu: marks tests as needing a GPU"
+    "gpu: marks tests as needing a GPU",
+    "report: marks tests that primarily emit diagnostic reports rather than asserting strict correctness",
 ]
 testpaths = ["tests"]
 

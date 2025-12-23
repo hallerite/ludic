@@ -1,7 +1,7 @@
 from __future__ import annotations
 from collections import defaultdict
 import uuid
-from typing import Dict, List, Any
+from typing import Any, Dict, List, Optional
 
 from ludic.types import Rollout, Step
 
@@ -36,13 +36,22 @@ class TraceCollector:
         """
         self._traces[agent_id].append(step)
 
-    def extract_rollouts(self) -> List[Rollout]:
+    def extract_rollouts(
+        self,
+        *,
+        episode_truncated: bool = False,
+        truncation_reason: Optional[str] = None,
+    ) -> List[Rollout]:
         """
         Convert all collected traces into separate, flat Rollout objects.
-        
+
         Each Rollout represents the single-agent trajectory of one participant
         in the multi-agent episode.
-        
+
+        Args:
+            episode_truncated: Whether the episode was truncated (time limit or env).
+            truncation_reason: "max_steps" | "env" | None describing the cause.
+
         Returns:
             A list of Rollout objects, one per agent that generated at least one step.
         """
@@ -50,7 +59,7 @@ class TraceCollector:
         for agent_id, steps in self._traces.items():
             if not steps:
                 continue
-            
+
             # Create a clean, single-agent rollout
             # We treat each agent's trace as a distinct episode for training purposes.
             r = Rollout(
@@ -59,8 +68,55 @@ class TraceCollector:
                 meta={
                     **self._global_meta,
                     "agent_id": agent_id,
+                    "episode_truncated": episode_truncated,
+                    "truncation_reason": truncation_reason,
                 }
             )
             rollouts.append(r)
-            
+
+        return rollouts
+
+    def extract_rollouts_with_per_agent_status(self) -> List[Rollout]:
+        """
+        Convert all collected traces into Rollout objects, deriving
+        truncation status from each agent's last step.
+
+        This is used when agents finish independently (some terminate,
+        some get truncated, some hit max_steps).
+
+        Returns:
+            A list of Rollout objects, one per agent that generated at least one step.
+        """
+        rollouts = []
+        for agent_id, steps in self._traces.items():
+            if not steps:
+                continue
+
+            last_step = steps[-1]
+
+            # Derive episode_truncated and truncation_reason from the agent's last step
+            if last_step.terminated:
+                episode_truncated = False
+                truncation_reason = None
+            elif last_step.truncated:
+                episode_truncated = True
+                # Check if it was max_steps or env-initiated
+                truncation_reason = last_step.info.get("truncation_reason", "env")
+            else:
+                # Should not happen if protocol properly marks all endpoints
+                episode_truncated = False
+                truncation_reason = None
+
+            r = Rollout(
+                id=str(uuid.uuid4()),
+                steps=steps,
+                meta={
+                    **self._global_meta,
+                    "agent_id": agent_id,
+                    "episode_truncated": episode_truncated,
+                    "truncation_reason": truncation_reason,
+                },
+            )
+            rollouts.append(r)
+
         return rollouts

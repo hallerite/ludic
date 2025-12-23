@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import torch
 
-from typing import Any, Optional, List, Tuple, Mapping, Dict
-from dataclasses import asdict
-
+from typing import Any, Optional, Tuple, Mapping, Dict
 from ludic.envs.single_agent_env import SingleAgentEnv
-from ludic.types import Message, StepOutcome, Observation, Info
+from ludic.types import StepOutcome, Observation, Info
 from ludic.inference.client import ChatResponse, ChatClient
-from ludic.inference.sampling import SamplingConfig
+from ludic.inference.request import ChatCompletionRequest
 from ludic.agents.base_agent import Agent
 from ludic.context.base import ContextStrategy
 from ludic.context.full_dialog import FullDialog
@@ -19,20 +17,29 @@ def _mock_parser(raw: str) -> ParseResult:
     """A simple parser that just passes the text through."""
     return ParseResult(action=raw, reward=0.0, obs=None)
 
+# ---- Common test tools --------------------------------------------------
+
+def calculator_tool(a: int, b: int) -> int:
+    """Adds two numbers."""
+    return a + b
+
 # ---- Mock client ---------------------------------------------------------
 
 class MockClient(ChatClient):
-    def __init__(self, text: str = "1") -> None:
+    def __init__(
+        self,
+        text: str = "1",
+        finish_reason: str = "stop",
+    ) -> None:
         self._text = text
+        self._finish_reason = finish_reason
 
     async def complete(
         self,
-        *,
-        model: str,
-        messages: List[Message],
-        sampling: SamplingConfig,
+        request: ChatCompletionRequest,
     ) -> tuple[ChatResponse, Dict[str, Any]]:
-        return ChatResponse(text=self._text), {"used_args": asdict(sampling)}
+        resp = ChatResponse(text=self._text, finish_reason=self._finish_reason)
+        return resp, {"used_request": request.to_dict()}
 
     def sync_weights(self, params: Mapping[str, torch.Tensor], **kwargs) -> str:  # type: ignore[name-defined]
         return "mock-version"
@@ -43,13 +50,18 @@ class MockAgent(Agent):
     Uses FullDialog and a pass-through parser by default.
     """
     def __init__(
-        self, 
-        client: ChatClient = MockClient(), 
+        self,
+        client: ChatClient | None = None,
         model: str = "mock",
-        ctx: ContextStrategy = FullDialog(),
-        parser: Parser = _mock_parser
+        ctx: ContextStrategy | None = None,
+        parser: Parser = _mock_parser,
     ) -> None:
-        super().__init__(client=client, model=model, ctx=ctx, parser=parser)
+        super().__init__(
+            client=client or MockClient(),
+            model=model,
+            ctx=ctx or FullDialog(),
+            parser=parser,
+        )
 
 
 # ---- Seedable Mock Client for GRPO Test ----
@@ -64,14 +76,13 @@ class SeedableMockClient(ChatClient):
 
     async def complete(
         self,
-        *,
-        model: str,
-        messages: List[Message],
-        sampling: SamplingConfig,
+        request: ChatCompletionRequest,
     ) -> tuple[ChatResponse, Dict[str, Any]]:
         
         # Get the deterministic text output based on the sampling seed
-        text_out = self._seed_map.get(sampling.seed, "DEFAULT_FALLBACK")
+        if request.seed is None:
+            raise ValueError("SeedableMockClient requires request.seed to be set")
+        text_out = self._seed_map.get(int(request.seed), "DEFAULT_FALLBACK")
         
         resp = ChatResponse(
             text=text_out,
@@ -80,7 +91,7 @@ class SeedableMockClient(ChatClient):
             completion_token_ids=[10, 11] # Action
         )
         # Return the serializable dict, not the object
-        return resp, {"used_args": asdict(sampling)}
+        return resp, {"used_request": request.to_dict()}
 
     def sync_weights(self, params: Mapping[str, torch.Tensor], **kwargs) -> str:
         # Not needed for this test
@@ -91,15 +102,15 @@ class SeedableMockAgent(Agent):
     An agent wired to the SeedableMockClient.
     """
     def __init__(
-        self, 
+        self,
         seed_map: Dict[int, str],
-        ctx: ContextStrategy = FullDialog(),
-        parser: Parser = _mock_parser
+        ctx: ContextStrategy | None = None,
+        parser: Parser = _mock_parser,
     ) -> None:
         super().__init__(
             client=SeedableMockClient(seed_map), 
             model="seedable_mock",
-            ctx=ctx,
+            ctx=ctx or FullDialog(),
             parser=parser
         )
 
