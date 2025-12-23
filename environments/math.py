@@ -41,7 +41,7 @@ class MATHEnv(DatasetQAEnv):
         except Exception as e:
             raise SystemExit(
                 "MATHEnv requires 'math-verify' (import name: math_verify) for grading. "
-                "Install with: uv pip install math-verify"
+                "Install with: uv sync --extra examples"
             ) from e
 
         def _verifier(pred: str, target: str) -> bool:

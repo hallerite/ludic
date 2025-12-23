@@ -8,7 +8,7 @@ Example:
         --host 127.0.0.1 --port 8000 \
         --limit 200
 
-Requires: uv pip install datasets math-verify
+Requires: uv sync --extra examples
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ def load_gsm8k(split: str, limit: int | None) -> List[dict]:
     except ImportError as e:
         raise SystemExit(
             "This example requires the 'datasets' package. "
-            "Install with: uv pip install datasets"
+            "Install with: uv sync --extra examples"
         ) from e
 
     ds = load_dataset("gsm8k", "main", split=split)

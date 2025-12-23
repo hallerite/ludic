@@ -449,10 +449,5 @@ class CheckpointManager:
 
     @staticmethod
     def _load_safetensors(path: Path) -> Dict[str, torch.Tensor]:
-        try:
-            from safetensors.torch import load_file  # type: ignore
-        except Exception as e:  # pragma: no cover - optional dependency
-            raise RuntimeError(
-                "Cannot load safetensors checkpoint. Install with: uv pip install safetensors"
-            ) from e
+        from safetensors.torch import load_file  # type: ignore
         return load_file(str(path), device="cpu")

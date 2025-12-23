@@ -40,7 +40,7 @@ If you want to find your way around quickly, there are two main things in here: 
 - `environments/`: small runnable environments and configs you can import from, or execute directly when you just want to play with an env in isolation.
 - `data/`: small datasets and artifacts used by some examples.
 - `tests/`: unit/integration tests (pytest markers include `integration` and `gpu`).
-- `scripts/`: standalone utilities (for instance `push_to_hub.py` for uploading checkpoints to the HuggingFace Hub).
+- `scripts/`: standalone utilities (e.g., `calibrate_micro_batch.py` for micro-batch sizing; see `scripts/README.md`).
 
 If you care about truncation semantics (env time limits vs protocol cutoffs vs model finish reasons), read `CONSIDERATIONS.md`.
 
@@ -49,6 +49,12 @@ If you care about truncation semantics (env time limits vs protocol cutoffs vs m
 - Training stats use canonical prefixes: `train/`, `eval/`, and `perf/` (e.g., `train/loss`, `eval/accuracy`, `perf/gpu_mem_alloc_mb`).
 - `train/step` and `eval/step` are used by loggers to annotate panels and runs.
 - For W&B logging, set `WANDB_PROJECT` to your preferred project name; if unset, it defaults to `Ludic`.
+
+### Training Knobs (Macro vs Micro)
+
+- `rollouts_per_update`: number of rollouts per trainer step (must be divisible by `group_size` for GRPO-style grouping).
+- `max_seq_len`: maximum token length for any single sample; trainer raises if exceeded.
+- `micro_token_budget`: max padded tokens per micro-batch; the collator buckets + splits a macro-batch to fit this budget.
 
 ### Examples at a glance
 
@@ -67,7 +73,7 @@ If you care about truncation semantics (env time limits vs protocol cutoffs vs m
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.12+
 
 - PyTorch >= 2.8.0 with CUDA for training examples
 
@@ -86,7 +92,7 @@ uv sync
 For running example code use:
 
 ```bash
-uv sync --group examples
+uv sync --extra examples
 ```
 
 ## TODO

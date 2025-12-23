@@ -19,105 +19,12 @@ from ludic.training.checkpoint import CheckpointConfig, CheckpointManager
 from ludic.training.algorithm import RLAlgorithm
 from ludic.training.loggers import TrainingLogger
 from ludic.training.config import TrainerConfig
+from ludic.training.batching.micro_batching import collate_saw_items, split_items_by_token_budget
 from ludic.training.stats import aggregate_stats, Reducer
 from ludic.eval.evaluator import Evaluator
-from ludic.training.types import SAWBatch, SAWItem, BatchSource
+from ludic.training.types import SAWBatch, BatchSource
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Collation: SAWItems -> tensor batch
-# ---------------------------------------------------------------------------
-
-def _collate_saw_items(
-    items: List[SAWItem],
-    *,
-    pad_token_id: int,
-    device: torch.device,
-) -> Dict[str, Tensor]:
-    """
-    Collate a list of SAWItem into a simple dense batch of tensors.
-
-    - Left-aligns sequences and pads to max length in this batch.
-    - Returns a dict suitable for RLAlgorithm.loss.compute():
-
-          {
-              "input_ids":      [B, T] long,
-              "attention_mask": [B, T] long,
-              "action_mask":    [B, T] float,
-              "weight":         [B]    float,
-          }
-
-    If you want microbatching or a DataLoader, you can refactor this later.
-    """
-    if not items:
-        raise ValueError("Cannot collate empty list of SAWItems")
-
-    lengths = [len(it.input_ids) for it in items]
-    max_len = max(lengths)
-
-    input_ids_list: List[Tensor] = []
-    attn_mask_list: List[Tensor] = []
-    action_mask_list: List[Tensor] = []
-    weights_list: List[Tensor] = []
-
-    for it in items:
-        L = len(it.input_ids)
-
-        ids = torch.full((max_len,), pad_token_id, dtype=torch.long)
-        am = torch.zeros((max_len,), dtype=torch.long)
-        actm = torch.zeros((max_len,), dtype=torch.float32)
-
-        ids[:L] = torch.tensor(it.input_ids, dtype=torch.long)
-        am[:L] = torch.tensor(it.attention_mask, dtype=torch.long)
-        actm[:L] = torch.tensor(it.action_mask, dtype=torch.float32)
-
-        input_ids_list.append(ids)
-        attn_mask_list.append(am)
-        action_mask_list.append(actm)
-        weights_list.append(torch.tensor(it.weight, dtype=torch.float32))
-
-    # actor_logps is optional; required for ratio objectives (PPO/GRPO).
-    old_logp_action: List[Optional[float]] = []
-    actor_logps_tokens: List[Optional[List[float]]] = []
-    for it in items:
-        actor = it.actor_logps
-        actor_logps_tokens.append(None if actor is None else list(actor.token_logps))
-        old_logp_action.append(None if actor is None else float(sum(float(v) for v in actor.token_logps)))
-
-    batch: Dict[str, Tensor] = {
-        "input_ids": torch.stack(input_ids_list, dim=0).to(device),
-        "attention_mask": torch.stack(attn_mask_list, dim=0).to(device),
-        "action_mask": torch.stack(action_mask_list, dim=0).to(device),
-        "weight": torch.stack(weights_list, dim=0).to(device),
-    }
-
-    if any(v is not None for v in old_logp_action):
-        if any(v is None for v in old_logp_action):
-            raise ValueError(
-                "Mixed presence of actor_logps; either provide it for all samples or none."
-            )
-        assert all(v is not None for v in actor_logps_tokens)
-
-        # Optional token-level actor logps aligned to token positions.
-        # Shape: [B, T], zeros outside action region / padding.
-        actor_logps_batch = torch.zeros((len(items), max_len), dtype=torch.float32, device=device)
-        for b, it in enumerate(items):
-            token_logps = actor_logps_tokens[b]
-            assert token_logps is not None
-            action_positions = [i for i, m in enumerate(it.action_mask) if int(m) == 1]
-            if len(token_logps) != len(action_positions):
-                raise ValueError(
-                    "Length mismatch between actor_logps and the number of action tokens."
-                )
-            for lp, pos in zip(token_logps, action_positions):
-                actor_logps_batch[b, pos] = float(lp)
-
-        batch["actor_logps"] = actor_logps_batch
-        tensor_vals = [float(v) for v in old_logp_action]  # type: ignore[arg-type]
-        batch["old_logp_action"] = torch.tensor(tensor_vals, dtype=torch.float32, device=device)
-    return batch
 
 
 # ---------------------------------------------------------------------------
@@ -129,20 +36,21 @@ class Trainer:
     """
     Orchestrates the training loop with gradient accumulation:
 
-        Loop `grad_accum_steps`:
-            BatchSource.next_batch() → micro-batch
-              ↓
-            collate → tensors
-              ↓
-            RLAlgorithm.compute_loss(model, batch)
-              ↓
-            scaled_loss.backward() (with gradient sync disabled on non-final micros for FSDP)
+        BatchSource.next_batch() → macro-batch
           ↓
-        optimizer.step()
+        bucket + split (token budget) → micro-batches
           ↓
-        optimizer.zero_grad()  # <-- Grads freed
+        collate (per micro) → tensors
           ↓
-        publisher.publish(...)     # <-- Sync
+        RLAlgorithm.compute_loss(model, batch)
+          ↓
+        scaled_loss.backward() (with gradient sync disabled on non-final micros for FSDP)
+      ↓
+    optimizer.step()
+      ↓
+    optimizer.zero_grad()  # <-- Grads freed
+      ↓
+    publisher.publish(...)     # <-- Sync
 
     Trainer is agnostic to envs, contexts, rollouts, and tokenization.
 
@@ -185,7 +93,8 @@ class Trainer:
 
             batch_source:
                 Any object implementing BatchSource.next_batch() -> SAWBatch.
-                This is where rollouts, replay, branching, curricula live.
+                The SAWBatch is treated as a macro-batch and split into
+                micro-batches for gradient accumulation.
 
             publisher:
                 Abstract interface to push weights to inference workers. If None, weight
@@ -193,7 +102,7 @@ class Trainer:
 
             cfg:
                 TrainerConfig for device, optimizer hyperparams, pad_token_id,
-                grad_accum_steps, and sync_every_steps.
+                micro_token_budget, max_seq_len, and sync_every_steps.
 
             param_filter:
                 Optional predicate (name, Tensor) -> bool deciding which
@@ -256,7 +165,7 @@ class Trainer:
         # ---- Gradient Checkpointing Setup ----------------------------
         if enable_gradient_checkpointing:
             logger.info("🛡️ Enabling Gradient Checkpointing (Activation Checkpointing)...")
-            
+
             # 1. Enable on the model (HuggingFace standard API)
             if hasattr(self.model, "gradient_checkpointing_enable"):
                 self.model.gradient_checkpointing_enable()
@@ -351,7 +260,8 @@ class Trainer:
         Stats handling:
         - gpu_* keys: reduced with MAX (peak memory stats)
         - sum_keys (num_samples, etc.): reduced with SUM (counts)
-        - all other keys: reduced with SUM then divided by world_size (averages)
+        - all other keys: reduced with SUM of (value * num_samples) then divided
+          by total num_samples, falling back to world_size when num_samples is missing.
         """
         if not self.cfg.reduce_stats_across_ranks:
             return stats
@@ -364,25 +274,52 @@ class Trainer:
             "num_rollouts",
             "total_completion_tokens",
         }
+        has_num_samples = "num_samples" in stats
+        local_samples = float(stats.get("num_samples", 0.0)) if has_num_samples else 1.0
         reduced: Dict[str, float] = {}
 
         # Separate keys into gpu (MAX) and non-gpu (SUM) groups
         # Sort keys to ensure consistent ordering across ranks
         gpu_keys = sorted([k for k in stats if k.startswith("gpu_") and isinstance(stats[k], (int, float))])
-        sum_reduce_keys = sorted([k for k in stats if not k.startswith("gpu_") and isinstance(stats[k], (int, float))])
+        mean_reduce_keys = sorted(
+            [
+                k for k in stats
+                if (
+                    not k.startswith("gpu_")
+                    and k not in sum_keys
+                    and isinstance(stats[k], (int, float))
+                )
+            ]
+        )
+        sum_reduce_keys = sorted(
+            [
+                k for k in stats
+                if (k in sum_keys and isinstance(stats[k], (int, float)))
+            ]
+        )
 
         gpu_vals = [float(stats[k]) for k in gpu_keys]
         sum_reduce_vals = [float(stats[k]) for k in sum_reduce_keys]
+        mean_reduce_vals = [float(stats[k]) * local_samples for k in mean_reduce_keys]
 
         # Batch all_reduce for SUM keys
         if sum_reduce_vals:
             t_sum = torch.tensor(sum_reduce_vals, dtype=torch.float32, device=device)
             dist.all_reduce(t_sum, op=dist.ReduceOp.SUM)
             for i, k in enumerate(sum_reduce_keys):
-                if k in sum_keys:
-                    reduced[k] = float(t_sum[i].item())
-                else:
-                    reduced[k] = float(t_sum[i].item()) / float(world_size)
+                reduced[k] = float(t_sum[i].item())
+
+        # Batch all_reduce for mean keys using sample-weighted sums.
+        if mean_reduce_vals:
+            t_mean = torch.tensor(mean_reduce_vals + [local_samples], dtype=torch.float32, device=device)
+            dist.all_reduce(t_mean, op=dist.ReduceOp.SUM)
+            total_samples = float(t_mean[-1].item())
+            if has_num_samples:
+                denom = total_samples if total_samples > 0 else float(world_size)
+            else:
+                denom = float(world_size)
+            for i, k in enumerate(mean_reduce_keys):
+                reduced[k] = float(t_mean[i].item()) / denom
 
         # Batch all_reduce for MAX keys (gpu stats)
         if gpu_vals:
@@ -513,7 +450,8 @@ class Trainer:
         """
         One full "macro" RL step with gradient accumulation:
 
-            - Accumulate gradients over `cfg.grad_accum_steps` micro-batches
+            - Split the macro-batch into micro-batches using `cfg.micro_token_budget`
+            - Accumulate gradients over those micro-batches
             - Perform one optimizer step
             - Free gradients
             - Optionally push updated params into runtime
@@ -523,64 +461,76 @@ class Trainer:
             train/*, eval/*, and perf/* keys for logging.
         """
         device = torch.device(self.cfg.model_device)
-        grad_accum_steps = max(1, int(self.cfg.grad_accum_steps))
+        micro_token_budget = int(self.cfg.micro_token_budget)
+        max_seq_len = int(self.cfg.max_seq_len)
 
         all_micro_stats: List[Dict[str, float]] = []
         all_saw_batches: List[SAWBatch] = []
 
-        # ---- 1) Accumulation Loop (Micro-Steps) ------------------------
+        # ---- 1) Fetch Macro-Batch ---------------------------------------
 
         # Note: Gradients are *not* zeroed here. They are accumulated
         # from the previous state (which should be zero).
         self.model.train()
 
-        for micro_step_idx in range(grad_accum_steps):
-            
-            # ---- 1a) Sample Valid Micro-batch (with Rejection Loop) ----
-            # For PipelineRL, we might receive stale data from the queue.
-            # We loop until we get a batch containing at least one fresh item.
-            while True:
-                saw_batch: SAWBatch = await self._batch_source.next_batch()
-                
-                # If configured, filter out items that exceed max_lag.
-                if self.cfg.max_lag is not None:
-                    current_time = self._train_step_idx
-                    limit = self.cfg.max_lag
-                    
-                    fresh_items = []
-                    for item in saw_batch.items:
-                        # Default to current_time (0 lag) if tag is missing
-                        item_ver = item.meta.get("policy_version", current_time)
-                        if (current_time - item_ver) <= limit:
-                            fresh_items.append(item)
-                    
-                    # Update the batch with only fresh items
-                    saw_batch.items = fresh_items
+        # For PipelineRL, we might receive stale data from the queue.
+        # We loop until we get a batch containing at least one fresh item.
+        while True:
+            saw_batch = await self._batch_source.next_batch()
 
-                # Algorithm-specific preprocessing (CPU-side) before collation.
-                if self.algo.preprocess is not None:
-                    saw_batch = self.algo.preprocess(saw_batch)
+            # If configured, filter out items that exceed max_lag.
+            if self.cfg.max_lag is not None:
+                current_time = self._train_step_idx
+                limit = self.cfg.max_lag
 
-                # If the batch is empty (e.g. all stale), drop it and fetch another.
-                if not saw_batch.items:
-                    continue
+                fresh_items = []
+                for item in saw_batch.items:
+                    # Default to current_time (0 lag) if tag is missing
+                    item_ver = item.meta.get("policy_version", current_time)
+                    if (current_time - item_ver) <= limit:
+                        fresh_items.append(item)
 
-                # Batch has valid items, proceed to collation
-                break
+                # Update the batch with only fresh items
+                saw_batch.items = fresh_items
 
-            all_saw_batches.append(saw_batch)
+            # Algorithm-specific preprocessing (CPU-side) before collation.
+            if self.algo.preprocess is not None:
+                saw_batch = self.algo.preprocess(saw_batch)
 
-            item_count = len(saw_batch.items)
+            # If the batch is empty (e.g. all stale), drop it and fetch another.
+            if not saw_batch.items:
+                continue
+
+            # Batch has valid items, proceed to collation
+            break
+
+        all_saw_batches.append(saw_batch)
+
+        micro_chunks = split_items_by_token_budget(
+            saw_batch.items,
+            micro_token_budget=micro_token_budget,
+            max_seq_len=max_seq_len,
+        )
+        # Use the post-truncation items for stats aggregation.
+        processed_items = [item for chunk in micro_chunks for item in chunk]
+        saw_batch.items = processed_items
+        total_items = len(processed_items)
+        if total_items == 0:
+            raise ValueError("Macro-batch contains no items after preprocessing.")
+
+        # ---- 2) Accumulation Loop (Micro-Steps) -------------------------
+        for micro_step_idx, chunk in enumerate(micro_chunks):
+            item_count = len(chunk)
             logger.debug(
                 "[Micro-step %s/%s] Processing %s SAWItems.",
                 micro_step_idx + 1,
-                grad_accum_steps,
+                len(micro_chunks),
                 item_count,
             )
 
-            # ---- 1b) Collate into tensors ------------------------------
-            batch_tensors = _collate_saw_items(
-                saw_batch.items,
+            # ---- 2a) Collate into tensors ------------------------------
+            batch_tensors = collate_saw_items(
+                chunk,
                 pad_token_id=self.cfg.pad_token_id,
                 device=device,
             )
@@ -593,21 +543,21 @@ class Trainer:
                 input_shape[1],
             )
 
-            # ---- 1c) FSDP2 gradient sync control ----------------------
+            # ---- 2b) FSDP2 gradient sync control ----------------------
             # We only sync (all-reduce) gradients on the *last* micro-batch
-            is_last_micro = (micro_step_idx == grad_accum_steps - 1)
+            is_last_micro = (micro_step_idx == len(micro_chunks) - 1)
             grad_sync_disabled = False
             if isinstance(self.model, fsdp.FSDPModule) and not is_last_micro:
                 self.model.set_requires_gradient_sync(False)
                 grad_sync_disabled = True
 
-            # ---- 1d) Loss + backward (scaled) --------------------------
+            # ---- 2c) Loss + backward (scaled) --------------------------
             pre_forward_alloc = self._reset_peak_memory(device)
             try:
                 loss, stats = self.algo.compute_loss(self.model, batch_tensors)
 
-                # Scale loss for accumulation
-                scaled_loss = loss / grad_accum_steps
+                # Scale loss by micro-batch size to preserve macro-batch mean.
+                scaled_loss = loss * (item_count / total_items)
                 # Forward memory stats before backward frees activations
                 forward_mem_stats, alloc_after_forward, forward_peak = (
                     self._capture_forward_memory_stats(device, pre_forward_alloc)
@@ -642,33 +592,41 @@ class Trainer:
 
             all_micro_stats.append(stats)
 
-        # ---- 2) Gradient Clipping (after loop) -------------------------
-        if self.cfg.max_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.cfg.max_grad_norm,
-            )
+        # ---- 3) Gradient Clipping (after loop) -------------------------
+        max_norm = self.cfg.max_grad_norm
+        grad_norm: Optional[float] = None
 
-        # ---- 3) Optimizer Step (one step for the macro-batch) ----------
+        if max_norm is not None:
+            gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm)
+            grad_norm = float(gn)
+
+        # ---- 4) Optimizer Step (one step for the macro-batch) ----------
         self.optimizer.step()
 
-        # ---- 4) Free Gradients (as requested) --------------------------
+        # ---- 5) Free Gradients (as requested) --------------------------
         # Grads are freed *after* step and *before* weight sync
         self.optimizer.zero_grad(set_to_none=True)
 
         self._train_step_idx += 1
 
-        # ---- 5) Push policy update into runtime ------------------------
+        # ---- 6) Push policy update into runtime ------------------------
         if self.sync_every_steps and self.publisher is not None and self._train_step_idx % self.sync_every_steps == 0:
             self._push_weights_to_runtime()
 
-        # ---- 6) Enrich stats -------------------------------------------
-        final_stats = aggregate_stats(all_micro_stats, all_saw_batches, reducers=self.reducers)
+        # ---- 7) Enrich stats -------------------------------------------
+        final_stats = aggregate_stats(
+            all_micro_stats,
+            all_saw_batches,
+            reducers=self.reducers,
+            micro_batch_sizes=[len(chunk) for chunk in micro_chunks],
+        )
+        if grad_norm is not None:
+            final_stats["grad_norm"] = float(grad_norm)
         final_stats["train_step"] = float(self._train_step_idx)
 
         final_stats = self._maybe_reduce_stats_across_ranks(final_stats, device=device)
 
-        # ---- 7) Optional Checkpoint ------------------------------------
+        # ---- 8) Optional Checkpoint ------------------------------------
         if self._checkpointer is not None:
             self._checkpointer.maybe_save(
                 self.model,
@@ -677,7 +635,7 @@ class Trainer:
                 metadata={"algorithm": self.algo.name},
             )
 
-        # ---- 8) Optional logging ---------------------------------------
+        # ---- 9) Optional logging ---------------------------------------
         grouped = self._group_log_stats(final_stats)
         self._last_train_stats = dict(grouped)
         log_stats = dict(grouped)
@@ -709,8 +667,12 @@ class Trainer:
             )
         if self.cfg.pad_token_id is None:
             raise ValueError("TrainerConfig.pad_token_id must be set for collation.")
-        if self.cfg.grad_accum_steps < 1:
-            raise ValueError("TrainerConfig.grad_accum_steps must be >= 1.")
+        if self.cfg.max_seq_len < 1:
+            raise ValueError("TrainerConfig.max_seq_len must be >= 1.")
+        if self.cfg.micro_token_budget <= 0:
+            raise ValueError("TrainerConfig.micro_token_budget must be > 0.")
+        if self.cfg.micro_token_budget < self.cfg.max_seq_len:
+            raise ValueError("TrainerConfig.micro_token_budget must be >= max_seq_len.")
         if self._resume_from is not None and self._checkpointer is None:
             raise ValueError("resume_from requires a CheckpointManager or checkpoint_config.")
 
@@ -981,14 +943,14 @@ class Trainer:
                 for name, p in self.model.named_parameters():
                     # Optimization: In LoRA, only send what we touched (plus what needs fusion)
                     # If not PEFT, only send requires_grad.
-                    # If PEFT (merged), we theoretically need to send the whole base layer 
+                    # If PEFT (merged), we theoretically need to send the whole base layer
                     # because it changed.
-                    
+
                     # If standard training: send only requires_grad=True
                     # If LoRA (merged): send everything (because base weights need updating in vLLM)
                     if not is_peft and not p.requires_grad:
                         continue
-                        
+
                     if self.param_filter is not None:
                         if not self.param_filter(name, p):
                             continue

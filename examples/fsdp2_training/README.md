@@ -34,10 +34,11 @@ This example shows how to run Ludic with PyTorch FSDP2 for training while servin
      --vllm-port 8000 \
      --limit 2048 \
      --train-steps 50 --group-size 8 \
-     --concurrency 11 --batch-size 1 --train-temperature 1.0 \
+     --concurrency 11 --rollouts-per-update 8 --train-temperature 1.0 \
      --eval-before-start --eval-every 10 --eval-limit 100 \
      --eval-concurrency 32 --eval-temperature 0.0 \
-     --max-tokens 1024 \
+     --max-seq-len 1024 --max-completion-tokens 512 \
+     --micro-token-budget 16384 \
      --log-level INFO \
      --logger print \
      --rank0-only-output
@@ -54,9 +55,9 @@ This example shows how to run Ludic with PyTorch FSDP2 for training while servin
 ## Notes
 - Mixed precision: uses `fsdp.MixedPrecisionPolicy` with bf16 params / fp32 reductions.
 - Activation checkpointing: enabled by default in the script.
-- Gradient sync: uses `set_requires_gradient_sync(False/True)` for accumulation; no `no_sync`.
+- Gradient sync: uses `set_requires_gradient_sync(False/True)` for micro-batched accumulation; no `no_sync`.
 - Action parsing: the environment does not “re-parse” model outputs; the protocol’s parser must extract the final answer string used for grading.
 - Weight publishing: only rank0 gathers a full state dict (DCP full_state_dict) and pushes weights to vLLM over the separate pynccl communicator.
 - Sample sharding: MATH samples are sharded per rank to avoid duplicates; adjust to your data loader if needed.
 
-Tune `--batch-size`, `--group-size`, `--train-steps`, and `--grad-accum-steps` based on hardware. The script is a scaffold; extend it for eval, better logging, and real hyperparameters.
+Tune `--rollouts-per-update`, `--group-size`, `--train-steps`, `--micro-token-budget`, and `--max-seq-len` based on hardware. The script is a scaffold; extend it for eval, better logging, and real hyperparameters.

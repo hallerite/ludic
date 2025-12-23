@@ -329,7 +329,9 @@ class ClippedSurrogateLoss:
             old_logp = old_logp / lengths
 
         log_ratio = logp_action - old_logp
-        ratio = torch.exp(log_ratio)
+        ratio_raw = torch.exp(log_ratio)
+        mismatch_kl = ratio_raw - log_ratio - 1.0
+        ratio = ratio_raw
         if self.ratio_clip is not None:
             ratio = torch.clamp(ratio, max=self.ratio_clip)
 
@@ -355,6 +357,7 @@ class ClippedSurrogateLoss:
             "ratio_std": float(ratio.std(unbiased=False).detach().cpu()),
             "clip_frac": float(ppo_clip_frac.detach().cpu()),
             "ratio_clip_frac": float(ratio_clip_frac.detach().cpu()),
+            "kl_actor_policy": float(mismatch_kl.mean().detach().cpu()),
             "adv_mean": float(advantages.mean().detach().cpu()),
             "adv_std": float(advantages.std(unbiased=False).detach().cpu()),
             "logp_mean": float(logp_action.mean().detach().cpu()),
@@ -412,7 +415,9 @@ class TokenClippedSurrogateLoss:
         actor_logps_shifted = actor_logps[:, 1:]
 
         log_ratio = token_logp - actor_logps_shifted
-        ratio = torch.exp(log_ratio)
+        ratio_raw = torch.exp(log_ratio)
+        token_mismatch_kl = ratio_raw - log_ratio - 1.0
+        ratio = ratio_raw
         if self.ratio_clip is not None:
             ratio = torch.clamp(ratio, max=self.ratio_clip)
 
@@ -437,6 +442,7 @@ class TokenClippedSurrogateLoss:
             ).float().mean()
             ratio_mean = ratio_vals.mean()
             ratio_std = ratio_vals.std(unbiased=False)
+            mismatch_kl = token_mismatch_kl.masked_select(mask).mean()
             if self.ratio_clip is not None:
                 ratio_clip_frac = (ratio_vals >= self.ratio_clip).float().mean()
             else:
@@ -446,6 +452,7 @@ class TokenClippedSurrogateLoss:
             ratio_std = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
             ppo_clip_frac = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
             ratio_clip_frac = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            mismatch_kl = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
 
         logp_action = (token_logp * token_mask).sum(dim=-1)
         stats: Dict[str, Any] = {
@@ -454,6 +461,7 @@ class TokenClippedSurrogateLoss:
             "ratio_std": float(ratio_std.detach().cpu()),
             "clip_frac": float(ppo_clip_frac.detach().cpu()),
             "ratio_clip_frac": float(ratio_clip_frac.detach().cpu()),
+            "kl_actor_policy": float(mismatch_kl.detach().cpu()),
             "adv_mean": float(advantages.mean().detach().cpu()),
             "adv_std": float(advantages.std(unbiased=False).detach().cpu()),
             "logp_mean": float(logp_action.mean().detach().cpu()),

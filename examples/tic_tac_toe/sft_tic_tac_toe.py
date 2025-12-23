@@ -12,6 +12,7 @@ The SFT phase teaches the model:
 - The <think>...</think><move>X</move> format
 - The [TRUNCATED THOUGHTS] convention in history
 - Basic Tic-Tac-Toe strategy from winning examples
+Use --ctx full to train on full (untruncated) history prompts.
 
 This variant runs full-finetune FSDP2 over 2 GPUs (torchrun). No eval, no LoRA, no vLLM; it just prints loss.
 Launch with:
@@ -23,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 from pathlib import Path
 
 import torch
@@ -30,6 +32,7 @@ import torch.distributed as dist
 from torch.distributed import fsdp
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from ludic.types import Step
 from ludic.training import (
     OfflineBatchSource,
     Trainer,
@@ -43,6 +46,81 @@ from ludic.training import (
 # ---------------------------------------------------------------------------
 # Distributed init
 # ---------------------------------------------------------------------------
+
+STRICT_THINK_PATTERN = re.compile(
+    r"^(\s*<think>)(.*?)(</think>\s*)(.+)$",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+
+
+def _truncate_assistant_text(text: str, placeholder: str) -> str:
+    m = STRICT_THINK_PATTERN.match(text)
+    if not m:
+        return text
+    return f"{m.group(1)}{placeholder}{m.group(3)}{m.group(4)}"
+
+
+def _truncate_history_messages(
+    messages: list[dict[str, str]],
+    placeholder: str,
+) -> list[dict[str, str]]:
+    truncated: list[dict[str, str]] = []
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            content = msg.get("content", "")
+            new_msg = dict(msg)
+            new_msg["content"] = _truncate_assistant_text(content, placeholder)
+            truncated.append(new_msg)
+        else:
+            truncated.append(msg)
+    return truncated
+
+
+def _with_truncated_history(step: Step, placeholder: str) -> Step:
+    info = step.info or {}
+    full_messages = info.get("chat_prompt_messages_full")
+    if full_messages:
+        truncated = _truncate_history_messages(full_messages, placeholder)
+    else:
+        chat_messages = info.get("chat_prompt_messages")
+        if not chat_messages:
+            return step
+        truncated = _truncate_history_messages(chat_messages, placeholder)
+    new_info = dict(info)
+    new_info["chat_prompt_messages"] = truncated
+    return Step(
+        index=step.index,
+        prev_obs=step.prev_obs,
+        action=step.action,
+        next_obs=step.next_obs,
+        reward=step.reward,
+        truncated=step.truncated,
+        terminated=step.terminated,
+        info=new_info,
+        trace=step.trace,
+        ts_ns=step.ts_ns,
+    )
+
+
+def _with_full_history(step: Step) -> Step:
+    info = step.info or {}
+    full_messages = info.get("chat_prompt_messages_full")
+    if not full_messages:
+        return step
+    new_info = dict(info)
+    new_info["chat_prompt_messages"] = full_messages
+    return Step(
+        index=step.index,
+        prev_obs=step.prev_obs,
+        action=step.action,
+        next_obs=step.next_obs,
+        reward=step.reward,
+        truncated=step.truncated,
+        terminated=step.terminated,
+        info=new_info,
+        trace=step.trace,
+        ts_ns=step.ts_ns,
+    )
 
 
 def init_dist(local_rank: int) -> int:
@@ -73,7 +151,8 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=1, help="Number of epochs over the dataset.")
     parser.add_argument("--batch-size", type=int, default=8, help="Samples per batch per rank.")
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate.")
-    parser.add_argument("--grad-accum", type=int, default=2, help="Gradient accumulation steps.")
+    parser.add_argument("--max-seq-len", type=int, default=1024, help="Max tokens per sample.")
+    parser.add_argument("--micro-token-budget", type=int, default=8192, help="Max padded tokens per micro-batch.")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--checkpoint-dir", default="checkpoints_tictactoe_fsdp2")
     parser.add_argument("--checkpoint-every", type=int, default=100, help="0 disables checkpoints.")
@@ -86,6 +165,17 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable HF gradient checkpointing.",
+    )
+    parser.add_argument(
+        "--ctx",
+        choices=["full", "truncated"],
+        default="truncated",
+        help="Prompt history format for SFT: full or TruncatedThinking-style.",
+    )
+    parser.add_argument(
+        "--placeholder",
+        default="[TRUNCATED]",
+        help="Placeholder token for truncated <think> blocks.",
     )
     args = parser.parse_args()
 
@@ -135,7 +225,15 @@ def main() -> None:
     algo = make_sft(length_normalize=True)
 
     # Create step_to_item function with chat template preprocessing
-    step_to_item = make_chat_template_step_to_item(tokenizer)
+    base_step_to_item = make_chat_template_step_to_item(tokenizer)
+    if args.ctx == "truncated":
+        def step_to_item(rollout, step, weight):
+            truncated_step = _with_truncated_history(step, args.placeholder)
+            return base_step_to_item(rollout, truncated_step, weight)
+    else:
+        def step_to_item(rollout, step, weight):
+            full_step = _with_full_history(step)
+            return base_step_to_item(rollout, full_step, weight)
 
     batch_source = OfflineBatchSource(
         jsonl_paths=[data_path],
@@ -146,24 +244,25 @@ def main() -> None:
     )
 
     # Calculate training steps correctly:
-    # - Each train_step() consumes grad_accum batches
+    # - Each train_step() consumes one macro-batch
     # - We want exactly `epochs` passes through the data
     batches_per_epoch = batch_source.num_batches_per_epoch
     batches_needed = args.epochs * batches_per_epoch
-    total_steps = (batches_needed + args.grad_accum - 1) // args.grad_accum
-    effective_samples_per_step = args.batch_size * args.grad_accum * world_size
+    total_steps = batches_needed
+    effective_samples_per_step = args.batch_size * world_size
 
     if rank == 0:
         print(f"World size: {world_size}")
         print(f"Loaded {len(batch_source)} samples from {data_path}")
         print(f"Batches per epoch (per rank): {batches_per_epoch}")
         print(f"Total batches needed: {batches_needed} ({args.epochs} epochs)")
-        print(f"Total trainer steps: {total_steps} (batches / grad_accum)")
-        print(f"Effective samples per step: {effective_samples_per_step} (batch_size * grad_accum * world_size)")
+        print(f"Total trainer steps: {total_steps} (macro-batches)")
+        print(f"Effective samples per step: {effective_samples_per_step} (batch_size * world_size)")
 
     cfg = TrainerConfig(
         model_device=str(device),
-        grad_accum_steps=args.grad_accum,
+        max_seq_len=args.max_seq_len,
+        micro_token_budget=args.micro_token_budget,
         max_grad_norm=args.max_grad_norm,
         pad_token_id=tokenizer.pad_token_id,
         lr=args.lr,
@@ -207,7 +306,7 @@ def main() -> None:
                 logp_str = f"{logp_val:.4f}" if logp_val is not None else "n/a"
                 print(
                     f"[step {step + 1}/{total_steps}] loss={loss_str} logp_mean={logp_str} "
-                    f"(micro_batches={args.grad_accum}, effective_samples={effective_samples_per_step})",
+                    f"(effective_samples={effective_samples_per_step})",
                     flush=True,
                 )
 

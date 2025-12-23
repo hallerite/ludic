@@ -31,6 +31,24 @@ class Reducer:
     as_percent: bool = False
 
 
+def default_reducers() -> Mapping[str, Reducer]:
+    return {
+        "completion_truncated_rate": Reducer(
+            kind="count_true",
+            source="finish_reason",
+            transform=lambda v: v == "length",
+            normalize_by="samples",
+            as_percent=True,
+        ),
+        "seq_len_truncated_rate": Reducer(
+            kind="count_true",
+            source="seq_len_truncated",
+            normalize_by="samples",
+            as_percent=True,
+        ),
+    }
+
+
 def _get_value_from_source(item: SAWItem, source: str | Callable[[SAWItem], object]) -> object:
     if callable(source):
         return source(item)
@@ -52,13 +70,15 @@ def aggregate_stats(
     saw_batches: List[SAWBatch],
     *,
     reducers: Mapping[str, Reducer] | None = None,
+    micro_batch_sizes: Optional[List[int]] = None,
 ) -> Dict[str, float]:
     """
     Aggregate micro-batch stats with batch-level metadata and optional reducers.
 
     By default, micro-batch stats are averaged across micro-batches, except
     keys prefixed with ``gpu_`` which are reduced using ``max`` (since they
-    typically represent peaks).
+    typically represent peaks). If micro_batch_sizes is provided, stats are
+    weighted by micro-batch size.
 
     Core outputs (always present):
         - num_samples: total SAWItems across batches
@@ -76,6 +96,16 @@ def aggregate_stats(
 
     agg_stats: Dict[str, float] = {}
     sum_counts: Dict[str, int] = {}
+    sum_keys = {
+        "num_samples",
+        "num_rollouts",
+        "total_completion_tokens",
+    }
+    weights: Optional[List[float]] = None
+    if micro_batch_sizes is not None:
+        if len(micro_batch_sizes) != len(micro_stats_list):
+            raise ValueError("micro_batch_sizes must match micro_stats_list length.")
+        weights = [float(v) for v in micro_batch_sizes]
     for k in all_keys:
         if k in max_keys:
             agg_stats[k] = float("-inf")
@@ -83,21 +113,30 @@ def aggregate_stats(
             agg_stats[k] = 0.0
             sum_counts[k] = 0
 
-    for micro_stats in micro_stats_list:
+    for idx, micro_stats in enumerate(micro_stats_list):
+        weight = weights[idx] if weights is not None else 1.0
         for k, v in micro_stats.items():
             if k in max_keys:
                 agg_stats[k] = max(agg_stats[k], v)
-            else:
+            elif k in sum_keys:
                 agg_stats[k] += v
-                sum_counts[k] += 1
+            else:
+                agg_stats[k] += v * weight
+                if weights is None:
+                    sum_counts[k] += 1
 
     for k in list(agg_stats.keys()):
         if k in max_keys:
             if agg_stats[k] == float("-inf"):
                 del agg_stats[k]
             continue
-        denom = sum_counts.get(k, 0)
-        agg_stats[k] = agg_stats[k] / float(denom) if denom > 0 else 0.0
+        if k in sum_keys:
+            continue
+        if weights is not None:
+            denom = float(sum(weights))
+        else:
+            denom = float(sum_counts.get(k, 0))
+        agg_stats[k] = agg_stats[k] / denom if denom > 0 else 0.0
 
     # 2) Batch metadata stats
     total_samples = 0.0

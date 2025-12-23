@@ -10,6 +10,7 @@ from ludic.types import Observation, Info, StepOutcome
 
 
 _COORD_RE = re.compile(r"^[ABCabc][123]$")
+_MINIMAX_CACHE: dict[tuple[tuple[Optional[str], ...], str], int] = {}
 
 
 def _coord_to_index(coord: str) -> int:
@@ -43,9 +44,9 @@ class TicTacToeEnv(SingleAgentEnv):
     """
     Minimal Tic-Tac-Toe environment for Ludic.
 
-    - Agent always plays 'X'
-    - Opponent always plays 'O'
-    - Agent moves first
+    - Agent plays 'X' if it starts, otherwise 'O'
+    - Opponent plays the other mark
+    - Agent may move first or second
     - Opponent plays uniformly random legal moves
     - Actions are coordinates like "A1", "b2", ...
     """
@@ -88,6 +89,9 @@ class TicTacToeEnv(SingleAgentEnv):
         self._done: bool = False
         self._last_opponent_move: Optional[str] = None
         self._obs_cache: Observation = ""
+        self._minimax_cache = _MINIMAX_CACHE
+        self._all_agent_moves_gto: bool = True
+        self._initial_agent_value: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Env interface (SingleAgentEnv implementation)
@@ -96,7 +100,7 @@ class TicTacToeEnv(SingleAgentEnv):
     @property
     def suggested_sysprompt(self) -> Optional[str]:
         return (
-            "You are playing Tic-Tac-Toe as 'X'.\n"
+            "You are playing Tic-Tac-Toe.\n"
             "The board has rows A (top), B (middle), C (bottom) and "
             "columns 1 (left), 2 (middle), 3 (right).\n"
             "A move is written like A1, B2, C3, etc."
@@ -109,9 +113,18 @@ class TicTacToeEnv(SingleAgentEnv):
         self._board = [None] * 9
         self._done = False
         self._last_opponent_move = None
+        self._all_agent_moves_gto = True
+        if self.agent_starts:
+            self.agent_mark = "X"
+            self.opponent_mark = "O"
+        else:
+            self.agent_mark = "O"
+            self.opponent_mark = "X"
 
         if not self.agent_starts:
             self._opponent_random_move()
+
+        self._initial_agent_value = self._minimax_value(tuple(self._board), self.agent_mark)
 
         obs = self._render_obs()
         info: Info = {
@@ -126,7 +139,8 @@ class TicTacToeEnv(SingleAgentEnv):
 
         Reward:
           +1.0  agent wins
-          +0.5  draw
+          +1.0  forced draw (perfect play)
+          +0.5  non-forced draw
            0.0  agent loses
           -1.0  illegal move
            0.0  non-terminal step
@@ -137,6 +151,7 @@ class TicTacToeEnv(SingleAgentEnv):
             )
 
         info: Info = {}
+        gto_actions, _ = self._gto_actions()
 
         # 1) Parse & apply agent move
         try:
@@ -149,8 +164,10 @@ class TicTacToeEnv(SingleAgentEnv):
                     "illegal_move": True,
                     "error": str(e),
                     "agent_move": action,
+                    "gto_action": False,
                 }
             )
+            self._all_agent_moves_gto = False
             return StepOutcome(
                 obs=obs,
                 reward=-1.0,
@@ -168,8 +185,10 @@ class TicTacToeEnv(SingleAgentEnv):
                     "illegal_move": True,
                     "error": f"Cell {coord_norm} is already occupied.",
                     "agent_move": coord_norm,
+                    "gto_action": False,
                 }
             )
+            self._all_agent_moves_gto = False
             return StepOutcome(
                 obs=obs,
                 reward=-1.0,
@@ -179,15 +198,22 @@ class TicTacToeEnv(SingleAgentEnv):
             )
 
         self._board[idx] = self.agent_mark
+        is_gto = idx in gto_actions
         info["agent_move"] = action.strip().upper()
+        info["gto_action"] = is_gto
+        if not is_gto:
+            self._all_agent_moves_gto = False
 
         # 2) Check terminal after agent move
         result = self._check_game_over()
         if result is not None:
             self._done = True
-            reward = self._result_to_reward(result)
+            forced_draw = self._is_forced_draw(result)
+            reward = self._result_to_reward(result, forced_draw=forced_draw)
             obs = self._render_obs()
             info["result"] = self._result_label(result)
+            if result.draw:
+                info["forced_draw"] = forced_draw
             return StepOutcome(
                 obs=obs,
                 reward=reward,
@@ -209,9 +235,12 @@ class TicTacToeEnv(SingleAgentEnv):
         result = self._check_game_over()
         if result is not None:
             self._done = True
-            reward = self._result_to_reward(result)
+            forced_draw = self._is_forced_draw(result)
+            reward = self._result_to_reward(result, forced_draw=forced_draw)
             obs = self._render_obs()
             info["result"] = self._result_label(result)
+            if result.draw:
+                info["forced_draw"] = forced_draw
             return StepOutcome(
                 obs=obs,
                 reward=reward,
@@ -253,9 +282,9 @@ class TicTacToeEnv(SingleAgentEnv):
 
         return None
 
-    def _result_to_reward(self, result: _GameResult) -> float:
+    def _result_to_reward(self, result: _GameResult, *, forced_draw: bool = False) -> float:
         if result.draw:
-            return 0.5
+            return 1.0 if forced_draw else 0.5
         if result.winner == self.agent_mark:
             return 1.0
         # Loss (opponent wins)
@@ -277,6 +306,82 @@ class TicTacToeEnv(SingleAgentEnv):
         idx = random.choice(empty)
         self._board[idx] = self.opponent_mark
         return idx
+
+    def _check_game_over_board(self, board: Tuple[Optional[str], ...]) -> Optional[_GameResult]:
+        for a, b, c in self.WIN_LINES:
+            m = board[a]
+            if m is not None and m == board[b] == board[c]:
+                return _GameResult(winner=m, draw=False)
+        if all(cell is not None for cell in board):
+            return _GameResult(winner=None, draw=True)
+        return None
+
+    def _minimax_value(self, board: Tuple[Optional[str], ...], to_move: str) -> int:
+        key = (board, to_move)
+        if key in self._minimax_cache:
+            return self._minimax_cache[key]
+
+        result = self._check_game_over_board(board)
+        if result is not None:
+            if result.draw:
+                value = 0
+            elif result.winner == self.agent_mark:
+                value = 1
+            else:
+                value = -1
+            self._minimax_cache[key] = value
+            return value
+
+        empty = [i for i, v in enumerate(board) if v is None]
+        if to_move == self.agent_mark:
+            best = -2
+            for idx in empty:
+                new_board = list(board)
+                new_board[idx] = self.agent_mark
+                val = self._minimax_value(tuple(new_board), self.opponent_mark)
+                if val > best:
+                    best = val
+                if best == 1:
+                    break
+        else:
+            best = 2
+            for idx in empty:
+                new_board = list(board)
+                new_board[idx] = self.opponent_mark
+                val = self._minimax_value(tuple(new_board), self.agent_mark)
+                if val < best:
+                    best = val
+                if best == -1:
+                    break
+
+        self._minimax_cache[key] = best
+        return best
+
+    def _gto_actions(self) -> Tuple[set[int], int]:
+        board = tuple(self._board)
+        empty = self._empty_cells()
+        if not empty:
+            return set(), self._minimax_value(board, self.agent_mark)
+
+        best = -2
+        gto_moves: set[int] = set()
+        for idx in empty:
+            new_board = list(board)
+            new_board[idx] = self.agent_mark
+            val = self._minimax_value(tuple(new_board), self.opponent_mark)
+            if val > best:
+                best = val
+                gto_moves = {idx}
+            elif val == best:
+                gto_moves.add(idx)
+        return gto_moves, best
+
+    def _is_forced_draw(self, result: _GameResult) -> bool:
+        if not result.draw:
+            return False
+        if self._initial_agent_value is None:
+            return False
+        return self._initial_agent_value == 0 and self._all_agent_moves_gto
 
     def _render_obs(self) -> Observation:
         """Render board + available moves as a text observation."""

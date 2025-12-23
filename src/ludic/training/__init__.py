@@ -63,7 +63,7 @@ from .batching import (
     make_dataset_sequence_requests_fn,
     make_chat_template_step_to_item,
 )
-from .stats import Reducer, apply_reducers_to_records
+from .stats import Reducer, apply_reducers_to_records, default_reducers
 from .loggers import TrainingLogger, PrintLogger, RichLiveLogger, TeeLogger, WandbLogger
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -129,6 +129,7 @@ __all__ = [
     # Stats + loggers
     "Reducer",
     "apply_reducers_to_records",
+    "default_reducers",
     "TrainingLogger",
     "PrintLogger",
     "RichLiveLogger",

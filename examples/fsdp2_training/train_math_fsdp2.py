@@ -47,7 +47,7 @@ from ludic.training import (
     EnvSpec,
     ProtocolSpec,
 )
-from ludic.training import Reducer, RichLiveLogger, PrintLogger, TeeLogger, WandbLogger
+from ludic.training import Reducer, RichLiveLogger, PrintLogger, TeeLogger, WandbLogger, default_reducers
 
 
 def configure_logging(*, rank: int, level: str) -> None:
@@ -164,9 +164,13 @@ def main() -> None:
     parser.add_argument("--vllm-port", type=int, default=8000)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--train-steps", type=int, default=100, help="Number of trainer steps.")
-    parser.add_argument("--grad-accum-steps", type=int, default=2, help="Gradient accumulation steps.")
     parser.add_argument("--group-size", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--rollouts-per-update",
+        type=int,
+        default=8,
+        help="Total rollouts per update (must be divisible by --group-size).",
+    )
     parser.add_argument("--concurrency", type=int, default=11)
     parser.add_argument("--train-temperature", type=float, default=1.0)
     parser.add_argument(
@@ -190,10 +194,12 @@ def main() -> None:
     parser.add_argument("--eval-limit", type=int, default=100, help="Number of test samples for eval (0 disables).")
     parser.add_argument("--eval-concurrency", type=int, default=32)
     parser.add_argument("--eval-temperature", type=float, default=0.0)
+    parser.add_argument("--max-seq-len", type=int, default=1024, help="Max tokens per sample.")
+    parser.add_argument("--micro-token-budget", type=int, default=8192, help="Max padded tokens per micro-batch.")
     parser.add_argument(
-        "--max-tokens",
+        "--max-completion-tokens",
         type=int,
-        default=1024,
+        default=512,
         help="Max tokens per completion (train + eval).",
     )
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -211,6 +217,12 @@ def main() -> None:
     )
     parser.add_argument("--final-save", action="store_true", help="Save a final checkpoint after training completes.")
     args = parser.parse_args()
+    if args.rollouts_per_update <= 0:
+        raise ValueError("--rollouts-per-update must be > 0.")
+    if args.rollouts_per_update % args.group_size != 0:
+        raise ValueError("--rollouts-per-update must be divisible by --group-size.")
+    if args.max_completion_tokens > args.max_seq_len:
+        raise ValueError("--max-completion-tokens must be <= --max-seq-len.")
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     rank = init_dist(local_rank=env_local_rank)
@@ -313,12 +325,16 @@ def main() -> None:
         jsonl_path=rollout_log_path,
     )
     train_inference = InferenceSpec(
-        sampling=SamplingParams(temperature=args.train_temperature, max_tokens=args.max_tokens),
+        sampling=SamplingParams(
+            temperature=args.train_temperature,
+            max_tokens=args.max_completion_tokens,
+        ),
         return_=ReturnSpec.for_rl(top_logprobs_k=1),
     )
+    base_requests = args.rollouts_per_update // args.group_size
     requests_fn = make_dataset_queue_requests_fn(
         samples_q,
-        batch_size=args.batch_size,
+        batch_size=base_requests,
         env_kind="math",
         protocol_kind="single_agent",
         inference=train_inference,
@@ -343,7 +359,8 @@ def main() -> None:
 
     cfg = TrainerConfig(
         model_device=str(device),
-        grad_accum_steps=args.grad_accum_steps,
+        max_seq_len=args.max_seq_len,
+        micro_token_budget=args.micro_token_budget,
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
         reduce_stats_across_ranks=True,
@@ -371,6 +388,7 @@ def main() -> None:
             normalize_by="samples",
         ),
     }
+    reducers = {**default_reducers(), **reducers}
     train_logger = None
     if rank == 0:
         raw_logger = args.logger or "rich"
@@ -387,6 +405,8 @@ def main() -> None:
             "train/avg_total_reward",
             "train/correct_rate",
             "train/parse_err_rate",
+            "train/completion_truncated_rate",
+            "train/seq_len_truncated_rate",
             "eval/accuracy",
             "eval/parse_error_rate",
             "eval/avg_completion_tokens",
@@ -453,7 +473,7 @@ def main() -> None:
                         inference=InferenceSpec(
                             sampling=SamplingParams(
                                 temperature=float(args.eval_temperature),
-                                max_tokens=int(args.max_tokens),
+                                max_tokens=int(args.max_completion_tokens),
                             ),
                             return_=ReturnSpec.for_eval(return_token_ids=True),
                         ),

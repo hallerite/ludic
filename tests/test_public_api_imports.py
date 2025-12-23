@@ -23,6 +23,7 @@ def test_training_exports_import() -> None:
         RLAlgorithm,
         Reducer,
         apply_reducers_to_records,
+        default_reducers,
         RichLiveLogger,
         PrintLogger,
         make_dataset_queue_requests_fn,

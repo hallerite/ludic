@@ -4,9 +4,9 @@ Generate synthetic training data for Tic-Tac-Toe SFT.
 This script:
 1. Generates rollouts using FullDialog (model sees full thinking history)
 2. Filters to keep only winning trajectories (rejection sampling)
-3. Post-hoc rebuilds prompts that mimic TruncatedThinkingContext:
+3. Optionally rebuilds prompts to mimic TruncatedThinkingContext:
    prior assistant turns become <think>[TRUNCATED]</think><answer>, but the
-   action for the current step stays intact.
+   action for the current step stays intact. (--no-transform keeps full history)
 4. Saves lean JSONL (minimal fields; we retokenize downstream) for use with
    OfflineBatchSource + make_sft()
 
@@ -27,11 +27,11 @@ from typing import Any, Dict, List
 
 from ludic.agent import Agent
 from ludic.context import FullDialog
-from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams
+from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import compose_parsers, think_prefix_parser, xml_tag_parser
 from ludic.training import RolloutEngine, EnvSpec, ProtocolSpec, RolloutRequest
-from ludic.types import Rollout, EnvironmentStep
+from ludic.types import Rollout, EnvironmentStep, AgentStep
 
 from environments.tic_tac_toe import TicTacToeEnv
 
@@ -63,58 +63,6 @@ def get_result(r: Rollout) -> str | None:
 def is_win(r: Rollout) -> bool:
     """Check if rollout ended in a win."""
     return get_result(r) == "win"
-
-
-def rollout_to_dict(r: Rollout, *, lean: bool = True) -> dict[str, Any]:
-    """
-    Convert a Rollout to a JSON-serializable dict.
-
-    If lean=True (default), drop heavy metadata so the JSONL stays small
-    (we retokenize downstream anyway).
-    """
-    steps = []
-    env_steps = [s for s in r.steps if isinstance(s, EnvironmentStep)]
-    for s in env_steps:
-        step: Dict[str, Any] = {
-            "id": s.id,
-            "index": s.index,
-            "kind": s.kind,
-            "prev_obs": s.prev_obs,
-            "action": s.action,
-            "parsed_action": s.parsed_action,
-            "next_obs": s.next_obs,
-            "source_agent_step_id": s.source_agent_step_id,
-            "agent_step_ids": s.agent_step_ids,
-            "reward": s.reward,
-            "reward_components": s.reward_components,
-            "truncated": s.truncated,
-            "terminated": s.terminated,
-            "trace": s.trace.to_dict(),
-        }
-        if not lean:
-            step.update(
-                {
-                    "info": s.info,
-                    "ts_ns": s.ts_ns,
-                    "turn_id": s.turn_id,
-                    "parent_id": s.parent_id,
-                }
-            )
-        steps.append(step)
-
-    rollout_dict: Dict[str, Any] = {"id": r.id, "steps": steps}
-    if not lean:
-        rollout_dict.update(
-            {
-                "meta": r.meta,
-                "total_reward": r.total_reward,
-                "length": len(steps),
-                "duration_ns": r.duration_ns,
-            }
-        )
-    return rollout_dict
-
-
 STRICT_THINK_PATTERN = re.compile(
     r"^(\s*<think>)(.*?)(</think>\s*)(.+)$",
     flags=re.DOTALL | re.IGNORECASE,
@@ -145,12 +93,32 @@ def _messages_to_prompt(messages: List[dict[str, str]]) -> str:
     return "\n\n".join(parts)
 
 
-def apply_truncated_prompt(
+def _truncate_history_messages(
+    messages: List[dict[str, str]],
+    placeholder: str,
+) -> List[dict[str, str]]:
+    truncated: List[dict[str, str]] = []
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            content = msg.get("content", "")
+            new_msg = dict(msg)
+            new_msg["content"] = _truncate_assistant_text(content, placeholder)
+            truncated.append(new_msg)
+        else:
+            truncated.append(msg)
+    return truncated
+
+
+def apply_prompt_format(
     rollout: Rollout,
     *,
     system_prompt: str,
     placeholder: str = "[TRUNCATED]",
     lean: bool = True,
+    truncate_history: bool = True,
+    min_completion_tokens: int = 0,
+    max_completion_tokens: int = 0,
+    stats: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """
     Build per-step prompts that mirror what the agent saw:
@@ -161,52 +129,91 @@ def apply_truncated_prompt(
     if system_prompt:
         history.append({"role": "system", "content": system_prompt})
 
+    agent_steps = {s.id: s for s in rollout.steps if isinstance(s, AgentStep)}
     env_steps = [s for s in rollout.steps if isinstance(s, EnvironmentStep)]
     for s in env_steps:
-        chat_messages: List[dict[str, str]] = list(history)
-        # Ensure current observation is present as the latest user turn
-        if not chat_messages or chat_messages[-1].get("role") != "user" or chat_messages[-1].get("content") != s.prev_obs:
-            chat_messages.append({"role": "user", "content": s.prev_obs})
-
-        prompt_text = _messages_to_prompt(chat_messages)
-
-        step_dict: Dict[str, Any] = {
-            "id": s.id,
-            "index": s.index,
-            "kind": s.kind,
-            "prev_obs": prompt_text,
-            "action": s.action,
-            "parsed_action": s.parsed_action,
-            "next_obs": s.next_obs,
-            "source_agent_step_id": s.source_agent_step_id,
-            "agent_step_ids": s.agent_step_ids,
-            "reward": s.reward,
-            "reward_components": s.reward_components,
-            "truncated": s.truncated,
-            "terminated": s.terminated,
-            "trace": s.trace.to_dict(),
-        }
-        if not lean:
-            step_dict.update(
-                {
-                    "info": s.info,
-                    "ts_ns": s.ts_ns,
-                    "turn_id": s.turn_id,
-                    "parent_id": s.parent_id,
-                }
-            )
+        source_agent = agent_steps.get(s.source_agent_step_id)
+        used_agent_prompt = False
+        if source_agent and source_agent.prompt_messages:
+            full_messages = list(source_agent.prompt_messages)
+            used_agent_prompt = True
+            if system_prompt and not any(msg.get("role") == "system" for msg in full_messages):
+                full_messages = [{"role": "system", "content": system_prompt}] + full_messages
         else:
-            step_dict["info"] = {}
+            full_messages = list(history)
+        if not used_agent_prompt:
+            # Ensure current observation is present as the latest user turn
+            if (
+                not full_messages
+                or full_messages[-1].get("role") != "user"
+                or full_messages[-1].get("content") != s.prev_obs
+            ):
+                full_messages.append({"role": "user", "content": s.prev_obs})
 
-        # Store chat-format prompt/completion for downstream apply_chat_template
-        info_field = step_dict.setdefault("info", {}) or {}
-        info_field["chat_prompt_messages"] = chat_messages
-        info_field["chat_completion"] = {"role": "assistant", "content": s.action}
-        step_dict["info"] = info_field
-        steps.append(step_dict)
+        include_step = True
+        if min_completion_tokens > 0 or max_completion_tokens > 0:
+            trace = s.trace
+            if trace is None:
+                include_step = False
+                if stats is not None:
+                    stats["missing_trace"] = stats.get("missing_trace", 0) + 1
+            else:
+                comp_len = len(trace.completion_token_ids)
+                if max_completion_tokens > 0 and comp_len > max_completion_tokens:
+                    include_step = False
+                    if stats is not None:
+                        stats["too_long"] = stats.get("too_long", 0) + 1
+                if min_completion_tokens > 0 and comp_len < min_completion_tokens:
+                    include_step = False
+                    if stats is not None:
+                        stats["too_short"] = stats.get("too_short", 0) + 1
 
-        # Update history to include this action and next observation (if any)
-        history = list(chat_messages)
+        if include_step:
+            truncated_messages = _truncate_history_messages(full_messages, placeholder)
+            chat_messages = truncated_messages if truncate_history else list(full_messages)
+
+            prompt_text = _messages_to_prompt(chat_messages)
+
+            step_dict: Dict[str, Any] = {
+                "id": s.id,
+                "index": s.index,
+                "kind": s.kind,
+                "prev_obs": prompt_text,
+                "action": s.action,
+                "parsed_action": s.parsed_action,
+                "next_obs": s.next_obs,
+                "source_agent_step_id": s.source_agent_step_id,
+                "agent_step_ids": s.agent_step_ids,
+                "reward": s.reward,
+                "reward_components": s.reward_components,
+                "truncated": s.truncated,
+                "terminated": s.terminated,
+                "trace": s.trace.to_dict(),
+            }
+            if not lean:
+                step_dict.update(
+                    {
+                        "info": s.info,
+                        "ts_ns": s.ts_ns,
+                        "turn_id": s.turn_id,
+                        "parent_id": s.parent_id,
+                    }
+                )
+            else:
+                step_dict["info"] = {}
+
+            # Store chat-format prompt/completion for downstream apply_chat_template
+            info_field = step_dict.setdefault("info", {}) or {}
+            info_field["chat_prompt_messages"] = chat_messages
+            info_field["chat_prompt_messages_full"] = list(full_messages)
+            info_field["chat_completion"] = {"role": "assistant", "content": s.action}
+            step_dict["info"] = info_field
+            steps.append(step_dict)
+            if stats is not None:
+                stats["kept_steps"] = stats.get("kept_steps", 0) + 1
+
+        # Update full history to include this action and next observation (if any)
+        history = list(full_messages)
         history.append({"role": "assistant", "content": s.action})
         if s.next_obs is not None:
             history.append({"role": "user", "content": s.next_obs})
@@ -256,8 +263,12 @@ async def generate_synth_data(args: argparse.Namespace) -> None:
         jsonl_path=None,
     )
 
+    return_spec = ReturnSpec()
+    if args.min_completion_tokens > 0 or args.max_completion_tokens > 0:
+        return_spec = ReturnSpec.for_eval(return_token_ids=True)
     inference = InferenceSpec(
         sampling=SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens),
+        return_=return_spec,
     )
 
     # Generate both agent-starts and opponent-starts scenarios
@@ -301,24 +312,44 @@ async def generate_synth_data(args: argparse.Namespace) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     accepted = 0
+    dropped_empty = 0
+    stats: dict[str, int] = {}
     with open(out_path, "w", encoding="utf-8") as f:
         for r in rollouts:
             # Filter by result label, not reward (parser rewards can inflate totals)
             if is_win(r):
-                if args.transform:
-                    rollout_dict = apply_truncated_prompt(
-                        r,
-                        system_prompt=prompt_text,
-                        placeholder=args.placeholder,
-                        lean=args.lean,
-                    )
-                else:
-                    rollout_dict = rollout_to_dict(r, lean=args.lean)
+                rollout_dict = apply_prompt_format(
+                    r,
+                    system_prompt=prompt_text,
+                    placeholder=args.placeholder,
+                    lean=args.lean,
+                    truncate_history=args.transform,
+                    min_completion_tokens=args.min_completion_tokens,
+                    max_completion_tokens=args.max_completion_tokens,
+                    stats=stats,
+                )
+                if not rollout_dict["steps"]:
+                    dropped_empty += 1
+                    continue
 
                 f.write(json.dumps(rollout_dict, ensure_ascii=False) + "\n")
                 accepted += 1
 
     print(f"Saved {accepted} winning rollouts to: {out_path.resolve()}")
+    if args.min_completion_tokens > 0 or args.max_completion_tokens > 0:
+        missing_trace = stats.get("missing_trace", 0)
+        too_long = stats.get("too_long", 0)
+        too_short = stats.get("too_short", 0)
+        kept_steps = stats.get("kept_steps", 0)
+        if missing_trace:
+            print(f"Skipped {missing_trace} steps missing token traces (enable return_token_ids).")
+        if too_short:
+            print(f"Skipped {too_short} steps with completion length < {args.min_completion_tokens}.")
+        if too_long:
+            print(f"Skipped {too_long} steps with completion length > {args.max_completion_tokens}.")
+        print(f"Kept {kept_steps} steps after length filtering.")
+        if dropped_empty:
+            print(f"Skipped {dropped_empty} rollouts with no remaining steps.")
     if args.transform:
         print(f"  (transformed to TruncatedThinking format with placeholder: '{args.placeholder}')")
 
@@ -338,12 +369,24 @@ def main():
     parser.add_argument("--concurrency", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--max-tokens", type=int, default=250)
+    parser.add_argument(
+        "--min-completion-tokens",
+        type=int,
+        default=0,
+        help="Drop steps with completion length below this value (0 disables).",
+    )
+    parser.add_argument(
+        "--max-completion-tokens",
+        type=int,
+        default=0,
+        help="Drop steps with completion length above this value (0 disables).",
+    )
 
     # Transformation
     parser.add_argument("--transform", action="store_true", default=True,
-                        help="Transform to TruncatedThinking format (default: True)")
+                        help="Truncate history to TruncatedThinking format (default: True)")
     parser.add_argument("--no-transform", action="store_false", dest="transform",
-                        help="Keep raw FullDialog format")
+                        help="Keep full assistant history in prompts")
     parser.add_argument("--placeholder", default="[TRUNCATED]",
                         help="Placeholder for truncated thinking blocks")
     parser.add_argument("--lean", action="store_true", default=True,
