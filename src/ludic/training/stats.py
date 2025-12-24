@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional
 
+import torch
+from torch import Tensor
+
 from ludic.training.types import SAWBatch, SAWItem
 
 
@@ -66,7 +69,7 @@ def _apply_transform(value: object, transform: Optional[Callable[[object], objec
 
 
 def aggregate_stats(
-    micro_stats_list: List[Dict[str, float]],
+    micro_stats_list: List[Dict[str, float | Tensor]],
     saw_batches: List[SAWBatch],
     *,
     reducers: Mapping[str, Reducer] | None = None,
@@ -94,8 +97,19 @@ def aggregate_stats(
     # 1) Standard loss/grad stats
     all_keys = {k for ms in micro_stats_list for k in ms.keys()}
     max_keys = {k for k in all_keys if k.startswith("gpu_")}
+    key_is_tensor: Dict[str, bool] = {}
+    key_device: Dict[str, torch.device] = {}
+    for k in all_keys:
+        for ms in micro_stats_list:
+            value = ms.get(k)
+            if isinstance(value, Tensor):
+                key_is_tensor[k] = True
+                key_device[k] = value.device
+                break
+        else:
+            key_is_tensor[k] = False
 
-    agg_stats: Dict[str, float] = {}
+    agg_stats: Dict[str, float | Tensor] = {}
     sum_counts: Dict[str, int] = {}
     sum_keys = {
         "num_samples",
@@ -109,27 +123,52 @@ def aggregate_stats(
             raise ValueError("micro_batch_sizes must match micro_stats_list length.")
         weights = [float(v) for v in micro_batch_sizes]
     for k in all_keys:
-        if k in max_keys:
-            agg_stats[k] = float("-inf")
+        if key_is_tensor[k]:
+            device = key_device[k]
+            if k in max_keys:
+                agg_stats[k] = torch.tensor(float("-inf"), device=device)
+            else:
+                agg_stats[k] = torch.tensor(0.0, device=device)
+                sum_counts[k] = 0
         else:
-            agg_stats[k] = 0.0
-            sum_counts[k] = 0
+            if k in max_keys:
+                agg_stats[k] = float("-inf")
+            else:
+                agg_stats[k] = 0.0
+                sum_counts[k] = 0
 
     for idx, micro_stats in enumerate(micro_stats_list):
         weight = weights[idx] if weights is not None else 1.0
         for k, v in micro_stats.items():
-            if k in max_keys:
-                agg_stats[k] = max(agg_stats[k], v)
-            elif k in sum_keys:
-                agg_stats[k] += v
+            if key_is_tensor[k]:
+                device = key_device[k]
+                value = v if isinstance(v, Tensor) else torch.tensor(float(v), device=device)
+                if k in max_keys:
+                    agg_stats[k] = torch.maximum(agg_stats[k], value)
+                elif k in sum_keys:
+                    agg_stats[k] = agg_stats[k] + value
+                else:
+                    if weights is None:
+                        agg_stats[k] = agg_stats[k] + value
+                        sum_counts[k] += 1
+                    else:
+                        agg_stats[k] = agg_stats[k] + value * torch.tensor(weight, device=device)
             else:
-                agg_stats[k] += v * weight
-                if weights is None:
-                    sum_counts[k] += 1
+                if k in max_keys:
+                    agg_stats[k] = max(agg_stats[k], float(v))
+                elif k in sum_keys:
+                    agg_stats[k] += float(v)
+                else:
+                    agg_stats[k] += float(v) * weight
+                    if weights is None:
+                        sum_counts[k] += 1
 
     for k in list(agg_stats.keys()):
         if k in max_keys:
-            if agg_stats[k] == float("-inf"):
+            if key_is_tensor[k]:
+                if agg_stats[k].item() == float("-inf"):
+                    del agg_stats[k]
+            elif agg_stats[k] == float("-inf"):
                 del agg_stats[k]
             continue
         if k in sum_keys:
@@ -138,7 +177,14 @@ def aggregate_stats(
             denom = float(sum(weights))
         else:
             denom = float(sum_counts.get(k, 0))
-        agg_stats[k] = agg_stats[k] / denom if denom > 0 else 0.0
+        if key_is_tensor[k]:
+            agg_stats[k] = agg_stats[k] / denom if denom > 0 else torch.tensor(0.0, device=key_device[k])
+        else:
+            agg_stats[k] = agg_stats[k] / denom if denom > 0 else 0.0
+
+    for k, v in list(agg_stats.items()):
+        if isinstance(v, Tensor):
+            agg_stats[k] = float(v.item())
 
     # 2) Batch metadata stats
     total_samples = 0.0

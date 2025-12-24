@@ -464,8 +464,9 @@ class Trainer:
         device = torch.device(self.cfg.model_device)
         micro_token_budget = int(self.cfg.micro_token_budget)
         max_seq_len = int(self.cfg.max_seq_len)
+        profile_memory = bool(self.cfg.profile_memory)
 
-        all_micro_stats: List[Dict[str, float]] = []
+        all_micro_stats: List[Dict[str, float | Tensor]] = []
         all_saw_batches: List[SAWBatch] = []
 
         # ---- 1) Fetch Macro-Batch ---------------------------------------
@@ -563,16 +564,19 @@ class Trainer:
                 grad_sync_disabled = True
 
             # ---- 2c) Loss + backward (scaled) --------------------------
-            pre_forward_alloc = self._reset_peak_memory(device)
+            pre_forward_alloc = self._reset_peak_memory(device) if profile_memory else None
             try:
                 loss, stats = self.algo.compute_loss(self.model, batch_tensors)
 
                 # Scale loss by micro-batch size to preserve macro-batch mean.
                 scaled_loss = loss * (item_count / total_items)
-                # Forward memory stats before backward frees activations
-                forward_mem_stats, alloc_after_forward, forward_peak = (
-                    self._capture_forward_memory_stats(device, pre_forward_alloc)
-                )
+                if profile_memory:
+                    # Forward memory stats before backward frees activations
+                    forward_mem_stats, alloc_after_forward, forward_peak = (
+                        self._capture_forward_memory_stats(device, pre_forward_alloc)
+                    )
+                else:
+                    forward_mem_stats, alloc_after_forward, forward_peak = {}, None, None
 
                 scaled_loss.backward()
             finally:
@@ -581,13 +585,16 @@ class Trainer:
 
             # Attach memory stats (if available) for logging/aggregation
             stats = dict(stats)
-            backward_mem_stats, backward_peak = self._collect_memory_stats(
-                device,
-                baseline_alloc=alloc_after_forward,
-            )
+            if profile_memory:
+                backward_mem_stats, backward_peak = self._collect_memory_stats(
+                    device,
+                    baseline_alloc=alloc_after_forward,
+                )
+            else:
+                backward_mem_stats, backward_peak = {}, None
 
             # Compute overall peak/activation across forward+backward
-            if forward_peak is not None or backward_peak is not None:
+            if profile_memory and (forward_peak is not None or backward_peak is not None):
                 mb = 1024 ** 2
                 total_peak = max(
                     forward_peak or 0,
