@@ -41,7 +41,7 @@ class WeightMeanLoss(Loss):
     def compute(self, logits: torch.Tensor, batch: dict[str, torch.Tensor]):
         weight_mean = batch["weight"].mean()
         loss = logits.mean() * weight_mean
-        stats = {"loss": float(weight_mean.detach().cpu())}
+        stats = {"loss": weight_mean.detach()}
         return loss, stats
 
 

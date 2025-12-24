@@ -307,27 +307,30 @@ class Trainer:
         if sum_reduce_vals:
             t_sum = torch.tensor(sum_reduce_vals, dtype=torch.float32, device=device)
             dist.all_reduce(t_sum, op=dist.ReduceOp.SUM)
-            for i, k in enumerate(sum_reduce_keys):
-                reduced[k] = float(t_sum[i].item())
+            sum_vals = t_sum.cpu().tolist()
+            for k, v in zip(sum_reduce_keys, sum_vals):
+                reduced[k] = v
 
         # Batch all_reduce for mean keys using sample-weighted sums.
         if mean_reduce_vals:
             t_mean = torch.tensor(mean_reduce_vals + [local_samples], dtype=torch.float32, device=device)
             dist.all_reduce(t_mean, op=dist.ReduceOp.SUM)
-            total_samples = float(t_mean[-1].item())
+            mean_vals = t_mean.cpu().tolist()
+            total_samples = mean_vals[-1]
             if has_num_samples:
                 denom = total_samples if total_samples > 0 else float(world_size)
             else:
                 denom = float(world_size)
-            for i, k in enumerate(mean_reduce_keys):
-                reduced[k] = float(t_mean[i].item()) / denom
+            for k, v in zip(mean_reduce_keys, mean_vals[:-1]):
+                reduced[k] = v / denom
 
         # Batch all_reduce for MAX keys (gpu stats)
         if gpu_vals:
             t_max = torch.tensor(gpu_vals, dtype=torch.float32, device=device)
             dist.all_reduce(t_max, op=dist.ReduceOp.MAX)
-            for i, k in enumerate(gpu_keys):
-                reduced[k] = float(t_max[i].item())
+            max_vals = t_max.cpu().tolist()
+            for k, v in zip(gpu_keys, max_vals):
+                reduced[k] = v
 
         # Preserve the local step counter
         reduced["train_step"] = float(self._train_step_idx)
@@ -466,7 +469,7 @@ class Trainer:
         max_seq_len = int(self.cfg.max_seq_len)
         profile_memory = bool(self.cfg.profile_memory)
 
-        all_micro_stats: List[Dict[str, float | Tensor]] = []
+        all_micro_stats: List[Dict[str, Tensor]] = []
         all_saw_batches: List[SAWBatch] = []
 
         # ---- 1) Fetch Macro-Batch ---------------------------------------
@@ -631,7 +634,21 @@ class Trainer:
         if self.sync_every_steps and self.publisher is not None and self._train_step_idx % self.sync_every_steps == 0:
             self._push_weights_to_runtime()
 
-        # ---- 7) Enrich stats -------------------------------------------
+        # ---- 7) Optional Checkpoint ------------------------------------
+        if self._checkpointer is not None:
+            self._checkpointer.maybe_save(
+                self.model,
+                optimizer=self.optimizer,
+                step=self._train_step_idx,
+                metadata={"algorithm": self.algo.name},
+            )
+
+        # ---- 8) Stats aggregation (skip on non-logging steps) ----------
+        log_every = self.cfg.log_every
+        if log_every > 1 and self._train_step_idx % log_every != 0:
+            # Skip expensive stats sync on non-logging steps
+            return {"train/step": float(self._train_step_idx)}
+
         final_stats = aggregate_stats(
             all_micro_stats,
             all_saw_batches,
@@ -644,16 +661,7 @@ class Trainer:
 
         final_stats = self._maybe_reduce_stats_across_ranks(final_stats, device=device)
 
-        # ---- 8) Optional Checkpoint ------------------------------------
-        if self._checkpointer is not None:
-            self._checkpointer.maybe_save(
-                self.model,
-                optimizer=self.optimizer,
-                step=self._train_step_idx,
-                metadata={"algorithm": self.algo.name},
-            )
-
-        # ---- 9) Optional logging ---------------------------------------
+        # ---- 9) Logging ------------------------------------------------
         grouped = self._group_log_stats(final_stats)
         self._last_train_stats = dict(grouped)
         log_stats = dict(grouped)

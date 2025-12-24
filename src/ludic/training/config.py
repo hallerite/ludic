@@ -111,6 +111,7 @@ class TrainerConfig:
     max_lag: Optional[int] = None  # Drop batches older than N steps
     reduce_stats_across_ranks: bool = False
     profile_memory: bool = False
+    log_every: int = 1
 
     # ----- collation ------------------------------
     pad_token_id: int = 0

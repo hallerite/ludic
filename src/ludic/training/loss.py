@@ -35,9 +35,12 @@ class Loss(Protocol):
     """
     Generic loss: given model outputs (logits) and a collated batch, return
     (scalar_loss, stats).
+
+    Stats values must be scalar tensors (on the same device as logits) to enable
+    batched D2H transfer during aggregation. Use `tensor.detach()` not `float(...)`.
     """
 
-    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Tensor]]:
         ...
 
 # We define this as a standalone helper so torch.compile can cache it cleanly.
