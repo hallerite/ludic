@@ -64,12 +64,11 @@ Represents the env transition triggered by a final AgentStep and carries the ful
 - Tool results are stored on the triggering AgentStep (tool_calls + tool_results in order), not as separate steps.
 
 ## Training / collation
-- Batch sources accept a step_selector (default: env-only) to preserve current RL behavior.
-- For interleaved CoT training:
-  - select AgentSteps (and optionally the final AgentStep before env action).
-  - prompt tokens already include tool results and env observations but are masked out by action_mask.
-  - if tool-call text appears inside the assistant completion and should be excluded from loss,
-    add a per-token loss_mask attachment in SAWItem for agent steps.
+- Batch sources now concatenate the entire agent turn into **one** SAWItem.
+- All AgentStep completions in the turn are action tokens (action_mask = 1).
+- Tool/interpreter feedback appears as user messages in the prompt and is masked out.
+- Credit/weight is taken from the final step in the turn (env step if present, else the last agent step).
+- This requires append-only context histories; context strategies that truncate or rewrite prior messages are not supported for online training.
 - Credit assignment can be scoped by step kind and/or reward_components.
 
 ## Breaking changes

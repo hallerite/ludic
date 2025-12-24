@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from environments.gsm8k import GSM8KEnv
 from ludic.agent import ReToolAgent
+from ludic.agents import CodeExecutionResult
 from ludic.context import FullDialog
 from ludic.eval.cli import (
     add_common_eval_args,
@@ -42,49 +43,54 @@ from ludic.training.batching.rollout_engine import RolloutEngine
 from ludic.types import Rollout
 
 
-async def python_code_sandbox(code: str):
+async def python_code_sandbox(code: str, timeout_s: float = 5.0):
     """
-    Simple async code sandbox for Python execution.
+    Async subprocess-based sandbox for Python execution.
 
-    In production, use a proper sandboxed environment like:
-    - dockerized Python container
-    - RestrictedPython library
-    - Online execution API
+    Runs code in a separate Python process for isolation.
     """
-    stdout = io.StringIO()
-    stderr = io.StringIO()
+    from ludic.agents import CodeExecutionResult
 
     try:
-        # Execute with builtins but with safety restrictions
-        exec_globals = {
-            "__builtins__": {
-                k: v
-                for k, v in __builtins__.items()
-                if k not in ("open", "exec", "eval", "compile", "__import__")
-            },
-            "print": print,
-            "result": None,
-        }
+        proc = await asyncio.create_subprocess_exec(
+            "python",
+            "-c",
+            code,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
 
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            exec(code, exec_globals)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
 
-        # Try to extract a result if available
-        output = stdout.getvalue()
-        if "result" in exec_globals and exec_globals["result"] is not None:
-            output = str(exec_globals["result"])
-        elif not output:
+        output = stdout.decode().strip()
+        error = stderr.decode().strip()
+        success = proc.returncode == 0
+
+        if not output and success:
             output = "(code executed with no output)"
 
-        from ludic.agents import CodeExecutionResult
+        if not success and error:
+            return CodeExecutionResult(
+                output="",
+                success=False,
+                error=error,
+            )
 
         return CodeExecutionResult(
             output=output,
-            success=True,
+            success=success,
+        )
+
+    except asyncio.TimeoutError:
+        if "proc" in locals():
+            proc.kill()
+            await proc.wait()
+        return CodeExecutionResult(
+            output="",
+            success=False,
+            error=f"Execution timed out after {timeout_s}s",
         )
     except Exception as e:
-        from ludic.agents import CodeExecutionResult
-
         return CodeExecutionResult(
             output="",
             success=False,

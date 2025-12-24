@@ -95,9 +95,8 @@ Implications:
   are action tokens.
 - Interleaved tool calling is multiple model calls between env steps. This is now
   recorded as multiple AgentSteps with per-call `TokenTrace`.
-- Training still defaults to env steps (plus env-targeted parse errors) via the default
-  step selector; training on internal tool calls requires an explicit `step_selector`
-  or filter.
+- Training now concatenates the full agent turn into one training sample by default,
+  so internal tool calls are included automatically.
 - Env tools still need a dedicated action contract/parser to mark tool calls as
   `action_target="env"` and emit an EnvironmentStep directly from the tool call.
 
@@ -105,7 +104,32 @@ Current behavior (ReActAgent):
 - `src/ludic/agents/react_agent.py` runs multiple model calls and returns per-call
   AgentSteps with token traces, plus one final env-targeted step. Protocols log all
   AgentSteps and one EnvironmentStep for the env transition, so intermediate tool
-  calls are visible but not trained on by default.
+  calls are visible and trained on via turn concatenation.
+
+## Turn-Concatenated Training Samples (Default)
+
+Online RL batching builds **one SAWItem per agent turn**, not per step.
+
+Why:
+- We want a **true transcript** of the internal loop (reasoning + code + feedback)
+  to be the training signal, not a bag of per-step fragments.
+- We do **not** want to rely on chat template retokenization; instead we stitch the
+  rollout-time token traces from each AgentStep.
+
+How:
+- Start with the first AgentStep's prompt token IDs.
+- Append each AgentStep's completion token IDs as action tokens (action_mask = 1).
+- For subsequent AgentSteps, append only the **prompt suffix** that extends the
+  existing sequence (action_mask = 0), then append that step's completion.
+- Interpreter outputs are user messages in the prompt, so they are **masked out**
+  automatically.
+- Credit/weight is taken from the **final step in the turn** (env step if present,
+  otherwise the last agent step for parse failures).
+
+Constraint:
+- This requires **append-only** context histories. Context strategies that truncate
+  or rewrite prior messages (e.g., thinking truncation in prompts) will break the
+  prefix-matching invariant, so they are **not supported** for online training yet.
 
 ## Future: First-Class Evaluation + Better Layering
 

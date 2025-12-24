@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
 
 from ludic.envs.env import LudicEnv
 from ludic.interaction.base import InteractionProtocol
@@ -23,7 +24,6 @@ from ludic.training.types import (
     EnvSpec,
     SampleFilter,
 )
-from ludic.training.filters import default_step_selector
 
 # ---------------------------------------------------------------------------
 # Factory aliases
@@ -40,6 +40,13 @@ _INFO_TRACE_KEYS = {
     "completion_token_ids",
     "completion_logprobs",
 }
+
+
+@dataclass
+class _TurnGroup:
+    turn_id: str
+    agent_steps: List[AgentStep] = field(default_factory=list)
+    env_step: Optional[EnvironmentStep] = None
 
 def _require_finite(value: float, *, what: str, rollout_id: str, step_index: int) -> None:
     if not math.isfinite(value):
@@ -204,6 +211,192 @@ def _build_saw_item_from_token_trace(
             meta=meta,
             attachments=attachments,
         ),
+        comp_len,
+    )
+
+
+def _collect_turns(rollout: Rollout) -> List[_TurnGroup]:
+    turns: List[_TurnGroup] = []
+    current: Optional[_TurnGroup] = None
+
+    for step in rollout.steps:
+        turn_id = step.turn_id or step.id
+        if current is None or current.turn_id != turn_id:
+            current = _TurnGroup(turn_id=turn_id)
+            turns.append(current)
+        if isinstance(step, AgentStep):
+            current.agent_steps.append(step)
+        elif isinstance(step, EnvironmentStep):
+            if current.env_step is not None:
+                raise ValueError(
+                    "Encountered multiple env steps for turn_id "
+                    f"{turn_id!r} in rollout {rollout.id}."
+                )
+            current.env_step = step
+
+    return turns
+
+
+def _append_prompt_suffix(
+    *,
+    input_ids: List[int],
+    prompt_ids: Sequence[int],
+    rollout_id: str,
+    step_index: int,
+) -> List[int]:
+    if len(prompt_ids) < len(input_ids):
+        raise ValueError(
+            "Cannot concatenate turn token traces: prompt token IDs are shorter than "
+            f"the existing sequence (rollout_id={rollout_id!r}, step_index={step_index}). "
+            "Context strategies that truncate or rewrite history are not supported in "
+            "turn-concatenated training."
+        )
+    if list(prompt_ids[: len(input_ids)]) != input_ids:
+        raise ValueError(
+            "Cannot concatenate turn token traces: prompt token IDs do not extend the "
+            f"existing sequence (rollout_id={rollout_id!r}, step_index={step_index}). "
+            "This typically means the context strategy modified prior history, which "
+            "is not supported in turn-concatenated training."
+        )
+    return list(prompt_ids[len(input_ids) :])
+
+
+def _build_turn_saw_item(
+    *,
+    rollout: Rollout,
+    turn: _TurnGroup,
+    weights: Mapping[Tuple[str, int], float],
+    require_chosen_logprobs: bool,
+) -> Tuple[SAWItem, int, int]:
+    if not turn.agent_steps:
+        raise ValueError(
+            f"Turn {turn.turn_id!r} in rollout {rollout.id} has no agent steps."
+        )
+
+    input_ids: List[int] = []
+    attention_mask: List[int] = []
+    action_mask: List[int] = []
+    comp_len = 0
+
+    logprobs_mode: Optional[bool] = None
+    logprobs: List[float] = []
+
+    def _extend(ids: Sequence[int], *, is_action: bool) -> None:
+        input_ids.extend(ids)
+        attention_mask.extend([1] * len(ids))
+        action_mask.extend([1 if is_action else 0] * len(ids))
+
+    for idx, step in enumerate(turn.agent_steps):
+        trace = _require_token_trace(
+            step,
+            rollout_id=rollout.id,
+            step_index=step.index,
+        )
+        prompt_ids = list(trace.prompt_token_ids)
+        if idx == 0:
+            _extend(prompt_ids, is_action=False)
+        else:
+            suffix = _append_prompt_suffix(
+                input_ids=input_ids,
+                prompt_ids=prompt_ids,
+                rollout_id=rollout.id,
+                step_index=step.index,
+            )
+            _extend(suffix, is_action=False)
+
+        completion_ids = list(trace.completion_token_ids)
+        _extend(completion_ids, is_action=True)
+        comp_len += len(completion_ids)
+
+        completion_logprobs = _coerce_completion_logprobs(
+            trace.completion_logprobs,
+            completion_ids=completion_ids,
+            rollout_id=rollout.id,
+            step_index=step.index,
+        )
+        if completion_logprobs is None:
+            if logprobs_mode is True:
+                raise ValueError(
+                    "Missing completion_logprobs for a step within a turn-concatenated "
+                    f"sample (rollout_id={rollout.id!r}, step_index={step.index}). "
+                    "Either return logprobs for all steps or none."
+                )
+            logprobs_mode = False
+        else:
+            if logprobs_mode is False:
+                raise ValueError(
+                    "Mixed presence of completion_logprobs within a turn-concatenated "
+                    f"sample (rollout_id={rollout.id!r}, step_index={step.index}). "
+                    "Either return logprobs for all steps or none."
+                )
+            logprobs_mode = True
+            logprobs.extend(completion_logprobs)
+
+    if require_chosen_logprobs and not logprobs_mode:
+        raise ValueError(
+            f"Missing completion_logprobs for rollout {rollout.id}, turn {turn.turn_id!r}, "
+            "but the rollout was executed with return_spec.return_chosen_logprobs=True. "
+            "Fix your inference client to return chosen-token logprobs (e.g. ReturnSpec.for_rl())."
+        )
+
+    final_step: Step = turn.env_step or turn.agent_steps[-1]
+    reward = float(final_step.reward)
+    _require_finite(
+        reward,
+        what="reward",
+        rollout_id=rollout.id,
+        step_index=final_step.index,
+    )
+    weight = _get_credit_weight(
+        weights,
+        rollout_id=rollout.id,
+        step_index=final_step.index,
+    )
+
+    prev_obs = final_step.prev_obs if isinstance(final_step, EnvironmentStep) else ""
+    action = final_step.action
+    prompt_len = len(input_ids) - comp_len
+
+    meta = _base_item_meta(
+        rollout=rollout,
+        step_index=final_step.index,
+        reward=reward,
+        comp_len=comp_len,
+        prev_obs=prev_obs,
+        action=action,
+        truncated=final_step.truncated,
+        terminated=final_step.terminated,
+        step_kind=final_step.kind,
+        turn_id=turn.turn_id,
+        prompt_len=prompt_len,
+    )
+    meta.update(_strip_trace_info(final_step.info))
+    meta.update(
+        {
+            "turn_step_count": len(turn.agent_steps),
+            "turn_agent_step_indices": [s.index for s in turn.agent_steps],
+            "turn_agent_step_ids": [s.id for s in turn.agent_steps],
+            "turn_action_targets": [s.action_target for s in turn.agent_steps],
+            "turn_has_env_step": turn.env_step is not None,
+        }
+    )
+
+    attachments = SampleAttachments()
+    if logprobs_mode:
+        attachments = SampleAttachments(
+            actor_logps=ActorTokenLogps(token_logps=logprobs)
+        )
+
+    return (
+        SAWItem(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            action_mask=action_mask,
+            weight=weight,
+            meta=meta,
+            attachments=attachments,
+        ),
+        prompt_len,
         comp_len,
     )
 
@@ -431,26 +624,27 @@ class RolloutEngine:
         timeout_s: Optional[float] = None,
         concurrency: int = 8,
         sample_filter: Optional[SampleFilter] = None,
-        step_selector: Optional[Callable[[Step], bool]] = None,
     ) -> SAWBatch:
         """
         High-level entrypoint for RL-style training:
 
         1. Generates rollouts.
         2. Computes credit (advantages/rewards).
-        3. Collates into SAWItems (handling tokenization/masking).
+        3. Collates into SAWItems by concatenating each agent turn into a single
+           training sample (handling tokenization/masking).
         4. Optionally filters samples based on metadata.
 
         Tokenization strategy:
         - Online RL requires rollout-time token IDs:
           Step.trace must contain prompt/completion token IDs.
+        - Turn concatenation assumes each subsequent prompt token sequence
+          strictly extends the previous sequence (append-only history).
+          Context strategies that truncate or rewrite history are not supported.
 
         Filtering:
         - If sample_filter is provided, it's applied after SAWItems are created.
         - Filter returns True to KEEP a sample, False to DROP it.
         - Use ludic.training.filters for common predicates.
-        - If step_selector is not provided, env steps and env-targeted parse
-          errors are selected by default.
         """
         rollouts = await self.generate_rollouts(
             requests=requests,
@@ -459,55 +653,21 @@ class RolloutEngine:
             concurrency=concurrency,
         )
         weights = credit_assigner.compute(rollouts)
-        selector = step_selector or default_step_selector
 
         items_with_lengths: List[Tuple[SAWItem, int, int]] = []
 
         for r in rollouts:
-            for step in r.steps:
-                if not selector(step):
-                    continue
-                w = _get_credit_weight(weights, rollout_id=r.id, step_index=step.index)
-                reward = float(step.reward)
-                _require_finite(reward, what="reward", rollout_id=r.id, step_index=step.index)
-
-                info = step.info or {}
-                trace = _require_token_trace(step, rollout_id=r.id, step_index=step.index)
-                prompt_ids = list(trace.prompt_token_ids)
-                completion_ids = list(trace.completion_token_ids)
-                prompt_len = len(prompt_ids)
-                completion_logprobs = _coerce_completion_logprobs(
-                    trace.completion_logprobs,
-                    completion_ids=completion_ids,
-                    rollout_id=r.id,
-                    step_index=step.index,
-                )
-                require_chosen_logprobs = bool(
-                    (r.meta.get("engine") or {})
-                    .get("return_spec", {})
-                    .get("return_chosen_logprobs", False)
-                )
-                if require_chosen_logprobs and completion_logprobs is None:
-                    raise ValueError(
-                        f"Missing completion_logprobs for rollout {r.id}, step {step.index}, "
-                        "but the rollout was executed with return_spec.return_chosen_logprobs=True. "
-                        "Fix your inference client to return chosen-token logprobs (e.g. ReturnSpec.for_rl())."
-                    )
-                item, comp_len = _build_saw_item_from_token_trace(
+            require_chosen_logprobs = bool(
+                (r.meta.get("engine") or {})
+                .get("return_spec", {})
+                .get("return_chosen_logprobs", False)
+            )
+            for turn in _collect_turns(r):
+                item, prompt_len, comp_len = _build_turn_saw_item(
                     rollout=r,
-                    step_index=step.index,
-                    reward=reward,
-                    weight=w,
-                    prev_obs=step.prev_obs if isinstance(step, EnvironmentStep) else "",
-                    action=step.action,
-                    prompt_ids=prompt_ids,
-                    completion_ids=completion_ids,
-                    step_info=info,
-                    completion_logprobs=completion_logprobs,
-                    truncated=step.truncated,
-                    terminated=step.terminated,
-                    step_kind=step.kind,
-                    turn_id=step.turn_id,
+                    turn=turn,
+                    weights=weights,
+                    require_chosen_logprobs=require_chosen_logprobs,
                 )
                 items_with_lengths.append((item, prompt_len, comp_len))
 

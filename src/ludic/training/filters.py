@@ -43,9 +43,12 @@ def keep_agent_steps(item: SAWItem) -> bool:
 
 def default_step_selector(step: Step) -> bool:
     """
-    Default rollout step selection for training:
+    Default rollout step selection for step-wise training:
       - all env steps
       - env-targeted agent steps that failed parsing
+
+    Note: online RolloutEngine batching now concatenates full agent turns by default,
+    so this selector is primarily used by offline/legacy pipelines.
     """
     if isinstance(step, EnvironmentStep):
         return True

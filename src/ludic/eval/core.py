@@ -4,7 +4,8 @@ Evaluation helpers built on RolloutEngine.
 This module is intentionally training-agnostic: it consumes RolloutEngine and
 RolloutRequests and produces reduced metrics over step-level eval items.
 
-Eval items are dicts shaped like training `SAWItem.meta` (one per step).
+Eval items are dicts shaped like training `SAWItem.meta` (eval uses env steps,
+while training batches concatenate full turns into one item).
 """
 
 from __future__ import annotations
@@ -21,8 +22,9 @@ def _eval_items_from_rollout(rollout: Rollout) -> List[Dict[str, Any]]:
     """
     Convert a rollout into eval "items" that match the training reducer mental model.
 
-    Each item is a dict that mirrors the structure of `SAWItem.meta` produced by
-    `RolloutEngine.generate_batch()`: one item per step, with rollout.meta merged.
+Each item is a dict that mirrors the structure of `SAWItem.meta` produced by
+`RolloutEngine.generate_batch()`: evaluation records only env steps, while
+training batches concatenate full turns into one item.
     """
     items: List[Dict[str, Any]] = []
     for step in rollout.steps:

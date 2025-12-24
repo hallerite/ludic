@@ -106,7 +106,7 @@ async def run_pipeline_actor(
     1. Fetch intent via requests_fn.
     2. Poll the runtime (via client) for the current policy version.
     3. Tag requests with that version.
-    4. Delegate generation AND collation to the shared Engine.
+    4. Delegate generation AND collation to the shared Engine (one SAWItem per turn).
     5. Push the resulting SAWItems to Redis.
     """
     try:

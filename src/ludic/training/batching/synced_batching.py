@@ -15,6 +15,9 @@ class RolloutBatchSource(BatchSource):
     """
     Synchronous BatchSource.
     It holds the Engine and blocks the Trainer while generating data.
+
+    Note: RolloutEngine now concatenates each agent turn into a single training
+    sample (one SAWItem per turn), rather than emitting per-step samples.
     """
 
     def __init__(

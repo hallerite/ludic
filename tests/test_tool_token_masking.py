@@ -23,6 +23,9 @@ class ToolTraceClient(ChatClient):
         self._steps = steps
         self._i = 0
         self.last_messages: Optional[List[Dict[str, Any]]] = None
+        self.first_messages: Optional[List[Dict[str, Any]]] = None
+        self._rolling_prompt_ids: Optional[List[int]] = None
+        self._last_prompt_len: int = 0
 
     async def complete(
         self,
@@ -33,10 +36,20 @@ class ToolTraceClient(ChatClient):
 
         step = self._steps[self._i]
         self._i += 1
+        if self.first_messages is None:
+            self.first_messages = list(request.messages)
         self.last_messages = list(request.messages)
 
         prompt_len = len(request.messages)
-        prompt_token_ids = list(range(prompt_len))
+        if self._rolling_prompt_ids is None:
+            prompt_token_ids = list(range(prompt_len))
+        else:
+            if prompt_len < self._last_prompt_len:
+                raise RuntimeError("Prompt length decreased between steps")
+            extra_count = prompt_len - self._last_prompt_len
+            start = self._rolling_prompt_ids[-1] + 1 if self._rolling_prompt_ids else 0
+            extra_tokens = list(range(start, start + extra_count))
+            prompt_token_ids = list(self._rolling_prompt_ids) + extra_tokens
         completion_token_ids = [100, 101]
 
         resp = ChatResponse(
@@ -45,6 +58,9 @@ class ToolTraceClient(ChatClient):
             completion_token_ids=completion_token_ids,
             finish_reason="stop",
         )
+
+        self._rolling_prompt_ids = list(prompt_token_ids) + list(completion_token_ids)
+        self._last_prompt_len = prompt_len
 
         raw_response = {
             "choices": [
@@ -136,6 +152,7 @@ async def test_tool_role_tokens_are_masked_out(env_registry) -> None:
     assert any(msg.get("role") == "tool" for msg in client.last_messages)
 
     prompt_len = item.meta["prompt_length"]
-    assert prompt_len == len(client.last_messages)
-    assert all(v == 0 for v in item.action_mask[:prompt_len])
-    assert all(v == 1 for v in item.action_mask[prompt_len:])
+    assert prompt_len == len(item.input_ids) - sum(item.action_mask)
+    first_action_idx = item.action_mask.index(1)
+    assert any(v == 0 for v in item.action_mask[first_action_idx + 1 :])
+    assert sum(item.action_mask) == 4
