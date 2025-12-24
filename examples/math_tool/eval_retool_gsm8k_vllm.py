@@ -236,7 +236,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", type=str, default="test", help="GSM8K split.")
     parser.add_argument("--limit", type=int, default=None, help="Max samples.")
     parser.add_argument(
-        "--max-code-blocks", type=int, default=10, help="Max code blocks per episode."
+        "--max-code-blocks", type=int, default=3, help="Max code blocks per episode."
     )
     parser.add_argument(
         "--system-prompt",
