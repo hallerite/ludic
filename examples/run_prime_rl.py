@@ -1,20 +1,25 @@
-# run_experiment.py
+# run_prime_rl.py
 import asyncio
 import logging
 
-from ludic.training.prime_bridge import LudicConfig, PrimeOrchestrator
 from prime_rl.utils.pydantic_config import parse_argv
 
-from ludic.training.rollout_engine import RolloutEngine, GRPOBatchSource
-from ludic.training.credit_assignment import GroupNormalizedReturn
-from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
-
-from examples.envs.tic_tac_toe import TicTacToeEnv
-from ludic.inference.vllm_client import VLLMChatClient
-from ludic.interaction.single_agent import SingleAgentSyncProtocol
+from environments.tic_tac_toe import TicTacToeEnv
 from ludic.agent import Agent
-from ludic.context.full_dialog import FullDialog
-from ludic.parsers import xml_move_parser
+from ludic.context import FullDialog
+from ludic.inference import InferenceSpec, ReturnSpec, SamplingParams, VLLMChatClient
+from ludic.interaction import SingleAgentSyncProtocol
+from ludic.parsers import xml_tag_parser
+from ludic.training import (
+    EnvSpec,
+    GroupNormalizedReturn,
+    GRPORequestStrategy,
+    ProtocolSpec,
+    RolloutBatchSource,
+    RolloutEngine,
+    RolloutRequest,
+)
+from ludic.training.prime_rl import LudicConfig, PrimeOrchestrator
 
 
 # -------------------------------------------------------------------------
@@ -46,17 +51,17 @@ def create_single_agent_protocol(**kwargs):
         enable_weight_updates=False,
     )
 
+    base_prompt = TicTacToeEnv().suggested_sysprompt or ""
+    prompt = base_prompt + "\n\nOutput your move as a single XML tag, e.g., <move>A1</move>."
+
     agent = Agent(
         client=client,
         model="Qwen/Qwen2.5-7B-Instruct",
-        ctx=FullDialog(),
-        parser=xml_move_parser,
+        ctx=FullDialog(system_prompt=prompt),
+        parser=xml_tag_parser("move", exact=True, success_reward=0.0, error_reward=-1.0),
     )
 
-    prompt = TicTacToeEnv().suggested_sysprompt or ""
-    # You can optionally append extra instructions for XML format here.
-
-    return SingleAgentSyncProtocol(agent=agent, prompt=prompt)
+    return SingleAgentSyncProtocol(agent=agent)
 
 
 protocol_registry = {"single_agent_xml": create_single_agent_protocol}
@@ -73,6 +78,8 @@ async def main():
     # [orchestrator]
     # env_kind = "tictactoe_agent_starts"
     # protocol_kind = "single_agent_xml"
+    # max_steps_per_episode = 5
+    # rollout_concurrency = 64
     #
     # [orchestrator.sampling]
     # temperature = 0.7
@@ -80,6 +87,10 @@ async def main():
     #
     # and standard Prime RL fields (output_dir, num_train_workers, rollouts_per_example, ...)
     config = parse_argv(LudicConfig)
+    if config.rollouts_per_example <= 0:
+        raise ValueError("rollouts_per_example must be > 0.")
+    if config.batch_size % config.rollouts_per_example != 0:
+        raise ValueError("batch_size must be divisible by rollouts_per_example.")
 
     # 3.2 Build the Ludic rollout engine
     engine = RolloutEngine(
@@ -89,11 +100,23 @@ async def main():
     )
 
     # 3.3 Build credit assigner (GRPO-style group-normalized return)
-    credit_assigner = GroupNormalizedReturn(normalize_adv=True)
+    credit_assigner = GroupNormalizedReturn(
+        group_size=config.rollouts_per_example,
+        normalize_adv=True,
+    )
 
     # 3.4 Define GRPO base requests: one per "group" / prompt
+    train_inference = InferenceSpec(
+        sampling=SamplingParams(
+            temperature=config.sampling.temperature,
+            max_tokens=config.sampling.max_tokens,
+        ),
+        # Prime expects per-token logprobs for the sampled completion tokens.
+        return_=ReturnSpec.for_rl(),
+    )
+
     def base_requests_fn():
-        # Number of groups: each group will be expanded to G rollouts by GRPOBatchSource,
+        # Number of groups: each group will be expanded to G rollouts by GRPORequestStrategy,
         # where G = config.rollouts_per_example (must divide batch_size).
         num_groups = config.batch_size // config.rollouts_per_example
 
@@ -108,30 +131,38 @@ async def main():
                     kwargs=config.protocol_kwargs,
                 ),
                 num_episodes=1,
-                sampling_args={
-                    "temperature": config.sampling.temperature,
-                    "max_tokens": config.sampling.max_tokens,
-                    "seed": base_seed + i,
-                    # Crucial: vLLM must return token IDs for Ludic → SAW → Prime
-                    "extras": {
-                        "extra_body": {"return_token_ids": True}
-                    },
-                },
+                env_seed=base_seed + i,
+                sampling_seed=base_seed + i * config.rollouts_per_example,
+                inference=train_inference,
             )
             for i in range(num_groups)
         ]
 
     # 3.5 Choose a BatchSource (GRPO here; RolloutBatchSource would also work)
-    batch_source = GRPOBatchSource(
+    def requests_fn():
+        return GRPORequestStrategy(group_size=config.rollouts_per_example).expand(
+            base_requests_fn()
+        )
+
+    max_steps_per_episode = getattr(config, "max_steps_per_episode", None)
+    if max_steps_per_episode is None:
+        # Backward-compat fallback: older configs overloaded max_steps.
+        max_steps_per_episode = getattr(config, "max_steps", 1)
+    if max_steps_per_episode <= 0:
+        raise ValueError("max_steps_per_episode must be > 0.")
+    rollout_concurrency = getattr(config, "rollout_concurrency", None)
+    if rollout_concurrency is None:
+        rollout_concurrency = min(128, config.batch_size)
+    if rollout_concurrency <= 0:
+        raise ValueError("rollout_concurrency must be > 0.")
+
+    batch_source = RolloutBatchSource(
         orchestrator=engine,
         credit_assigner=credit_assigner,
-        requests_fn=base_requests_fn,
-        group_size=config.rollouts_per_example,          # the "G" in GRPO
-        max_steps=config.seq_len,
-        concurrency=min(128, config.batch_size),
-        timeout_s=None,
-        retokenize=False,
-        tokenize=None,
+        requests_fn=requests_fn,
+        max_steps=int(max_steps_per_episode),
+        concurrency=int(rollout_concurrency),
+        timeout_s=getattr(config, "rollout_timeout_s", None),
     )
 
     # 3.6 Build and run the PrimeOrchestrator bridge

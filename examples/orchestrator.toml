@@ -1,6 +1,7 @@
 # orchestrator.toml
 
 # --- General Settings ---
+# IMPORTANT: keep this output_dir in sync with trainer.toml and inference.toml
 output_dir = "./runs/tictactoe_lora_run"
 num_train_workers = 1
 max_steps = 20
@@ -8,23 +9,20 @@ max_steps = 20
 # --- Ludic Specifics ---
 env_kind = "tictactoe_agent_starts"
 protocol_kind = "single_agent_xml"
+max_steps_per_episode = 5
+rollout_concurrency = 64
 
 # GRPO / Batch Settings
 batch_size = 128
-rollouts_per_example = 1 
+rollouts_per_example = 1
 seq_len = 1024
 
 # --- Inference Infrastructure (The vLLM Server) ---
 [client]
 base_url = ["http://127.0.0.1:8000/v1"]
 
-# --- Weight Broadcasting (NCCL) ---
-# Ensure this matches the port opened by the vLLM server container/process
 [weight_broadcast]
-type = "nccl"
-host = "127.0.0.1"
-port = 51216
-timeout = 600
+type = "filesystem"
 
 # --- Sampling Parameters ---
 [sampling]

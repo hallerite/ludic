@@ -21,5 +21,6 @@ tp = 1
 dp = 1
 
 # --- Weight Sync / Broadcast ---
+# Ensure this matches trainer.toml/orchestrator.toml.
 [weight_broadcast]
 type = "filesystem"

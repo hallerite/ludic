@@ -1,5 +1,6 @@
 # trainer.toml
-output_dir = "/root/ludic/runs/tictactoe_lora_run"
+# IMPORTANT: keep this output_dir in sync with orchestrator.toml and inference.toml
+output_dir = "./runs/tictactoe_lora_run"
 
 [model]
 name = "Qwen/Qwen2.5-7B-Instruct"

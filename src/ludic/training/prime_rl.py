@@ -1,8 +1,8 @@
 import asyncio
-import torch
 import shutil
+import torch
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from pydantic import Field
 
 # --- Prime-RL Imports ---
@@ -22,7 +22,6 @@ from prime_rl.utils.utils import (
     get_rollout_dir,
     get_step_path,
     get_latest_ckpt_step,
-    clean_exit,
 )
 from prime_rl.utils.logger import setup_logger
 
@@ -49,6 +48,20 @@ class LudicConfig(PrimeOrchestratorConfig):
     # Ludic specific rollout settings (free-form kwargs for env/protocol)
     protocol_kwargs: dict = Field(default_factory=dict)
     env_kwargs: dict = Field(default_factory=dict)
+
+    # Ludic specific rollout control
+    max_steps_per_episode: int = Field(
+        description="Max environment steps per Ludic rollout episode.",
+        default=1,
+    )
+    rollout_concurrency: Optional[int] = Field(
+        description="Concurrency for Ludic rollout execution (default min(128, batch_size)).",
+        default=None,
+    )
+    rollout_timeout_s: Optional[float] = Field(
+        description="Optional per-call timeout (seconds) for Ludic inference during rollouts.",
+        default=None,
+    )
 
     # You can still override defaults like batch_size here if desired
     batch_size: int = 128
@@ -97,9 +110,14 @@ class PrimeRLDataSink:
             prompt_ids = input_tensor[prompt_indices].tolist()
             completion_ids = input_tensor[completion_indices].tolist()
 
-            # Extract logprobs from meta (populated by VLLM client / Ludic)
-            # We assume Ludic put them in item.meta['completion_logprobs'].
-            completion_logprobs = item.meta.get("completion_logprobs", [])
+            # Extract logprobs from attachments (preferred) with meta fallback.
+            completion_logprobs = []
+            if item.actor_logps is not None:
+                completion_logprobs = list(item.actor_logps.token_logps)
+            else:
+                meta_logprobs = item.meta.get("completion_logprobs")
+                if isinstance(meta_logprobs, list):
+                    completion_logprobs = list(meta_logprobs)
 
             # Padding/Truncation safety for logprobs
             if len(completion_logprobs) < len(completion_ids):
