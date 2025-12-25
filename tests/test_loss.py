@@ -89,22 +89,28 @@ def test_compute_logp_action_multitoken_and_norm():
 # ---- test_reinforce_loss ----
 
 def test_reinforce_loss():
+    """Test REINFORCE with IS correction (on-policy case where ratio=1)."""
     loss_fn = ReinforceLoss()
 
     # B=1, T=2, V=2
     logits = torch.tensor([[[1.0, 2.0], [3.0, 1.0]]], dtype=torch.float32)
     # logprobs -> [[[-1.313, -0.313], [-0.127, -2.127]]]
-    
+
+    # Compute logp_action for on-policy old_logp
+    input_ids = torch.tensor([[1, 0]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1]], dtype=torch.float32)
+    # With causal shift, logp_action = logp[0, 0, 0] = -1.3133
+    old_logp = compute_logp_action(logits, input_ids, action_mask)
+
     batch = {
-        "input_ids": torch.tensor([[1, 0]], dtype=torch.long),
-        "action_mask": torch.tensor([[0, 1]], dtype=torch.float32),
-        "weight": torch.tensor([2.0], dtype=torch.float32), # Advantages
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([2.0], dtype=torch.float32),  # Advantages
+        "old_logp_action": old_logp.detach(),  # On-policy: ratio will be 1.0
     }
 
-    # With causal shift, only position 0 logits are used to score token at pos 1
-    # logp_action = logp[0, 0, 0] = -1.3133
-    # advantages = 2.0
-    # loss = - (adv * logp_action).mean() = - (2.0 * -1.3133) = 2.6266
+    # On-policy: ratio = 1.0, logp = -1.3133
+    # loss = - sg(ratio) * adv * logp = - 1.0 * 2.0 * (-1.3133) = 2.6266
     expected_loss = 2.6266
 
     loss, stats = loss_fn.compute(logits, batch)
@@ -112,6 +118,52 @@ def test_reinforce_loss():
     assert torch.allclose(loss, torch.tensor(expected_loss), atol=1e-3)
     assert stats["adv_mean"] == pytest.approx(2.0)
     assert stats["logp_mean"] == pytest.approx(-1.3133, abs=1e-3)
+    assert stats["ratio_mean"] == pytest.approx(1.0, abs=1e-3)
+    assert stats["kl_actor_policy"] == pytest.approx(0.0, abs=1e-3)
+
+
+def test_reinforce_loss_off_policy():
+    """Test REINFORCE with IS correction (off-policy case)."""
+    # B=1, T=2, V=2
+    logits = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+    input_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1]], dtype=torch.float32)
+
+    logp_action = compute_logp_action(logits, input_ids, action_mask)
+    # logp_action = log(0.5) = -0.693
+    # Set old_logp so ratio = 2.0 (current policy is 2x more likely than behavior)
+    ratio_target = 2.0
+    old_logp_action = logp_action - torch.log(torch.tensor(ratio_target))
+
+    batch = {
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([1.0], dtype=torch.float32),
+        "old_logp_action": old_logp_action.detach(),
+    }
+
+    # loss = - sg(ratio) * adv * logp = - 2.0 * 1.0 * (-0.693) = 1.386
+    loss_fn = ReinforceLoss()
+    loss, stats = loss_fn.compute(logits, batch)
+
+    expected_loss = -2.0 * 1.0 * float(logp_action)
+    assert torch.allclose(loss, torch.tensor(expected_loss), atol=1e-3)
+    assert stats["ratio_mean"] == pytest.approx(2.0, abs=1e-3)
+
+
+def test_reinforce_loss_requires_old_logp():
+    """Test that ReinforceLoss raises KeyError when old_logp_action is missing."""
+    logits = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+    batch = {
+        "input_ids": torch.tensor([[0, 1]], dtype=torch.long),
+        "action_mask": torch.tensor([[0, 1]], dtype=torch.float32),
+        "weight": torch.tensor([1.0], dtype=torch.float32),
+        # Missing old_logp_action
+    }
+
+    loss_fn = ReinforceLoss()
+    with pytest.raises(KeyError, match="old_logp_action"):
+        loss_fn.compute(logits, batch)
 
 
 # ---- test_reinforce_baseline_loss ----
@@ -126,10 +178,17 @@ def test_reinforce_baseline_loss(normalize):
         [[2.0, 1.0], [1.0, 2.0]],  # sample 1: logp(id=0 | pos0) = -0.313
     ], dtype=torch.float32)
 
+    input_ids = torch.tensor([[1, 0], [0, 0]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1], [0, 1]], dtype=torch.float32)
+
+    # Compute on-policy old_logp (ratio will be 1.0)
+    old_logp = compute_logp_action(logits, input_ids, action_mask)
+
     batch = {
-        "input_ids": torch.tensor([[1, 0], [0, 0]], dtype=torch.long),
-        "action_mask": torch.tensor([[0, 1], [0, 1]], dtype=torch.float32),
-        "weight": torch.tensor([1.5, 0.5], dtype=torch.float32), # Raw returns
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([1.5, 0.5], dtype=torch.float32),  # Raw returns
+        "old_logp_action": old_logp.detach(),
     }
 
     # With causal shift, both samples score the token at position 1 using logits from position 0
@@ -137,18 +196,19 @@ def test_reinforce_baseline_loss(normalize):
     # raw_returns = [1.5, 0.5]
     # baseline = raw_returns.mean() = 1.0
     # advantages = [1.5 - 1.0, 0.5 - 1.0] = [0.5, -0.5]
-    
+    # On-policy: ratio = 1.0
+
     if normalize:
         # std = advantages.std(unbiased=False) = 0.5
         # advantages = [0.5 / 0.5, -0.5 / 0.5] = [1.0, -1.0]
-        # loss = - (advantages * logp_action).mean()
-        # loss = - ([1.0, -1.0] * [-1.313, -0.313]).mean()
+        # loss = - sg(ratio) * (advantages * logp_action).mean()
+        # loss = - 1.0 * ([1.0, -1.0] * [-1.313, -0.313]).mean()
         # loss = - ([-1.313, 0.313]).mean() = 0.5
         expected_loss = 0.5
     else:
         # advantages = [0.5, -0.5]
-        # loss = - (advantages * logp_action).mean()
-        # loss = - ([0.5, -0.5] * [-1.313, -0.313]).mean()
+        # loss = - sg(ratio) * (advantages * logp_action).mean()
+        # loss = - 1.0 * ([0.5, -0.5] * [-1.313, -0.313]).mean()
         # loss = - ([-0.6565, 0.1565]).mean() = 0.25
         expected_loss = 0.25
 
