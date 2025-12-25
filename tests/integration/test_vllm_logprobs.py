@@ -12,7 +12,7 @@ from ludic.inference.vllm_client import VLLMChatClient
 from ludic.inference.request import ChatCompletionRequest, ReturnSpec
 from ludic.inference.sampling import SamplingParams
 
-pytestmark = [pytest.mark.integration, pytest.mark.gpu, pytest.mark.report]
+pytestmark = [pytest.mark.integration, pytest.mark.gpu, pytest.mark.diagnostic]
 
 
 @pytest.mark.asyncio

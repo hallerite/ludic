@@ -49,9 +49,10 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+addopts = ["-m", "not diagnostic"]
 markers = [
     "integration: marks tests as integration tests",
     "gpu: marks tests as needing a GPU",
-    "report: marks tests that primarily emit diagnostic reports rather than asserting strict correctness",
+    "diagnostic: marks tests that primarily emit diagnostic reports rather than asserting strict correctness",
 ]
 testpaths = ["tests"]
