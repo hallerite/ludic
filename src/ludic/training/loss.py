@@ -136,13 +136,23 @@ def compute_token_logp(
 @dataclass
 class ReinforceLoss:
     """
-    Vanilla REINFORCE:
+    REINFORCE with importance sampling correction:
 
-        loss = - E[ A * log π(a|s) ]
+        loss = - E[ sg(r) * A * log π(a|s) ]
 
-    where A is taken from `batch["weight"]`.
+    where:
+        - A is taken from `batch["weight"]`
+        - r = π_new(a|s) / π_old(a|s) is the IS ratio
+        - sg(·) is stop-gradient
+
+    The IS correction accounts for the fact that in LLM-RL we are always
+    slightly off-policy due to different inference vs training kernels.
+
+    Expects batch[old_logp_key] containing log π_old(a|s).
     """
+
     length_normalize: bool = False
+    old_logp_key: str = "old_logp_action"
 
     @jaxtyped(typechecker=typechecker)
     def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
@@ -150,17 +160,34 @@ class ReinforceLoss:
         action_mask = batch["action_mask"]        # [B, T]
         advantages = batch["weight"]              # [B]
 
+        if self.old_logp_key not in batch:
+            raise KeyError(f"ReinforceLoss requires '{self.old_logp_key}' in batch.")
+
         logp_action = compute_logp_action(
             logits, input_ids, action_mask, length_normalize=self.length_normalize
         )  # [B]
 
-        loss = - (advantages * logp_action).mean()
+        old_logp = batch[self.old_logp_key]  # [B]
+        if self.length_normalize:
+            lengths = action_mask[:, 1:].to(old_logp.dtype).sum(dim=-1).clamp(min=1.0)
+            old_logp = old_logp / lengths
+
+        log_ratio = logp_action - old_logp
+        ratio = torch.exp(log_ratio)
+        # KL approximation for stats: r - log(r) - 1
+        mismatch_kl = ratio - log_ratio - 1.0
+
+        # Stop-gradient on IS weight: gradient flows only through log π
+        loss = - (ratio.detach() * advantages * logp_action).mean()
 
         stats: Dict[str, Any] = {
             "loss": loss.detach(),
             "adv_mean": advantages.mean().detach(),
             "adv_std": advantages.std(unbiased=False).detach(),
             "logp_mean": logp_action.mean().detach(),
+            "ratio_mean": ratio.mean().detach(),
+            "ratio_std": ratio.std(unbiased=False).detach(),
+            "kl_actor_policy": mismatch_kl.mean().detach(),
         }
         return loss, stats
 
@@ -236,16 +263,22 @@ class MaskedCausalLMCrossEntropyLoss:
 @dataclass
 class ReinforceBaselineLoss:
     """
-    REINFORCE with batch-mean baseline:
+    REINFORCE with batch-mean baseline and importance sampling correction:
 
         A_i = adv_i - mean(adv)
-        loss = - E[ A_i * log π(a_i|s_i) ]
+        loss = - E[ sg(r) * A_i * log π(a_i|s_i) ]
 
-    where adv_i is batch["weight"].
+    where:
+        - adv_i is batch["weight"]
+        - r = π_new(a|s) / π_old(a|s) is the IS ratio
+        - sg(·) is stop-gradient
+
+    Expects batch[old_logp_key] containing log π_old(a|s).
     """
 
     normalize: bool = False
     length_normalize: bool = False
+    old_logp_key: str = "old_logp_action"
 
     @jaxtyped(typechecker=typechecker)
     def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
@@ -253,9 +286,21 @@ class ReinforceBaselineLoss:
         action_mask = batch["action_mask"]
         adv_raw = batch["weight"]                # [B]
 
+        if self.old_logp_key not in batch:
+            raise KeyError(f"ReinforceBaselineLoss requires '{self.old_logp_key}' in batch.")
+
         logp_action = compute_logp_action(
             logits, input_ids, action_mask, length_normalize=self.length_normalize
         )  # [B]
+
+        old_logp = batch[self.old_logp_key]  # [B]
+        if self.length_normalize:
+            lengths = action_mask[:, 1:].to(old_logp.dtype).sum(dim=-1).clamp(min=1.0)
+            old_logp = old_logp / lengths
+
+        log_ratio = logp_action - old_logp
+        ratio = torch.exp(log_ratio)
+        mismatch_kl = ratio - log_ratio - 1.0
 
         baseline = adv_raw.mean()
         advantages = adv_raw - baseline
@@ -264,7 +309,8 @@ class ReinforceBaselineLoss:
             std = advantages.std(unbiased=False)
             advantages = advantages / (std + 1e-8)
 
-        loss = - (advantages * logp_action).mean()
+        # Stop-gradient on IS weight
+        loss = - (ratio.detach() * advantages * logp_action).mean()
 
         stats: Dict[str, Any] = {
             "loss": loss.detach(),
@@ -272,6 +318,9 @@ class ReinforceBaselineLoss:
             "adv_mean": advantages.mean().detach(),
             "adv_std": advantages.std(unbiased=False).detach(),
             "logp_mean": logp_action.mean().detach(),
+            "ratio_mean": ratio.mean().detach(),
+            "ratio_std": ratio.std(unbiased=False).detach(),
+            "kl_actor_policy": mismatch_kl.mean().detach(),
         }
         return loss, stats
 
