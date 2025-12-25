@@ -35,9 +35,12 @@ class Loss(Protocol):
     """
     Generic loss: given model outputs (logits) and a collated batch, return
     (scalar_loss, stats).
+
+    Stats values must be scalar tensors (on the same device as logits) to enable
+    batched D2H transfer during aggregation. Use `tensor.detach()` not `float(...)`.
     """
 
-    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Tensor]]:
         ...
 
 # We define this as a standalone helper so torch.compile can cache it cleanly.
@@ -154,10 +157,10 @@ class ReinforceLoss:
         loss = - (advantages * logp_action).mean()
 
         stats: Dict[str, Any] = {
-            "loss": float(loss.detach().cpu()),
-            "adv_mean": float(advantages.mean().detach().cpu()),
-            "adv_std": float(advantages.std(unbiased=False).detach().cpu()),
-            "logp_mean": float(logp_action.mean().detach().cpu()),
+            "loss": loss.detach(),
+            "adv_mean": advantages.mean().detach(),
+            "adv_std": advantages.std(unbiased=False).detach(),
+            "logp_mean": logp_action.mean().detach(),
         }
         return loss, stats
 
@@ -222,10 +225,10 @@ class MaskedCausalLMCrossEntropyLoss:
         # Stats for parity with ReinforceLoss
         per_sample_logp = -per_sample_nll
         stats: Dict[str, Any] = {
-            "loss": float(loss.detach().cpu()),
-            "logp_mean": float(per_sample_logp.mean().detach().cpu()),
-            "nll_mean": float(per_sample_nll.mean().detach().cpu()),
-            "avg_action_tokens": float(token_counts.mean().detach().cpu()),
+            "loss": loss.detach(),
+            "logp_mean": per_sample_logp.mean().detach(),
+            "nll_mean": per_sample_nll.mean().detach(),
+            "avg_action_tokens": token_counts.mean().detach(),
         }
         return loss, stats
 
@@ -264,11 +267,11 @@ class ReinforceBaselineLoss:
         loss = - (advantages * logp_action).mean()
 
         stats: Dict[str, Any] = {
-            "loss": float(loss.detach().cpu()),
-            "baseline": float(baseline.detach().cpu()),
-            "adv_mean": float(advantages.mean().detach().cpu()),
-            "adv_std": float(advantages.std(unbiased=False).detach().cpu()),
-            "logp_mean": float(logp_action.mean().detach().cpu()),
+            "loss": loss.detach(),
+            "baseline": baseline.detach(),
+            "adv_mean": advantages.mean().detach(),
+            "adv_std": advantages.std(unbiased=False).detach(),
+            "logp_mean": logp_action.mean().detach(),
         }
         return loss, stats
 
@@ -352,15 +355,15 @@ class ClippedSurrogateLoss:
             ratio_clip_frac = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
 
         stats = {
-            "loss": float(loss.detach().cpu()),
-            "ratio_mean": float(ratio.mean().detach().cpu()),
-            "ratio_std": float(ratio.std(unbiased=False).detach().cpu()),
-            "clip_frac": float(ppo_clip_frac.detach().cpu()),
-            "ratio_clip_frac": float(ratio_clip_frac.detach().cpu()),
-            "kl_actor_policy": float(mismatch_kl.mean().detach().cpu()),
-            "adv_mean": float(advantages.mean().detach().cpu()),
-            "adv_std": float(advantages.std(unbiased=False).detach().cpu()),
-            "logp_mean": float(logp_action.mean().detach().cpu()),
+            "loss": loss.detach(),
+            "ratio_mean": ratio.mean().detach(),
+            "ratio_std": ratio.std(unbiased=False).detach(),
+            "clip_frac": ppo_clip_frac.detach(),
+            "ratio_clip_frac": ratio_clip_frac.detach(),
+            "kl_actor_policy": mismatch_kl.mean().detach(),
+            "adv_mean": advantages.mean().detach(),
+            "adv_std": advantages.std(unbiased=False).detach(),
+            "logp_mean": logp_action.mean().detach(),
         }
         return loss, stats
 
@@ -574,16 +577,16 @@ class TokenClippedSurrogateLoss:
 
         logp_action = (token_logp * token_mask).sum(dim=-1)
         stats: Dict[str, Any] = {
-            "loss": float(loss.detach().cpu()),
-            "ratio_mean": float(ratio_mean.detach().cpu()),
-            "ratio_std": float(ratio_std.detach().cpu()),
-            "clip_frac": float(ppo_clip_frac.detach().cpu()),
-            "ratio_clip_frac": float(ratio_clip_frac.detach().cpu()),
-            "kl_actor_policy": float(mismatch_kl.detach().cpu()),
-            "adv_mean": float(advantages.mean().detach().cpu()),
-            "adv_std": float(advantages.std(unbiased=False).detach().cpu()),
-            "logp_mean": float(logp_action.mean().detach().cpu()),
-            "avg_action_tokens": float(token_counts.mean().detach().cpu()),
+            "loss": loss.detach(),
+            "ratio_mean": ratio_mean.detach(),
+            "ratio_std": ratio_std.detach(),
+            "clip_frac": ppo_clip_frac.detach(),
+            "ratio_clip_frac": ratio_clip_frac.detach(),
+            "kl_actor_policy": mismatch_kl.detach(),
+            "adv_mean": advantages.mean().detach(),
+            "adv_std": advantages.std(unbiased=False).detach(),
+            "logp_mean": logp_action.mean().detach(),
+            "avg_action_tokens": token_counts.mean().detach(),
         }
         return loss, stats
 
@@ -634,9 +637,9 @@ class KLLoss:
         loss = self.coeff * kl.mean()
 
         stats: Dict[str, Any] = {
-            "loss": float(loss.detach().cpu()),
-            "kl_mean": float(kl.mean().detach().cpu()),
-            "kl_std": float(kl.std(unbiased=False).detach().cpu()),
+            "loss": loss.detach(),
+            "kl_mean": kl.mean().detach(),
+            "kl_std": kl.std(unbiased=False).detach(),
         }
         return loss, stats
 
@@ -679,8 +682,8 @@ class EntropyBonus:
         loss = -self.coeff * mean_entropy
 
         stats: Dict[str, Any] = {
-            "loss": float(loss.detach().cpu()),
-            "entropy_mean": float(mean_entropy.detach().cpu()),
+            "loss": loss.detach(),
+            "entropy_mean": mean_entropy.detach(),
         }
         return loss, stats
 
@@ -742,12 +745,12 @@ class CompositeLoss:
                 total_loss = total_loss + scaled_loss
 
             # per-term stats
-            stats[f"{term.name}/loss"] = float(raw_loss.detach().cpu())
+            stats[f"{term.name}/loss"] = raw_loss.detach()
             stats[f"{term.name}/weight"] = term.weight
             for k, v in term_stats.items():
                 stats[f"{term.name}/{k}"] = v
 
         assert total_loss is not None
-        stats["loss"] = float(total_loss.detach().cpu())
+        stats["loss"] = total_loss.detach()
 
         return total_loss, stats
