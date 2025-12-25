@@ -237,9 +237,16 @@ async def run_training(args: argparse.Namespace) -> None:
         eps=1e-8,
     )
 
+    wandb_project = args.wandb_project
+    if not wandb_project:
+        env_project = os.environ.get("WANDB_PROJECT")
+        if env_project:
+            wandb_project = env_project
+        elif os.environ.get("WANDB_API_KEY"):
+            wandb_project = "Ludic"
     logger = ml_log.setup_logging(
         log_dir=args.log_path,
-        wandb_project=args.wandb_project,
+        wandb_project=wandb_project,
         wandb_name=args.wandb_name,
         config=vars(args),
     )
