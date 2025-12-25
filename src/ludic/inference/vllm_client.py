@@ -15,7 +15,7 @@ from vllm.distributed.utils import StatelessProcessGroup
 
 from ludic.types import ChatResponse
 from ludic.inference.client import ChatClient
-from ludic.inference.request import ChatCompletionRequest, ToolRequest
+from ludic.inference.request import ChatCompletionRequest, TokenCompletionRequest, ToolRequest
 from ludic.inference.extensions import BackendExtensions, VLLMExtensions
 
 log = logging.getLogger(__name__)
@@ -251,6 +251,142 @@ class VLLMChatClient(ChatClient):
         info: Dict[str, Any] = {
             "raw_response": resp.model_dump(exclude_none=True),
             "used_args": request_kwargs,
+        }
+
+        return chat_resp, info
+
+    # ---- ChatClient.complete_tokens ------------------------------------
+
+    async def complete_tokens(
+        self,
+        request: TokenCompletionRequest,
+    ) -> Tuple[ChatResponse, Dict[str, Any]]:
+        """
+        Complete from pre-tokenized prompt using the completions endpoint.
+
+        This bypasses vLLM's chat template application, giving full control
+        over tokenization for drift-free RL training.
+
+        Args:
+            request: TokenCompletionRequest with prompt_token_ids and prompt_text.
+
+        Returns:
+            (ChatResponse, info): Same structure as complete().
+        """
+        if request.prompt_text is None:
+            raise ValueError(
+                "TokenCompletionRequest.prompt_text is required for complete_tokens(). "
+                "Decode prompt_token_ids before calling."
+            )
+
+        # Build request for completions endpoint
+        request_kwargs: Dict[str, Any] = {
+            "model": request.model,
+            "prompt": request.prompt_text,
+        }
+        request_kwargs.update(request.sampling.to_openai_kwargs())
+
+        if request.seed is not None:
+            request_kwargs["seed"] = int(request.seed)
+
+        # vLLM extensions
+        extra_body: Dict[str, Any] = {}
+
+        if request.extensions is not None:
+            ext: BackendExtensions = request.extensions
+            if isinstance(ext, VLLMExtensions):
+                if ext.max_think is not None:
+                    if not isinstance(ext.max_think, int) or ext.max_think <= 0:
+                        raise ValueError("VLLMExtensions.max_think must be a positive integer")
+                if ext.repetition_penalty <= 0:
+                    raise ValueError("VLLMExtensions.repetition_penalty must be > 0")
+
+                extra_body["repetition_penalty"] = float(ext.repetition_penalty)
+
+                if ext.max_think is not None:
+                    vllm_xargs = extra_body.get("vllm_xargs", {})
+                    if not isinstance(vllm_xargs, dict):
+                        vllm_xargs = {}
+                    vllm_xargs["max_think"] = int(ext.max_think)
+                    extra_body["vllm_xargs"] = vllm_xargs
+                if ext.extra_body_overrides:
+                    extra_body.update(dict(ext.extra_body_overrides))
+            else:
+                raise TypeError(
+                    f"{self.__class__.__name__} received unsupported request.extensions kind="
+                    f"{getattr(ext, 'kind', None)!r} (type={type(ext).__name__}); expected VLLMExtensions."
+                )
+
+        # Token IDs
+        if request.return_.return_token_ids:
+            extra_body["return_token_ids"] = True
+
+        # Request chosen-token logprobs if asked
+        if request.return_.return_chosen_logprobs:
+            request_kwargs["logprobs"] = int(max(1, request.return_.top_logprobs_k))
+
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        # Call completions endpoint (not chat completions)
+        resp = await self._async_client.completions.create(**request_kwargs)
+
+        choice = resp.choices[0]
+        text = choice.text
+        finish_reason = choice.finish_reason
+
+        # Extract token IDs if present
+        returned_prompt_token_ids = getattr(resp, "prompt_token_ids", None)
+        completion_token_ids = getattr(choice, "token_ids", None)
+
+        # Verify token alignment if we got prompt_token_ids back
+        if returned_prompt_token_ids is not None:
+            if list(returned_prompt_token_ids) != list(request.prompt_token_ids):
+                log.warning(
+                    "Token mismatch: vLLM returned different prompt_token_ids than expected. "
+                    "Expected %d tokens, got %d. This may indicate tokenizer inconsistency.",
+                    len(request.prompt_token_ids),
+                    len(returned_prompt_token_ids),
+                )
+
+        # Use our known prompt tokens for the response (canonical source)
+        prompt_token_ids = request.prompt_token_ids
+
+        # Extract per-token logprobs
+        completion_logprobs = None
+        logprobs_obj = getattr(choice, "logprobs", None)
+        if logprobs_obj is not None:
+            token_logprobs = getattr(logprobs_obj, "token_logprobs", None)
+            if token_logprobs is None and isinstance(logprobs_obj, dict):
+                token_logprobs = (
+                    logprobs_obj.get("token_logprobs")
+                    or logprobs_obj.get("logprobs")
+                )
+            if token_logprobs is None and hasattr(logprobs_obj, "content"):
+                parts = []
+                for part in getattr(logprobs_obj, "content", []):
+                    lp = getattr(part, "logprob", None)
+                    if lp is None and isinstance(part, dict):
+                        lp = part.get("logprob")
+                    if lp is not None:
+                        parts.append(lp)
+                if parts:
+                    token_logprobs = parts
+            if token_logprobs is not None:
+                completion_logprobs = list(token_logprobs)
+
+        chat_resp = ChatResponse(
+            text=text,
+            finish_reason=finish_reason,
+            completion_token_ids=completion_token_ids,
+            prompt_token_ids=prompt_token_ids,
+            completion_logprobs=completion_logprobs,
+        )
+
+        info: Dict[str, Any] = {
+            "raw_response": resp.model_dump(exclude_none=True),
+            "used_args": request_kwargs,
+            "mode": "token_in",
         }
 
         return chat_resp, info

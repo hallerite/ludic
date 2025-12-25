@@ -97,11 +97,13 @@ class ToolAgent(Agent):
 
         for name, param in sig.parameters.items():
             p_type = "string"
-            if param.annotation == int:
+            # Handle both actual types and PEP 563 string annotations
+            ann = param.annotation
+            if ann in (int, "int"):
                 p_type = "integer"
-            elif param.annotation == float:
+            elif ann in (float, "float"):
                 p_type = "number"
-            elif param.annotation == bool:
+            elif ann in (bool, "bool"):
                 p_type = "boolean"
 
             params[name] = {"type": p_type}

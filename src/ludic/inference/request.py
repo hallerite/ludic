@@ -64,6 +64,26 @@ class ChatCompletionRequest:
 
 
 @dataclass(frozen=True)
+class TokenCompletionRequest:
+    """
+    Pre-tokenized completion request.
+
+    Used when the caller has already applied the chat template and wants
+    to send raw token IDs to the model. This bypasses vLLM's internal
+    template application, giving full control over tokenization for
+    drift-free RL training.
+    """
+
+    model: str
+    prompt_token_ids: List[int]
+    prompt_text: Optional[str] = None  # For debugging/logging
+    sampling: SamplingParams = field(default_factory=SamplingParams)
+    return_: ReturnSpec = field(default_factory=ReturnSpec)
+    seed: Optional[int] = None
+    extensions: Optional[BackendExtensions] = None
+
+
+@dataclass(frozen=True)
 class InferenceSpec:
     """
     Per-step inference configuration (minus the prompt/messages).

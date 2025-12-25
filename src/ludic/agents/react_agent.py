@@ -4,17 +4,17 @@ from typing import Callable, List, Tuple, Dict, Any, Optional
 from ludic.agents.tool_agent import ToolAgent
 from ludic.inference.request import InferenceSpec, ToolRequest
 from ludic.parsers import ParseResult
-from ludic.types import TokenTrace
+from ludic.types import ChatResponse, TokenTrace
 
 class ReActAgent(ToolAgent):
     """
-    An agent that implements the ReAct pattern: 
+    An agent that implements the ReAct pattern:
     [Think -> Tool Call] * n -> Act.
 
-    It supports an execution loop where the model can call auxiliary tools 
+    It supports an execution loop where the model can call auxiliary tools
     multiple times before emitting a final answer for the environment.
 
-    If the max_react_steps limit is reached, it forces a final generation 
+    If the max_react_steps limit is reached, it forces a final generation
     attempt without tools to produce a valid environment action.
     """
     def __init__(self, tools: List[Callable], max_react_steps: int = 5, **kwargs):
@@ -26,10 +26,30 @@ class ReActAgent(ToolAgent):
         """
         super().__init__(tools=tools, **kwargs)
         self.max_react_steps = max_react_steps
-        
+
         # Safety check: Context must explicitly flag support for tools
         if not self._ctx.supports_tools:
             raise TypeError("ReActAgent requires a context with supports_tools=True. ")
+
+    def _extract_content_and_tool_calls(
+        self,
+        resp: ChatResponse,
+        info: Dict[str, Any],
+    ) -> Tuple[Optional[str], Optional[List[Dict[str, Any]]]]:
+        """
+        Extract content and tool_calls from the response.
+
+        When using chat_template (token-in mode), parses tool calls from raw text.
+        Otherwise extracts from the OpenAI response structure.
+        """
+        if self._chat_template is not None:
+            # Token-in mode: parse tool calls from raw completion text
+            content = resp.text
+            tool_calls = self._chat_template.parse_tool_calls(content)
+            return content, tool_calls
+        else:
+            # Legacy mode: extract from OpenAI response
+            return self._extract_openai_message(info)
 
     async def act(
         self, 
@@ -78,8 +98,8 @@ class ReActAgent(ToolAgent):
             )
             last_trace = token_trace
 
-            # Extract content/tool_calls from OpenAI raw_response
-            content, tool_calls = self._extract_openai_message(info)
+            # Extract content/tool_calls (handles both token-in and standard modes)
+            content, tool_calls = self._extract_content_and_tool_calls(resp, info)
 
             # 4. Handle Final Panic Move
             if is_final_try:

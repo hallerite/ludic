@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import torch
 
-from typing import Any, Optional, Tuple, Mapping, Dict
+from typing import Any, Optional, Tuple, Mapping, Dict, List
 from ludic.envs.single_agent_env import SingleAgentEnv
-from ludic.types import StepOutcome, Observation, Info
+from ludic.types import StepOutcome, Observation, Info, Message
 from ludic.inference.client import ChatResponse, ChatClient
-from ludic.inference.request import ChatCompletionRequest
+from ludic.inference.request import ChatCompletionRequest, TokenCompletionRequest
+from ludic.inference.chat_template import ChatTemplate, TemplateResult
+from ludic.inference.tool_parser import ToolParser
 from ludic.agents.base_agent import Agent
 from ludic.context.base import ContextStrategy
 from ludic.context.full_dialog import FullDialog
@@ -17,6 +19,51 @@ def _mock_parser(raw: str) -> ParseResult:
     """A simple parser that just passes the text through."""
     return ParseResult(action=raw, reward=0.0, obs=None)
 
+
+# ---- Mock ChatTemplate for token-in API testing ----
+
+class MockChatTemplate(ChatTemplate):
+    """
+    A mock ChatTemplate that returns predictable token IDs.
+    Used for testing the token-in API without requiring a real tokenizer.
+    """
+
+    def __init__(self, tool_parser: Optional[ToolParser] = None) -> None:
+        self._tool_parser = tool_parser
+        self._call_count = 0
+
+    def apply(
+        self,
+        messages: List[Message],
+        *,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        add_generation_prompt: bool = True,
+    ) -> TemplateResult:
+        self._call_count += 1
+        # Generate mock token IDs based on message content
+        text_parts = []
+        for msg in messages:
+            text_parts.append(f"[{msg.get('role', 'unknown')}]")
+            if msg.get("content"):
+                text_parts.append(str(msg["content"]))
+        prompt_text = " ".join(text_parts)
+
+        # Simple mock: each character becomes a token ID
+        prompt_token_ids = [ord(c) % 1000 for c in prompt_text[:50]]
+
+        return TemplateResult(
+            prompt_token_ids=prompt_token_ids,
+            prompt_text=prompt_text,
+        )
+
+    def parse_tool_calls(
+        self,
+        completion_text: str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        if self._tool_parser:
+            return self._tool_parser.parse(completion_text)
+        return None
+
 # ---- Common test tools --------------------------------------------------
 
 def calculator_tool(a: int, b: int) -> int:
@@ -26,6 +73,8 @@ def calculator_tool(a: int, b: int) -> int:
 # ---- Mock client ---------------------------------------------------------
 
 class MockClient(ChatClient):
+    """Mock client supporting both complete() and complete_tokens() for token-in API."""
+
     def __init__(
         self,
         text: str = "1",
@@ -40,6 +89,19 @@ class MockClient(ChatClient):
     ) -> tuple[ChatResponse, Dict[str, Any]]:
         resp = ChatResponse(text=self._text, finish_reason=self._finish_reason)
         return resp, {"used_request": request.to_dict()}
+
+    async def complete_tokens(
+        self,
+        request: TokenCompletionRequest,
+    ) -> tuple[ChatResponse, Dict[str, Any]]:
+        """Token-in API: complete from pre-tokenized prompt."""
+        resp = ChatResponse(
+            text=self._text,
+            finish_reason=self._finish_reason,
+            prompt_token_ids=request.prompt_token_ids,
+            completion_token_ids=[100, 101, 102],  # Mock completion tokens
+        )
+        return resp, {"mode": "token_in", "prompt_text": request.prompt_text}
 
     def sync_weights(self, params: Mapping[str, torch.Tensor], **kwargs) -> str:  # type: ignore[name-defined]
         return "mock-version"
@@ -70,6 +132,7 @@ class SeedableMockClient(ChatClient):
     """
     A mock client that returns a deterministic response based on the
     sampling_seed provided. Also returns mock token IDs.
+    Supports both complete() and complete_tokens() for token-in API.
     """
     def __init__(self, seed_map: Dict[int, str]) -> None:
         self._seed_map = seed_map
@@ -78,12 +141,12 @@ class SeedableMockClient(ChatClient):
         self,
         request: ChatCompletionRequest,
     ) -> tuple[ChatResponse, Dict[str, Any]]:
-        
+
         # Get the deterministic text output based on the sampling seed
         if request.seed is None:
             raise ValueError("SeedableMockClient requires request.seed to be set")
         text_out = self._seed_map.get(int(request.seed), "DEFAULT_FALLBACK")
-        
+
         resp = ChatResponse(
             text=text_out,
             # Add mock token IDs so retokenize=False path passes
@@ -92,6 +155,22 @@ class SeedableMockClient(ChatClient):
         )
         # Return the serializable dict, not the object
         return resp, {"used_request": request.to_dict()}
+
+    async def complete_tokens(
+        self,
+        request: TokenCompletionRequest,
+    ) -> tuple[ChatResponse, Dict[str, Any]]:
+        """Token-in API version."""
+        if request.seed is None:
+            raise ValueError("SeedableMockClient requires request.seed to be set")
+        text_out = self._seed_map.get(int(request.seed), "DEFAULT_FALLBACK")
+
+        resp = ChatResponse(
+            text=text_out,
+            prompt_token_ids=request.prompt_token_ids,
+            completion_token_ids=[10, 11],
+        )
+        return resp, {"mode": "token_in"}
 
     def sync_weights(self, params: Mapping[str, torch.Tensor], **kwargs) -> str:
         # Not needed for this test
