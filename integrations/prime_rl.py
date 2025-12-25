@@ -1,14 +1,12 @@
 import asyncio
 import shutil
-import torch
 from pathlib import Path
 from typing import List, Optional
 from pydantic import Field
 
 # --- Prime-RL Imports ---
 from prime_rl.orchestrator.config import OrchestratorConfig as PrimeOrchestratorConfig
-from prime_rl.orchestrator.batch import prepare_batch
-from prime_rl.orchestrator.types import TrainingExample
+from prime_rl.transport import TrainingBatch, TrainingSample, setup_training_batch_sender
 from prime_rl.utils.client import (
     setup_clients,
     setup_admin_clients,
@@ -71,44 +69,38 @@ class LudicConfig(PrimeOrchestratorConfig):
 # 2. Data Sink (The Converter)
 # ---------------------------------------------------------------------------
 
-class PrimeRLDataSink:
+class PrimeRLBatchSender:
     """
-    Converts Ludic SAWBatches (in-memory) to Prime-RL MicroBatches (on-disk).
+    Converts Ludic SAWBatches (in-memory) to Prime-RL TrainingBatch (transport).
     """
 
     def __init__(
         self,
         output_dir: Path,
-        num_train_workers: int,
-        seq_len: int,
         temperature: float,
+        rollout_transport,
     ):
-        self.rollout_dir = get_rollout_dir(output_dir)
-        self.num_train_workers = num_train_workers
-        self.seq_len = seq_len
         self.temperature = temperature
+        self.sender = setup_training_batch_sender(output_dir, rollout_transport)
 
-    def save_step(self, saw_batch: SAWBatch, step: int):
+    def send_step(self, saw_batch: SAWBatch, step: int):
         """
-        Converts Ludic data -> Prime TrainingExamples -> Prime MicroBatches -> Disk.
+        Converts Ludic data -> Prime TrainingSamples -> TrainingBatch -> transport.
         """
-        train_examples: List[TrainingExample] = []
+        train_examples: List[TrainingSample] = []
 
         for item in saw_batch.items:
-            # Split input_ids based on action_mask (0=prompt, 1=completion)
-            input_tensor = torch.tensor(item.input_ids)
-            mask_tensor = torch.tensor(item.action_mask)
+            # Split input_ids based on action_mask (0=prompt, 1=completion).
+            prompt_ids: List[int] = []
+            completion_ids: List[int] = []
+            for token_id, mask in zip(item.input_ids, item.action_mask):
+                if mask:
+                    completion_ids.append(token_id)
+                else:
+                    prompt_ids.append(token_id)
 
-            # Identify indices
-            prompt_indices = (mask_tensor == 0).nonzero(as_tuple=True)[0]
-            completion_indices = (mask_tensor == 1).nonzero(as_tuple=True)[0]
-
-            if len(completion_indices) == 0:
-                # Skip prompts with no completion (shouldn't happen in SAW)
+            if not completion_ids:
                 continue
-
-            prompt_ids = input_tensor[prompt_indices].tolist()
-            completion_ids = input_tensor[completion_indices].tolist()
 
             # Extract logprobs from attachments (preferred) with meta fallback.
             completion_logprobs = []
@@ -126,37 +118,27 @@ class PrimeRLDataSink:
                     len(completion_ids) - len(completion_logprobs)
                 )
 
-            ex: TrainingExample = {
-                "prompt_ids": prompt_ids,
-                "prompt_mask": [0] * len(prompt_ids),
-                "completion_ids": completion_ids,
-                "completion_mask": [1] * len(completion_ids),
-                "completion_logprobs": completion_logprobs[: len(completion_ids)],
-                # In Ludic, SAWItem.weight is already the scalar advantage
-                "advantage": item.weight,
-            }
-            train_examples.append(ex)
+            train_examples.append(
+                TrainingSample(
+                    prompt_ids=prompt_ids,
+                    prompt_mask=[False] * len(prompt_ids),
+                    completion_ids=completion_ids,
+                    completion_mask=[True] * len(completion_ids),
+                    completion_logprobs=completion_logprobs[: len(completion_ids)],
+                    # In Ludic, SAWItem.weight is already the scalar advantage
+                    advantage=float(item.weight),
+                )
+            )
 
-        # Use Prime-RL's native batch packing (First Fit Decreasing)
-        batches_per_gpu = prepare_batch(
-            train_examples,
+        training_batch = TrainingBatch(
+            examples=train_examples,
             temperature=self.temperature,
-            seq_len=self.seq_len,
-            num_train_workers=self.num_train_workers,
+            step=step,
         )
+        self.sender.send(training_batch)
 
-        # Save to disk where Trainer looks for it
-        step_path = self.rollout_dir / f"step_{step}"
-        step_path.mkdir(parents=True, exist_ok=True)
-
-        for i, micro_batches in enumerate(batches_per_gpu):
-            # Prime-RL trainer expects rank_{i}.pt
-            batch_path = step_path / f"rank_{i}.pt"
-            tmp_path = batch_path.with_suffix(".tmp")
-
-            # Atomic write to avoid partially-written files being read
-            torch.save(micro_batches, tmp_path)
-            tmp_path.rename(batch_path)
+    def close(self) -> None:
+        self.sender.close()
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +151,7 @@ class PrimeOrchestrator:
 
     - pulls SAWBatches from a user-provided BatchSource
     - handles Prime-RL async weight sync
-    - converts & writes MicroBatches for the Prime-RL trainer
+    - converts & sends TrainingBatch for the Prime-RL packer/trainer
     """
 
     def __init__(self, config: LudicConfig, batch_source: BatchSource):
@@ -185,12 +167,11 @@ class PrimeOrchestrator:
         self.clients = setup_clients(config.client)
         self.admin_clients = setup_admin_clients(config.client)
 
-        # 2. Setup Data Sink (Prime format)
-        self.sink = PrimeRLDataSink(
+        # 2. Setup TrainingBatch sender (Prime transport)
+        self.sink = PrimeRLBatchSender(
             output_dir=config.output_dir,
-            num_train_workers=config.num_train_workers,
-            seq_len=config.seq_len,
             temperature=config.sampling.temperature,
+            rollout_transport=config.rollout_transport,
         )
 
         # 3. State
@@ -215,11 +196,12 @@ class PrimeOrchestrator:
         self.logger.info("Resetting to base model...")
         await reload_weights(self.admin_clients)
 
-        # Clean rollout directories at the beginning
-        if self.step == 0:
-            shutil.rmtree(
-                get_rollout_dir(self.config.output_dir), ignore_errors=True
-            )
+        # Clean rollout directories at the beginning (filesystem transport only)
+        if (
+            self.step == 0
+            and getattr(self.config.rollout_transport, "type", "filesystem") == "filesystem"
+        ):
+            shutil.rmtree(get_rollout_dir(self.config.output_dir), ignore_errors=True)
 
     async def sync_policy(self):
         """
@@ -291,12 +273,15 @@ class PrimeOrchestrator:
             f"Avg Reward: {saw_batch.meta.get('avg_total_reward', 0.0):.2f}"
         )
 
-        # 3. Save for Trainer
-        self.sink.save_step(saw_batch, self.step)
+        # 3. Send TrainingBatch for Trainer packer
+        self.sink.send_step(saw_batch, self.step)
 
         self.step += 1
 
     async def loop(self):
         await self.setup()
-        while self.step < (self.config.max_steps or float("inf")):
-            await self.run_step()
+        try:
+            while self.step < (self.config.max_steps or float("inf")):
+                await self.run_step()
+        finally:
+            self.sink.close()

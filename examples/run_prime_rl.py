@@ -106,10 +106,13 @@ async def main():
     )
 
     # 3.4 Define GRPO base requests: one per "group" / prompt
+    max_tokens = config.sampling.max_tokens
+    if max_tokens is None:
+        max_tokens = SamplingParams().max_tokens
     train_inference = InferenceSpec(
         sampling=SamplingParams(
             temperature=config.sampling.temperature,
-            max_tokens=config.sampling.max_tokens,
+            max_tokens=max_tokens,
         ),
         # Prime expects per-token logprobs for the sampled completion tokens.
         return_=ReturnSpec.for_rl(),
@@ -170,7 +173,7 @@ async def main():
     # PrimeOrchestrator:
     #   - pulls SAWBatches from batch_source
     #   - syncs weights with Prime trainer via broadcast dir
-    #   - converts to Prime MicroBatches and writes rank_i.pt files
+    #   - converts to Prime TrainingBatch and sends via rollout_transport
     orchestrator = PrimeOrchestrator(config=config, batch_source=batch_source)
     await orchestrator.loop()
 
