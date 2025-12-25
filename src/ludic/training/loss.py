@@ -473,15 +473,15 @@ class CISPOLoss:
 
         logp_action = (token_logp * token_mask).sum(dim=-1)
         stats: Dict[str, Any] = {
-            "loss": float(loss.detach().cpu()),
-            "ratio_mean": float(ratio_mean.detach().cpu()),
-            "ratio_std": float(ratio_std.detach().cpu()),
-            "clip_frac": float(clip_frac.detach().cpu()),
-            "kl_actor_policy": float(mismatch_kl.detach().cpu()),
-            "adv_mean": float(advantages.mean().detach().cpu()),
-            "adv_std": float(advantages.std(unbiased=False).detach().cpu()),
-            "logp_mean": float(logp_action.mean().detach().cpu()),
-            "avg_action_tokens": float(token_counts.mean().detach().cpu()),
+            "loss": loss.detach(),
+            "ratio_mean": ratio_mean.detach(),
+            "ratio_std": ratio_std.detach(),
+            "clip_frac": clip_frac.detach(),
+            "kl_actor_policy": mismatch_kl.detach(),
+            "adv_mean": advantages.mean().detach(),
+            "adv_std": advantages.std(unbiased=False).detach(),
+            "logp_mean": logp_action.mean().detach(),
+            "avg_action_tokens": token_counts.mean().detach(),
         }
         return loss, stats
 
