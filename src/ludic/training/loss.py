@@ -366,6 +366,124 @@ class ClippedSurrogateLoss:
 
 
 @dataclass
+class CISPOLoss:
+    """
+    CISPO (Clipped IS-weight Policy Optimization) loss.
+
+    Unlike PPO/GRPO which clip the policy update via the min operation,
+    CISPO clips the importance sampling weight itself and uses it as a
+    stop-gradient multiplier on the REINFORCE objective. This preserves
+    gradient contributions from all tokens, especially low-probability
+    tokens crucial for reflective reasoning (e.g., "However", "Recheck").
+
+    Loss:
+        L = - E[ sg(clip(r_t, 1-ε_low, 1+ε_high)) * A * log π(a_t|s_t) ]
+
+    Where:
+        - r_t = π_new(a_t|s_t) / π_old(a_t|s_t) is the importance sampling weight
+        - sg(·) is stop-gradient (weight does not receive gradients)
+        - A is the advantage (from batch["weight"])
+
+    Expects:
+        - batch["weight"]:       A (advantages)       [B]
+        - batch["actor_logps"]:  token logps under behavior policy [B, T]
+        - input_ids / attention_mask / action_mask for π_new.
+
+    Reference: MiniMax-M1 paper (arXiv:2506.13585)
+    """
+
+    clip_eps_low: float = 1e6  # Effectively no lower bound (paper setting)
+    clip_eps_high: float = 0.2
+    length_normalize: bool = True
+
+    def __post_init__(self) -> None:
+        if self.clip_eps_high < 0:
+            raise ValueError(f"clip_eps_high must be non-negative, got {self.clip_eps_high}")
+
+    @jaxtyped(typechecker=typechecker)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]
+        action_mask = batch["action_mask"]
+        advantages = batch["weight"]  # [B]
+
+        if "actor_logps" not in batch:
+            raise KeyError("CISPOLoss requires batch['actor_logps'] for importance sampling.")
+
+        actor_logps = batch["actor_logps"]  # [B, T]
+        if actor_logps.shape != input_ids.shape:
+            raise ValueError(
+                f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
+                f"{tuple(input_ids.shape)}."
+            )
+
+        # Compute token log probs under current policy
+        token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
+        token_mask = action_mask[:, 1:].to(token_logp.dtype)  # [B, T-1]
+        token_counts = token_mask.sum(dim=-1).clamp(min=1.0)  # [B]
+        actor_logps_shifted = actor_logps[:, 1:]  # [B, T-1]
+
+        # Compute importance sampling ratios
+        log_ratio = token_logp - actor_logps_shifted
+        ratio = torch.exp(log_ratio)
+
+        # CISPO: Clip the IS weight, not the update
+        clipped_ratio = torch.clamp(
+            ratio,
+            1.0 - self.clip_eps_low,
+            1.0 + self.clip_eps_high,
+        )
+
+        # Stop-gradient on the clipped IS weight
+        # The gradient only flows through log π, not through the IS weight
+        is_weight = clipped_ratio.detach()
+
+        # REINFORCE loss with IS weight correction
+        # L = - E[is_weight * A * log π]
+        adv = advantages.unsqueeze(-1)  # [B, 1]
+        weighted_logp = is_weight * adv * token_logp * token_mask  # [B, T-1]
+
+        per_sample_obj = weighted_logp.sum(dim=-1)  # [B]
+        if self.length_normalize:
+            per_sample_obj = per_sample_obj / token_counts
+
+        loss = -per_sample_obj.mean()
+
+        # Stats
+        mask = token_mask > 0
+        if mask.any():
+            ratio_vals = ratio.masked_select(mask)
+            ratio_mean = ratio_vals.mean()
+            ratio_std = ratio_vals.std(unbiased=False)
+            # Fraction of tokens where IS weight was clipped
+            clip_frac = (
+                (ratio_vals > 1.0 + self.clip_eps_high) |
+                (ratio_vals < 1.0 - self.clip_eps_low)
+            ).float().mean()
+            # KL approximation: r - log(r) - 1
+            token_kl = ratio_vals - log_ratio.masked_select(mask) - 1.0
+            mismatch_kl = token_kl.mean()
+        else:
+            ratio_mean = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            ratio_std = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            clip_frac = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            mismatch_kl = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+
+        logp_action = (token_logp * token_mask).sum(dim=-1)
+        stats: Dict[str, Any] = {
+            "loss": float(loss.detach().cpu()),
+            "ratio_mean": float(ratio_mean.detach().cpu()),
+            "ratio_std": float(ratio_std.detach().cpu()),
+            "clip_frac": float(clip_frac.detach().cpu()),
+            "kl_actor_policy": float(mismatch_kl.detach().cpu()),
+            "adv_mean": float(advantages.mean().detach().cpu()),
+            "adv_std": float(advantages.std(unbiased=False).detach().cpu()),
+            "logp_mean": float(logp_action.mean().detach().cpu()),
+            "avg_action_tokens": float(token_counts.mean().detach().cpu()),
+        }
+        return loss, stats
+
+
+@dataclass
 class TokenClippedSurrogateLoss:
     """
     Token-level PPO-style clipped surrogate loss (Token-TIS-style ratios).
