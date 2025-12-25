@@ -391,15 +391,17 @@ class Trainer:
         forward_activation_peak = max(0, forward_peak - (pre_forward_alloc or 0))
         alloc_after_forward = torch.cuda.memory_allocated(device)
 
+        gpu_forward_peak_mb = forward_peak / mb
+        gpu_forward_activation_peak_mb = forward_activation_peak / mb
         stats = {
-            "gpu_forward_peak_mb": forward_peak / mb,
-            "gpu_forward_activation_peak_mb": forward_activation_peak / mb,
+            "gpu_forward_peak_mb": torch.tensor(gpu_forward_peak_mb, device=device),
+            "gpu_forward_activation_peak_mb": torch.tensor(gpu_forward_activation_peak_mb, device=device),
         }
 
         logger.info(
             "GPU forward memory (MB) peak/activation_peak: %.1f / %.1f",
-            stats["gpu_forward_peak_mb"],
-            stats["gpu_forward_activation_peak_mb"],
+            gpu_forward_peak_mb,
+            gpu_forward_activation_peak_mb,
         )
 
         # Reset for backward measurement
@@ -429,19 +431,23 @@ class Trainer:
         peak = torch.cuda.max_memory_allocated(device)
         backward_activation_peak = max(0, peak - (baseline_alloc or 0))
 
+        gpu_mem_alloc_mb = alloc / mb
+        gpu_mem_reserved_mb = reserved / mb
+        gpu_backward_peak_mb = peak / mb
+        gpu_backward_activation_peak_mb = backward_activation_peak / mb
         stats = {
-            "gpu_mem_alloc_mb": alloc / mb,
-            "gpu_mem_reserved_mb": reserved / mb,
-            "gpu_backward_peak_mb": peak / mb,
-            "gpu_backward_activation_peak_mb": backward_activation_peak / mb,
+            "gpu_mem_alloc_mb": torch.tensor(gpu_mem_alloc_mb, device=device),
+            "gpu_mem_reserved_mb": torch.tensor(gpu_mem_reserved_mb, device=device),
+            "gpu_backward_peak_mb": torch.tensor(gpu_backward_peak_mb, device=device),
+            "gpu_backward_activation_peak_mb": torch.tensor(gpu_backward_activation_peak_mb, device=device),
         }
 
         logger.info(
             "GPU backward memory (MB) alloc/reserved/peak/activation_peak: %.1f / %.1f / %.1f / %.1f",
-            stats["gpu_mem_alloc_mb"],
-            stats["gpu_mem_reserved_mb"],
-            stats["gpu_backward_peak_mb"],
-            stats["gpu_backward_activation_peak_mb"],
+            gpu_mem_alloc_mb,
+            gpu_mem_reserved_mb,
+            gpu_backward_peak_mb,
+            gpu_backward_activation_peak_mb,
         )
 
         return stats, peak
@@ -605,8 +611,8 @@ class Trainer:
                 )
                 activation_total_peak = max(0, total_peak - (pre_forward_alloc or 0))
 
-                stats["gpu_mem_peak_mb"] = total_peak / mb
-                stats["gpu_activation_peak_mb"] = activation_total_peak / mb
+                stats["gpu_mem_peak_mb"] = torch.tensor(total_peak / mb, device=device)
+                stats["gpu_activation_peak_mb"] = torch.tensor(activation_total_peak / mb, device=device)
 
             stats.update(forward_mem_stats)
             stats.update(backward_mem_stats)
