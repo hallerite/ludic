@@ -6,7 +6,7 @@ import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ludic.agents.base_agent import Agent
-from ludic.inference.request import InferenceSpec, ReturnSpec, ToolRequest
+from ludic.inference.request import InferenceSpec, ToolRequest
 
 logger = logging.getLogger(__name__)
 
@@ -39,23 +39,8 @@ class ToolAgent(Agent):
         return ToolRequest(tools=list(self.tool_schemas))
 
     def _with_tools(self, inference: Optional[InferenceSpec]) -> InferenceSpec:
-        """
-        Return an InferenceSpec suitable for tool calling.
-
-        Enforces `return_token_ids=True` so training can stay drift-free.
-        """
-        inf = inference or InferenceSpec()
-        if inf.return_.return_token_ids:
-            return inf
-        return InferenceSpec(
-            sampling=inf.sampling,
-            return_=ReturnSpec(
-                return_token_ids=True,
-                return_chosen_logprobs=inf.return_.return_chosen_logprobs,
-                top_logprobs_k=inf.return_.top_logprobs_k,
-            ),
-            extensions=inf.extensions,
-        )
+        """Return an InferenceSpec suitable for tool calling."""
+        return inference or InferenceSpec()
 
     def _run_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> None:
         """Execute tool calls and record results in context."""

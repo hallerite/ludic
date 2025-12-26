@@ -28,8 +28,12 @@ class _DummyCompletions:
         class _DummyChoice:
             text: str = "ok"
             finish_reason: str = "stop"
-            token_ids: object | None = None
+            token_ids: list = None  # type: ignore[assignment]
             logprobs: object | None = None
+
+            def __post_init__(self):
+                if self.token_ids is None:
+                    self.token_ids = [100, 101]  # Default mock completion tokens
 
         class _DummyResp:
             choices = [_DummyChoice()]

@@ -46,9 +46,10 @@ async def test_tool_agent_helpers_and_execution():
         chat_template=chat_template,
     )
 
-    # _with_tools enforces return_token_ids for drift-free training.
+    # _with_tools returns a default InferenceSpec if None is passed.
+    # (return_token_ids is now enforced at the client level, not here.)
     inf = agent._with_tools(None)
-    assert inf.return_.return_token_ids is True
+    assert inf is not None
 
     # _tool_request advertises schemas.
     tool_req = agent._tool_request()
@@ -124,6 +125,7 @@ async def test_tool_agent_uses_token_in_when_template_provided():
             return ChatResponse(
                 text="ok",
                 prompt_token_ids=request.prompt_token_ids,
+                completion_token_ids=[1, 2],
             ), {"mode": "token_in"}
 
         def sync_weights(self, *args, **kwargs):

@@ -46,7 +46,11 @@ async def test_happy_path_terminates_immediately():
 async def test_truncation_when_agent_is_wrong():
     class WrongClient(MockClient):
         async def complete_tokens(self, request, **kwargs):
-            return ChatResponse(text="nope"), {"mode": "token_in"}
+            return ChatResponse(
+                text="nope",
+                prompt_token_ids=request.prompt_token_ids,
+                completion_token_ids=[1, 2, 3],
+            ), {"mode": "token_in"}
 
     env = MockEnv(max_steps=2, target="1")
     agent = MockAgent(client=WrongClient())

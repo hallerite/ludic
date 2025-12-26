@@ -177,9 +177,8 @@ class VLLMChatClient(ChatClient):
                     f"{getattr(ext, 'kind', None)!r} (type={type(ext).__name__}); expected VLLMExtensions."
                 )
 
-        # Token IDs
-        if request.return_.return_token_ids:
-            extra_body["return_token_ids"] = True
+        # Token IDs - always request for token-in/token-out consistency
+        extra_body["return_token_ids"] = True
 
         # Request chosen-token logprobs if asked
         if request.return_.return_chosen_logprobs:
@@ -195,9 +194,15 @@ class VLLMChatClient(ChatClient):
         text = choice.text
         finish_reason = choice.finish_reason
 
-        # Extract token IDs if present
+        # Extract token IDs (required for token-in/token-out)
         returned_prompt_token_ids = getattr(resp, "prompt_token_ids", None)
         completion_token_ids = getattr(choice, "token_ids", None)
+
+        if completion_token_ids is None:
+            raise ValueError(
+                "vLLM did not return completion token IDs. "
+                "Token-in API requires token-out. Check vLLM version and configuration."
+            )
 
         # Verify token alignment if we got prompt_token_ids back
         if returned_prompt_token_ids is not None:

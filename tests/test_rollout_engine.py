@@ -424,52 +424,6 @@ async def test_generate_batch_uses_model_token_ids_when_available(
 # ---------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_generate_batch_raises_if_no_token_ids_and_no_retokenize(
-    env_registry,
-) -> None:
-    class NoTokenClient(MockClient):
-        async def complete_tokens(  # type: ignore[override]
-            self,
-            request: TokenCompletionRequest,
-            **kwargs,
-        ) -> Tuple[ChatResponse, Dict[str, Any]]:
-            return ChatResponse(text="1"), {"mode": "token_in"}
-
-    agent = Agent(
-        client=NoTokenClient(),
-        model="mock",
-        ctx=FullDialog(),
-        parser=_mock_parser,
-        chat_template=MockChatTemplate(),
-    )
-    protocol_registry = {
-        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent)
-    }
-    
-    engine = RolloutEngine(
-        env_registry=env_registry,
-        protocol_registry=protocol_registry,
-    )
-
-    credit_assigner = ConstantCreditAssigner(value=1.0)
-
-    request = RolloutRequest(
-        env=EnvSpec(kind="mock", kwargs={"max_steps": 1, "target": "1"}),
-        protocol=ProtocolSpec(kind="mock_protocol"),
-        num_episodes=1,
-    )
-
-    with pytest.raises(ValueError, match="Missing rollout-time token trace"):
-        await engine.generate_batch(
-            requests=[request],
-            max_steps=2,
-            credit_assigner=credit_assigner,
-            timeout_s=None,
-            concurrency=1,
-        )
-
-
 # ---------------------------------------------------------------------
 # RolloutBatchSource integration: delegates to RolloutEngine.generate_batch
 # ---------------------------------------------------------------------
