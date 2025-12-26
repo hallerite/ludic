@@ -73,9 +73,9 @@ If you care about truncation semantics (env time limits vs protocol cutoffs vs m
 
 ## Token-in Inference (Drift-Free)
 
-Ludic now applies chat templates locally and sends pre-tokenized prompts to the
+Ludic applies chat templates locally and sends pre-tokenized prompts to the
 vLLM `/v1/completions` endpoint. This keeps training aligned to the exact tokens
-sampled by the model.
+sampled by the model, eliminating drift between training and inference.
 
 Key points:
 - Agents require a `ChatTemplate` (see `ludic.inference.HFChatTemplate`).
@@ -84,6 +84,31 @@ Key points:
   from raw completions.
 - If you need explicit stop token IDs, set them via
   `VLLMExtensions.extra_body_overrides` (e.g., `{"stop_token_ids": [...]}`).
+
+### Migration from chat completions API
+
+The library previously used vLLM's `/v1/chat/completions` endpoint. The new
+token-in API has breaking changes:
+
+| Old API | New API |
+|---------|---------|
+| `ChatClient.complete(ChatCompletionRequest)` | `ChatClient.complete_tokens(TokenCompletionRequest)` |
+| `ChatCompletionRequest(messages=...)` | `TokenCompletionRequest(prompt_token_ids=...)` |
+| `Agent(client, model, ctx, parser)` | `Agent(client, model, ctx, parser, chat_template)` |
+| `ToolRequest(tools, tool_choice="auto")` | `ToolRequest(tools)` - tool_choice removed |
+
+The `chat_template` parameter is now **required** on all agents. Create one with:
+
+```python
+from transformers import AutoTokenizer
+from ludic.inference import HFChatTemplate, HermesToolParser
+
+tokenizer = AutoTokenizer.from_pretrained("your-model")
+chat_template = HFChatTemplate(tokenizer)
+
+# For tool-calling agents:
+chat_template = HFChatTemplate(tokenizer, tool_parser=HermesToolParser())
+```
 
 ## Requirements
 

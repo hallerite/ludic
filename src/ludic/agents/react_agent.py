@@ -7,6 +7,13 @@ from ludic.inference.tool_parser import ToolParseResult
 from ludic.parsers import ParseResult
 from ludic.types import ChatResponse, TokenTrace
 
+_DEFAULT_TOOL_PARSE_ERROR_OBS = "Invalid tool call format."
+_DEFAULT_FINAL_ANSWER_PROMPT = (
+    "You have exhausted your reasoning steps. "
+    "You must output your final move now."
+)
+
+
 class ReActAgent(ToolAgent):
     """
     An agent that implements the ReAct pattern:
@@ -18,17 +25,31 @@ class ReActAgent(ToolAgent):
     If the max_react_steps limit is reached, it forces a final generation
     attempt without tools to produce a valid environment action.
     """
-    _TOOL_PARSE_ERROR_REWARD = -1.0
-    _TOOL_PARSE_ERROR_OBS = "Invalid tool call format."
-    def __init__(self, tools: List[Callable], max_react_steps: int = 5, **kwargs):
+
+    def __init__(
+        self,
+        tools: List[Callable],
+        max_react_steps: int = 5,
+        tool_parse_error_penalty: float = -1.0,
+        tool_parse_error_feedback: str = _DEFAULT_TOOL_PARSE_ERROR_OBS,
+        final_answer_prompt: str = _DEFAULT_FINAL_ANSWER_PROMPT,
+        **kwargs,
+    ):
         """
         Args:
             tools: List of python functions the agent can call.
             max_react_steps: Maximum number of internal think/tool loops.
+            tool_parse_error_penalty: Reward penalty when tool call parsing fails.
+            tool_parse_error_feedback: Feedback shown when tool call parsing fails.
+            final_answer_prompt: Message injected when forcing a final answer
+                after exhausting react steps.
             **kwargs: Passed to base Agent.
         """
         super().__init__(tools=tools, **kwargs)
         self.max_react_steps = max_react_steps
+        self._tool_parse_error_penalty = tool_parse_error_penalty
+        self._tool_parse_error_feedback = tool_parse_error_feedback
+        self._final_answer_prompt = final_answer_prompt
 
         # Safety check: Context must explicitly flag support for tools
         if not self._ctx.supports_tools:
@@ -75,11 +96,8 @@ class ReActAgent(ToolAgent):
                 # We inject a temporary "system" instruction into the prompt
                 # (Note: We don't save this to self._ctx, just for this one call)
                 messages = messages + [{
-                    "role": "user", 
-                    "content": (
-                        "You have exhausted your reasoning steps. "
-                        "You must output your final move now."
-                    )
+                    "role": "user",
+                    "content": self._final_answer_prompt,
                 }]
                 tools_req_this: ToolRequest | None = None
             else:
@@ -104,8 +122,8 @@ class ReActAgent(ToolAgent):
                 return (
                     ParseResult(
                         action=None,
-                        reward=self._TOOL_PARSE_ERROR_REWARD,
-                        obs=self._TOOL_PARSE_ERROR_OBS,
+                        reward=self._tool_parse_error_penalty,
+                        obs=self._tool_parse_error_feedback,
                     ),
                     content or "",
                     last_info,

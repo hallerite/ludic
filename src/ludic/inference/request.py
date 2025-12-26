@@ -44,6 +44,18 @@ class ReturnSpec:
 
 @dataclass(frozen=True)
 class ToolRequest:
+    """
+    Tool schemas for chat template embedding.
+
+    In token-in mode, tools are embedded into the prompt via the chat template
+    (e.g., HuggingFace's apply_chat_template(tools=...)), not sent to the
+    server. The model outputs tool calls as text, which are then parsed by
+    a ToolParser.
+
+    Note: Unlike the old chat completions API, there is no `tool_choice`
+    parameter. Tool calling behavior is entirely prompt-driven.
+    """
+
     tools: List[Dict[str, Any]]
 
 
