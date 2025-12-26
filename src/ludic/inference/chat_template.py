@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, TYPE_CHECKING
 
 from ludic.types import Message
-from ludic.inference.tool_parser import ToolParser
+from ludic.inference.tool_parser import ToolParseResult, ToolParser
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -63,12 +63,17 @@ class ChatTemplate(Protocol):
     def parse_tool_calls(
         self,
         completion_text: str,
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> ToolParseResult:
         """
         Parse tool calls from raw completion text.
 
         Model-specific parsing to extract tool_calls from the output.
-        Returns None if no tool calls found or parsing fails.
+        """
+        ...
+
+    def supports_tools(self) -> bool:
+        """
+        Whether this template can parse tool calls from model output.
         """
         ...
 
@@ -131,8 +136,12 @@ class HFChatTemplate:
     def parse_tool_calls(
         self,
         completion_text: str,
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> ToolParseResult:
         """Parse tool calls from completion text using the tool parser."""
         if self._tool_parser:
             return self._tool_parser.parse(completion_text)
-        return None
+        return ToolParseResult(tool_calls=None, parse_error=False)
+
+    def supports_tools(self) -> bool:
+        """Whether tool-call parsing is configured."""
+        return self._tool_parser is not None

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from ludic.inference.sampling import SamplingParams
 from ludic.inference.extensions.base import BackendExtensions
@@ -45,7 +45,6 @@ class ReturnSpec:
 @dataclass(frozen=True)
 class ToolRequest:
     tools: List[Dict[str, Any]]
-    tool_choice: Optional[Union[str, Dict[str, Any]]] = "auto"
 
 
 @dataclass(frozen=True)

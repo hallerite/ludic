@@ -232,8 +232,7 @@ async def test_react_agent_requires_tool_supported_context():
 @pytest.mark.asyncio
 async def test_react_agent_records_bad_json_tool_arguments():
     """
-    If the model emits invalid JSON in <tool_call>, the parser returns None
-    and the agent treats it as no tool call (model gives final answer).
+    If the model emits invalid JSON in <tool_call>, the agent returns a parse error.
     """
     # Step 1: Bad JSON in tool call - parser will return None
     step_1 = (
@@ -256,10 +255,10 @@ async def test_react_agent_records_bad_json_tool_arguments():
         max_react_steps=3,
     )
 
-    # Since parser returns None for bad JSON, agent treats as final answer
-    result, raw_text, _, _ = await agent.act()
-    # The raw text doesn't have a <move> tag, so parse fails
+    result, raw_text, info, _ = await agent.act()
     assert result.action is None
+    assert info.get("tool_parse_error") is True
+    assert raw_text == step_1
 
 
 @pytest.mark.asyncio

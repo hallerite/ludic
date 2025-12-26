@@ -50,9 +50,8 @@ async def test_tool_agent_helpers_and_execution():
     inf = agent._with_tools(None)
     assert inf.return_.return_token_ids is True
 
-    # _tool_request advertises schemas and tool choice.
+    # _tool_request advertises schemas.
     tool_req = agent._tool_request()
-    assert tool_req.tool_choice == "auto"
     assert len(tool_req.tools) == 1
 
     # _run_tool_calls executes and records tool results
@@ -157,4 +156,17 @@ def test_tool_agent_requires_chat_template() -> None:
             parser=_mock_parser,
             tools=[calculator_tool],
             chat_template=None,  # type: ignore[arg-type]
+        )
+
+
+def test_tool_agent_requires_tool_parser() -> None:
+    """ToolAgent should require a tool parser when tools are configured."""
+    with pytest.raises(ValueError, match="tool parsing support"):
+        ToolAgent(
+            client=DummyClient(),
+            model="mock",
+            ctx=FullDialog(),
+            parser=_mock_parser,
+            tools=[calculator_tool],
+            chat_template=MockChatTemplate(),
         )

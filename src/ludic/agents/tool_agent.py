@@ -29,9 +29,14 @@ class ToolAgent(Agent):
         super().__init__(**kwargs)
         self.tool_map: Dict[str, Callable] = {t.__name__: t for t in tools}
         self.tool_schemas: List[Dict[str, Any]] = [self._func_to_schema(t) for t in tools]
+        if self.tool_schemas and not self._chat_template.supports_tools():
+            raise ValueError(
+                "ToolAgent requires a chat_template with tool parsing support "
+                "(configure a ToolParser, e.g., HermesToolParser)."
+            )
 
     def _tool_request(self) -> ToolRequest:
-        return ToolRequest(tools=list(self.tool_schemas), tool_choice="auto")
+        return ToolRequest(tools=list(self.tool_schemas))
 
     def _with_tools(self, inference: Optional[InferenceSpec]) -> InferenceSpec:
         """

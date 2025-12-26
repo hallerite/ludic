@@ -8,7 +8,7 @@ from ludic.types import StepOutcome, Observation, Info, Message
 from ludic.inference.client import ChatResponse, ChatClient
 from ludic.inference.request import TokenCompletionRequest
 from ludic.inference.chat_template import ChatTemplate, TemplateResult
-from ludic.inference.tool_parser import ToolParser
+from ludic.inference.tool_parser import ToolParseResult, ToolParser
 from ludic.agents.base_agent import Agent
 from ludic.context.base import ContextStrategy
 from ludic.context.full_dialog import FullDialog
@@ -63,10 +63,13 @@ class MockChatTemplate(ChatTemplate):
     def parse_tool_calls(
         self,
         completion_text: str,
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> ToolParseResult:
         if self._tool_parser:
             return self._tool_parser.parse(completion_text)
-        return None
+        return ToolParseResult(tool_calls=None, parse_error=False)
+
+    def supports_tools(self) -> bool:
+        return self._tool_parser is not None
 
 # ---- Common test tools --------------------------------------------------
 

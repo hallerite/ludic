@@ -21,12 +21,13 @@ class TestHermesToolParser:
 
         result = parser.parse(text)
 
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["id"] == "call_0"
-        assert result[0]["type"] == "function"
-        assert result[0]["function"]["name"] == "calculator"
-        assert result[0]["function"]["arguments"] == '{"a": 5, "b": 3}'
+        assert result.tool_calls is not None
+        assert result.parse_error is False
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["id"] == "call_0"
+        assert result.tool_calls[0]["type"] == "function"
+        assert result.tool_calls[0]["function"]["name"] == "calculator"
+        assert result.tool_calls[0]["function"]["arguments"] == '{"a": 5, "b": 3}'
 
     def test_parse_multiple_tool_calls(self):
         """Parse multiple tool calls in a single response."""
@@ -44,13 +45,14 @@ class TestHermesToolParser:
 
         result = parser.parse(text)
 
-        assert result is not None
-        assert len(result) == 2
-        assert result[0]["id"] == "call_0"
-        assert result[0]["function"]["name"] == "calculator"
-        assert result[1]["id"] == "call_1"
-        assert result[1]["function"]["name"] == "weather"
-        assert result[1]["function"]["arguments"] == '{"location": "NYC"}'
+        assert result.tool_calls is not None
+        assert result.parse_error is False
+        assert len(result.tool_calls) == 2
+        assert result.tool_calls[0]["id"] == "call_0"
+        assert result.tool_calls[0]["function"]["name"] == "calculator"
+        assert result.tool_calls[1]["id"] == "call_1"
+        assert result.tool_calls[1]["function"]["name"] == "weather"
+        assert result.tool_calls[1]["function"]["arguments"] == '{"location": "NYC"}'
 
     def test_parse_no_tool_calls_returns_none(self):
         """Return None when no tool_call tags are present."""
@@ -59,7 +61,8 @@ class TestHermesToolParser:
 
         result = parser.parse(text)
 
-        assert result is None
+        assert result.tool_calls is None
+        assert result.parse_error is False
 
     def test_parse_invalid_json_skipped(self):
         """Invalid JSON inside tool_call tags is skipped."""
@@ -72,8 +75,9 @@ class TestHermesToolParser:
 
         result = parser.parse(text)
 
-        # Invalid JSON results in empty list -> None
-        assert result is None
+        # Invalid JSON results in no tool calls but parse_error=True
+        assert result.tool_calls is None
+        assert result.parse_error is True
 
     def test_parse_mixed_valid_invalid_json(self):
         """Valid tool calls are kept, invalid ones are skipped."""
@@ -89,11 +93,12 @@ class TestHermesToolParser:
 
         result = parser.parse(text)
 
-        assert result is not None
-        assert len(result) == 1
+        assert result.tool_calls is not None
+        assert result.parse_error is True
+        assert len(result.tool_calls) == 1
         # The valid one gets id call_1 because it's second in the match order
         # but after filtering invalid, it's the only one
-        assert result[0]["function"]["name"] == "valid_tool"
+        assert result.tool_calls[0]["function"]["name"] == "valid_tool"
 
     def test_parse_empty_arguments(self):
         """Handle tool calls with no arguments."""
@@ -106,10 +111,11 @@ class TestHermesToolParser:
 
         result = parser.parse(text)
 
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["function"]["name"] == "no_args_tool"
-        assert result[0]["function"]["arguments"] == "{}"
+        assert result.tool_calls is not None
+        assert result.parse_error is False
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["name"] == "no_args_tool"
+        assert result.tool_calls[0]["function"]["arguments"] == "{}"
 
     def test_parse_missing_arguments_key(self):
         """Handle tool calls without arguments key (defaults to empty)."""
@@ -122,10 +128,11 @@ class TestHermesToolParser:
 
         result = parser.parse(text)
 
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["function"]["name"] == "simple_tool"
-        assert result[0]["function"]["arguments"] == "{}"
+        assert result.tool_calls is not None
+        assert result.parse_error is False
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["name"] == "simple_tool"
+        assert result.tool_calls[0]["function"]["arguments"] == "{}"
 
     def test_parse_whitespace_tolerance(self):
         """Handle various whitespace in tool_call tags."""
@@ -142,10 +149,12 @@ class TestHermesToolParser:
         result1 = parser.parse(text_compact)
         result2 = parser.parse(text_spaced)
 
-        assert result1 is not None
-        assert result1[0]["function"]["name"] == "tool1"
-        assert result2 is not None
-        assert result2[0]["function"]["name"] == "tool2"
+        assert result1.tool_calls is not None
+        assert result1.parse_error is False
+        assert result1.tool_calls[0]["function"]["name"] == "tool1"
+        assert result2.tool_calls is not None
+        assert result2.parse_error is False
+        assert result2.tool_calls[0]["function"]["name"] == "tool2"
 
     def test_parse_nested_json_arguments(self):
         """Handle complex nested JSON in arguments."""
@@ -158,11 +167,12 @@ class TestHermesToolParser:
 
         result = parser.parse(text)
 
-        assert result is not None
-        assert result[0]["function"]["name"] == "complex_tool"
+        assert result.tool_calls is not None
+        assert result.parse_error is False
+        assert result.tool_calls[0]["function"]["name"] == "complex_tool"
         # Arguments should be JSON string
         import json
-        args = json.loads(result[0]["function"]["arguments"])
+        args = json.loads(result.tool_calls[0]["function"]["arguments"])
         assert args["nested"]["a"] == [1, 2, 3]
         assert args["nested"]["b"]["c"] == "d"
 
@@ -180,9 +190,10 @@ class TestHermesToolParser:
 
         result = parser.parse(text)
 
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["function"]["name"] == "my_tool"
+        assert result.tool_calls is not None
+        assert result.parse_error is False
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["name"] == "my_tool"
 
     def test_parse_empty_string(self):
         """Empty input returns None."""
@@ -190,7 +201,8 @@ class TestHermesToolParser:
 
         result = parser.parse("")
 
-        assert result is None
+        assert result.tool_calls is None
+        assert result.parse_error is False
 
     def test_parse_missing_name_key(self):
         """Handle tool call without name (defaults to empty string)."""
@@ -203,5 +215,6 @@ class TestHermesToolParser:
 
         result = parser.parse(text)
 
-        assert result is not None
-        assert result[0]["function"]["name"] == ""
+        assert result.tool_calls is not None
+        assert result.parse_error is False
+        assert result.tool_calls[0]["function"]["name"] == ""

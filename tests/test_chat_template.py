@@ -170,9 +170,10 @@ class TestHFChatTemplate:
 
         result = template.parse_tool_calls(text)
 
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["function"]["name"] == "my_tool"
+        assert result.tool_calls is not None
+        assert result.parse_error is False
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["function"]["name"] == "my_tool"
 
     def test_parse_tool_calls_without_parser(self):
         """parse_tool_calls returns None when no parser configured."""
@@ -183,7 +184,15 @@ class TestHFChatTemplate:
 
         result = template.parse_tool_calls(text)
 
-        assert result is None
+        assert result.tool_calls is None
+        assert result.parse_error is False
+
+    def test_supports_tools_false_without_parser(self):
+        """supports_tools is False when no tool parser is configured."""
+        tokenizer = MockTokenizer()
+        template = HFChatTemplate(tokenizer)
+
+        assert template.supports_tools() is False
 
     def test_parse_tool_calls_no_tool_calls_in_text(self):
         """parse_tool_calls returns None when text has no tool calls."""
@@ -195,7 +204,16 @@ class TestHFChatTemplate:
 
         result = template.parse_tool_calls(text)
 
-        assert result is None
+        assert result.tool_calls is None
+        assert result.parse_error is False
+
+    def test_supports_tools_true_with_parser(self):
+        """supports_tools is True when tool parser is configured."""
+        tokenizer = MockTokenizer()
+        parser = HermesToolParser()
+        template = HFChatTemplate(tokenizer, tool_parser=parser)
+
+        assert template.supports_tools() is True
 
     def test_apply_returns_list_of_ints(self):
         """Token IDs are a list of integers, not other types."""

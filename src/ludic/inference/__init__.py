@@ -7,7 +7,7 @@ from .extensions import BackendExtensions, VLLMExtensions
 from .vllm_client import VLLMChatClient
 from .vllm_utils import start_vllm_server, wait_for_vllm_health
 from .chat_template import ChatTemplate, HFChatTemplate, TemplateResult
-from .tool_parser import ToolParser, HermesToolParser
+from .tool_parser import ToolParser, HermesToolParser, ToolParseResult
 
 __all__ = [
     # Client protocols
@@ -33,4 +33,5 @@ __all__ = [
     "TemplateResult",
     "ToolParser",
     "HermesToolParser",
+    "ToolParseResult",
 ]

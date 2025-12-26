@@ -18,7 +18,21 @@ from __future__ import annotations
 import json
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+
+
+@dataclass(frozen=True)
+class ToolParseResult:
+    """
+    Result of parsing tool calls from a completion.
+
+    tool_calls is None when no tool calls are present or none could be parsed.
+    parse_error is True when tool-call tags exist but parsing failed.
+    """
+
+    tool_calls: Optional[List[Dict[str, Any]]]
+    parse_error: bool = False
 
 
 class ToolParser(ABC):
@@ -30,7 +44,7 @@ class ToolParser(ABC):
     """
 
     @abstractmethod
-    def parse(self, completion_text: str) -> Optional[List[Dict[str, Any]]]:
+    def parse(self, completion_text: str) -> ToolParseResult:
         """
         Extract tool calls from completion text.
 
@@ -38,9 +52,9 @@ class ToolParser(ABC):
             completion_text: Raw model output text.
 
         Returns:
-            List of tool calls in OpenAI format:
+            ToolParseResult with tool_calls in OpenAI format:
             [{"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}]
-            Returns None if no tool calls found.
+            tool_calls is None if no tool calls were parsed.
         """
         ...
 
@@ -57,15 +71,16 @@ class HermesToolParser(ToolParser):
         </tool_call>
     """
 
-    def parse(self, completion_text: str) -> Optional[List[Dict[str, Any]]]:
+    def parse(self, completion_text: str) -> ToolParseResult:
         # Look for <tool_call>...</tool_call> blocks
         pattern = r"<tool_call>\s*(.*?)\s*</tool_call>"
         matches = re.findall(pattern, completion_text, re.DOTALL)
 
         if not matches:
-            return None
+            return ToolParseResult(tool_calls=None, parse_error=False)
 
         tool_calls = []
+        parse_error = False
         for i, match in enumerate(matches):
             try:
                 call_data = json.loads(match)
@@ -78,6 +93,10 @@ class HermesToolParser(ToolParser):
                     },
                 })
             except json.JSONDecodeError:
+                parse_error = True
                 continue
 
-        return tool_calls if tool_calls else None
+        return ToolParseResult(
+            tool_calls=tool_calls if tool_calls else None,
+            parse_error=parse_error,
+        )

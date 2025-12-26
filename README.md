@@ -71,6 +71,20 @@ If you care about truncation semantics (env time limits vs protocol cutoffs vs m
 
 - Rejection sampling (`examples/rejection_sampling.py`): generate rollouts, filter them, and write training-ready JSONL for offline training.
 
+## Token-in Inference (Drift-Free)
+
+Ludic now applies chat templates locally and sends pre-tokenized prompts to the
+vLLM `/v1/completions` endpoint. This keeps training aligned to the exact tokens
+sampled by the model.
+
+Key points:
+- Agents require a `ChatTemplate` (see `ludic.inference.HFChatTemplate`).
+- Provide a shared tokenizer per process to avoid duplicated init costs.
+- Tool calling uses a text parser (e.g., `HermesToolParser`) to extract tool calls
+  from raw completions.
+- If you need explicit stop token IDs, set them via
+  `VLLMExtensions.extra_body_overrides` (e.g., `{"stop_token_ids": [...]}`).
+
 ## Requirements
 
 - Python 3.12+
@@ -103,8 +117,6 @@ uv sync --extra examples
 - Add a classic Gym-style registry for agent harnesses, environments, and interaction protocols (so they don’t have to be built on the fly).
    - this will also allow us to create general eval and training scripts instead of hand-crafted ones
 - Use proper FSDP2 wrapping in the training scripts
-- Move to Token-In/Token-Out API
-	- we currently have a Token-Out API already
 
 ### Medium Priority
 
