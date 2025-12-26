@@ -8,8 +8,9 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from ludic.inference import HFChatTemplate
 from ludic.inference.vllm_client import VLLMChatClient
-from ludic.inference.request import ChatCompletionRequest, ReturnSpec
+from ludic.inference.request import TokenCompletionRequest, ReturnSpec
 from ludic.inference.sampling import SamplingParams
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu, pytest.mark.diagnostic]
@@ -49,6 +50,7 @@ async def test_vllm_client_returns_logprobs(
         vllm_model_name,
         trust_remote_code=True,
     )
+    chat_template = HFChatTemplate(tokenizer)
 
     long_sampling = SamplingParams(
         temperature=1.0,
@@ -83,10 +85,14 @@ async def test_vllm_client_returns_logprobs(
 
     for scenario_name, messages, sampling_cfg in scenarios:
         seed = 0
-        resp, _ = await vllm_client.complete(
-            ChatCompletionRequest(
+        prompt_token_ids = chat_template.apply(
+            messages,
+            add_generation_prompt=True,
+        ).prompt_token_ids
+        resp, _ = await vllm_client.complete_tokens(
+            TokenCompletionRequest(
                 model=vllm_model_name,
-                messages=messages,
+                prompt_token_ids=prompt_token_ids,
                 sampling=sampling_cfg,
                 seed=seed,
                 return_=ReturnSpec.for_rl(top_logprobs_k=1),

@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ludic.agents.base_agent import Agent
 from ludic.inference.request import InferenceSpec, ReturnSpec, ToolRequest
@@ -19,7 +19,6 @@ class ToolAgent(Agent):
       - Tool schema generation from python callables.
       - SamplingArgs augmentation to advertise tools to the model.
       - Execution + recording of tool calls into the ContextStrategy.
-      - Extraction of content/tool_calls from OpenAI raw_response info.
 
     Tool errors:
       - Missing tools, invalid JSON arguments, and tool exceptions are
@@ -52,18 +51,6 @@ class ToolAgent(Agent):
             ),
             extensions=inf.extensions,
         )
-
-    def _extract_openai_message(
-        self, info: Dict[str, Any]
-    ) -> Tuple[Optional[str], Optional[List[Dict[str, Any]]]]:
-        """
-        Extract (content, tool_calls) from OpenAI/vLLM raw_response structure.
-        """
-        raw_choice = info["raw_response"]["choices"][0]
-        message_data = raw_choice["message"]
-        content = message_data.get("content")
-        tool_calls = message_data.get("tool_calls")
-        return content, tool_calls
 
     def _run_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> None:
         """Execute tool calls and record results in context."""

@@ -1,14 +1,12 @@
 from __future__ import annotations
-import json
 import pytest
 from typing import Any, List, Dict, Optional, Tuple
 
 from ludic.agents.react_agent import ReActAgent
 from ludic.context.full_dialog import FullDialog
 from ludic.inference.client import ChatClient, ChatResponse
-from ludic.inference.request import ChatCompletionRequest, TokenCompletionRequest
+from ludic.inference.request import TokenCompletionRequest
 from ludic.inference.tool_parser import HermesToolParser
-from ludic.types import Message
 from ludic.parsers import xml_tag_parser
 from tests._mocks import calculator_tool, MockChatTemplate
 
@@ -33,13 +31,6 @@ class ReplayMockClient(ChatClient):
         self.call_count = 0
         self.last_request: Optional[TokenCompletionRequest] = None
         self.last_prompt_text: Optional[str] = None
-
-    async def complete(
-        self,
-        request: ChatCompletionRequest,
-        **kwargs,
-    ) -> Tuple[ChatResponse, Dict[str, Any]]:
-        raise NotImplementedError("Use complete_tokens for token-in API")
 
     async def complete_tokens(
         self,

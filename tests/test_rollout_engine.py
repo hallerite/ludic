@@ -11,7 +11,7 @@ from ludic.interaction.base import InteractionProtocol
 from ludic.interaction.single_agent import SingleAgentSyncProtocol
 from ludic.context.full_dialog import FullDialog
 from ludic.envs.env import LudicEnv
-from ludic.inference.request import ChatCompletionRequest, InferenceSpec, ReturnSpec
+from ludic.inference.request import TokenCompletionRequest, InferenceSpec, ReturnSpec
 from ludic.inference.sampling import SamplingParams
 
 from ludic.training.batching import (
@@ -27,7 +27,7 @@ from ludic.training.credit_assignment import MonteCarloReturn
 from ludic.training.filters import drop_truncated
 from ludic.types import Rollout, Step
 
-from tests._mocks import MockClient, _mock_parser, MockAgent
+from tests._mocks import MockClient, _mock_parser, MockAgent, MockChatTemplate
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -41,9 +41,9 @@ class TokenClient(MockClient):
     RolloutEngine.generate_batch can consume them without retokenization.
     """
 
-    async def complete(
+    async def complete_tokens(
         self,
-        request: ChatCompletionRequest,
+        request: TokenCompletionRequest,
         **kwargs,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
         # Prompt is "some prompt", completion is "1".
@@ -53,7 +53,7 @@ class TokenClient(MockClient):
             prompt_token_ids=[10, 11],
             completion_token_ids=[12, 13, 14],
         )
-        return resp, {"used_request": request.to_dict()}
+        return resp, {"mode": "token_in"}
 
 
 class ConstantCreditAssigner:
@@ -369,7 +369,8 @@ async def test_generate_batch_uses_model_token_ids_when_available(
         client=TokenClient(),
         model="mock",
         ctx=FullDialog(),
-        parser=_mock_parser
+        parser=_mock_parser,
+        chat_template=MockChatTemplate(),
     )
     
     protocol_registry = {
@@ -426,10 +427,24 @@ async def test_generate_batch_uses_model_token_ids_when_available(
 @pytest.mark.asyncio
 async def test_generate_batch_raises_if_no_token_ids_and_no_retokenize(
     env_registry,
-    mock_agent,
 ) -> None:
+    class NoTokenClient(MockClient):
+        async def complete_tokens(  # type: ignore[override]
+            self,
+            request: TokenCompletionRequest,
+            **kwargs,
+        ) -> Tuple[ChatResponse, Dict[str, Any]]:
+            return ChatResponse(text="1"), {"mode": "token_in"}
+
+    agent = Agent(
+        client=NoTokenClient(),
+        model="mock",
+        ctx=FullDialog(),
+        parser=_mock_parser,
+        chat_template=MockChatTemplate(),
+    )
     protocol_registry = {
-        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=mock_agent)
+        "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent)
     }
     
     engine = RolloutEngine(
@@ -469,6 +484,7 @@ async def test_rollout_batch_source_next_batch_integration(
         model="mock",
         ctx=FullDialog(),
         parser=_mock_parser,
+        chat_template=MockChatTemplate(),
     )
     protocol_registry = {
         "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent)
@@ -525,6 +541,7 @@ async def test_rollout_batch_source_passes_sample_filter(
         model="mock",
         ctx=FullDialog(),
         parser=_mock_parser,
+        chat_template=MockChatTemplate(),
     )
     protocol_registry = {
         "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent)
@@ -577,6 +594,7 @@ async def test_saw_item_contains_truncation_flags(
         model="mock",
         ctx=FullDialog(),
         parser=_mock_parser,
+        chat_template=MockChatTemplate(),
     )  # Never terminates the env since it never outputs target="win"
     protocol_registry = {
         "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent),
@@ -632,6 +650,7 @@ async def test_generate_batch_applies_sample_filter_and_updates_counts(
         model="mock",
         ctx=FullDialog(),
         parser=_mock_parser,
+        chat_template=MockChatTemplate(),
     )  # Never terminates the env since it never outputs target="win"
     protocol_registry = {
         "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent),
@@ -677,9 +696,9 @@ async def test_avg_completion_length_respects_filtered_items(
             self._texts = list(texts)
             self._i = 0
 
-        async def complete(  # type: ignore[override]
+        async def complete_tokens(  # type: ignore[override]
             self,
-            request: ChatCompletionRequest,
+            request: TokenCompletionRequest,
             **kwargs,
         ) -> Tuple[ChatResponse, Dict[str, Any]]:
             text = self._texts[min(self._i, len(self._texts) - 1)]
@@ -691,7 +710,7 @@ async def test_avg_completion_length_respects_filtered_items(
                     prompt_token_ids=[1, 2],
                     completion_token_ids=completion_ids,
                 ),
-                {"used_request": request.to_dict()},
+                {"mode": "token_in"},
             )
 
     agent = Agent(
@@ -699,6 +718,7 @@ async def test_avg_completion_length_respects_filtered_items(
         model="mock",
         ctx=FullDialog(),
         parser=_mock_parser,
+        chat_template=MockChatTemplate(),
     )
     protocol_registry = {
         "mock_protocol": lambda: SingleAgentSyncProtocol(agent=agent),

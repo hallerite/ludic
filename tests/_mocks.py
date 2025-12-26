@@ -6,7 +6,7 @@ from typing import Any, Optional, Tuple, Mapping, Dict, List
 from ludic.envs.single_agent_env import SingleAgentEnv
 from ludic.types import StepOutcome, Observation, Info, Message
 from ludic.inference.client import ChatResponse, ChatClient
-from ludic.inference.request import ChatCompletionRequest, TokenCompletionRequest
+from ludic.inference.request import TokenCompletionRequest
 from ludic.inference.chat_template import ChatTemplate, TemplateResult
 from ludic.inference.tool_parser import ToolParser
 from ludic.agents.base_agent import Agent
@@ -31,6 +31,8 @@ class MockChatTemplate(ChatTemplate):
     def __init__(self, tool_parser: Optional[ToolParser] = None) -> None:
         self._tool_parser = tool_parser
         self._call_count = 0
+        self.last_messages: Optional[List[Message]] = None
+        self.last_tools: Optional[List[Dict[str, Any]]] = None
 
     def apply(
         self,
@@ -40,6 +42,8 @@ class MockChatTemplate(ChatTemplate):
         add_generation_prompt: bool = True,
     ) -> TemplateResult:
         self._call_count += 1
+        self.last_messages = list(messages)
+        self.last_tools = list(tools) if tools is not None else None
         # Generate mock token IDs based on message content
         text_parts = []
         for msg in messages:
@@ -73,7 +77,7 @@ def calculator_tool(a: int, b: int) -> int:
 # ---- Mock client ---------------------------------------------------------
 
 class MockClient(ChatClient):
-    """Mock client supporting both complete() and complete_tokens() for token-in API."""
+    """Mock client supporting complete_tokens() for token-in API."""
 
     def __init__(
         self,
@@ -82,13 +86,6 @@ class MockClient(ChatClient):
     ) -> None:
         self._text = text
         self._finish_reason = finish_reason
-
-    async def complete(
-        self,
-        request: ChatCompletionRequest,
-    ) -> tuple[ChatResponse, Dict[str, Any]]:
-        resp = ChatResponse(text=self._text, finish_reason=self._finish_reason)
-        return resp, {"used_request": request.to_dict()}
 
     async def complete_tokens(
         self,
@@ -123,6 +120,7 @@ class MockAgent(Agent):
             model=model,
             ctx=ctx or FullDialog(),
             parser=parser,
+            chat_template=MockChatTemplate(),
         )
 
 
@@ -132,29 +130,9 @@ class SeedableMockClient(ChatClient):
     """
     A mock client that returns a deterministic response based on the
     sampling_seed provided. Also returns mock token IDs.
-    Supports both complete() and complete_tokens() for token-in API.
     """
     def __init__(self, seed_map: Dict[int, str]) -> None:
         self._seed_map = seed_map
-
-    async def complete(
-        self,
-        request: ChatCompletionRequest,
-    ) -> tuple[ChatResponse, Dict[str, Any]]:
-
-        # Get the deterministic text output based on the sampling seed
-        if request.seed is None:
-            raise ValueError("SeedableMockClient requires request.seed to be set")
-        text_out = self._seed_map.get(int(request.seed), "DEFAULT_FALLBACK")
-
-        resp = ChatResponse(
-            text=text_out,
-            # Add mock token IDs so retokenize=False path passes
-            prompt_token_ids=[1, 2, 3],
-            completion_token_ids=[10, 11] # Action
-        )
-        # Return the serializable dict, not the object
-        return resp, {"used_request": request.to_dict()}
 
     async def complete_tokens(
         self,
@@ -190,7 +168,8 @@ class SeedableMockAgent(Agent):
             client=SeedableMockClient(seed_map), 
             model="seedable_mock",
             ctx=ctx or FullDialog(),
-            parser=parser
+            parser=parser,
+            chat_template=MockChatTemplate(),
         )
 
 

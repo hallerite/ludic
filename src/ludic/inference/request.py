@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
-from ludic.types import Message
 from ludic.inference.sampling import SamplingParams
 from ludic.inference.extensions.base import BackendExtensions
 
@@ -50,20 +49,6 @@ class ToolRequest:
 
 
 @dataclass(frozen=True)
-class ChatCompletionRequest:
-    model: str
-    messages: List[Message]
-    sampling: SamplingParams = field(default_factory=SamplingParams)
-    return_: ReturnSpec = field(default_factory=ReturnSpec)
-    seed: Optional[int] = None
-    tools: Optional[ToolRequest] = None
-    extensions: Optional[BackendExtensions] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass(frozen=True)
 class TokenCompletionRequest:
     """
     Pre-tokenized completion request.
@@ -89,7 +74,7 @@ class InferenceSpec:
     Per-step inference configuration (minus the prompt/messages).
 
     Protocols pass this through to agents; agents construct a
-    ChatCompletionRequest using their configured model and current messages.
+    TokenCompletionRequest by applying their chat template to the current messages.
     """
 
     sampling: SamplingParams = field(default_factory=SamplingParams)

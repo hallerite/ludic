@@ -8,20 +8,14 @@ import pytest
 from ludic.agents.tool_agent import ToolAgent
 from ludic.context.full_dialog import FullDialog
 from ludic.inference.client import ChatClient, ChatResponse
-from ludic.inference.request import ChatCompletionRequest, TokenCompletionRequest
+from ludic.inference.request import TokenCompletionRequest
 from ludic.inference.tool_parser import HermesToolParser
 
 from tests._mocks import _mock_parser, calculator_tool, MockChatTemplate
 
 
 class DummyClient(ChatClient):
-    """Dummy client supporting both complete() and complete_tokens()."""
-
-    async def complete(
-        self,
-        request: ChatCompletionRequest,
-    ) -> Tuple[ChatResponse, Dict[str, Any]]:
-        return ChatResponse(text="ok"), {"raw_response": {"choices": [{"message": {"content": "ok"}}]}}
+    """Dummy client supporting complete_tokens()."""
 
     async def complete_tokens(
         self,
@@ -124,12 +118,7 @@ async def test_tool_agent_uses_token_in_when_template_provided():
 
     class TrackingClient(ChatClient):
         def __init__(self):
-            self.complete_called = False
             self.complete_tokens_called = False
-
-        async def complete(self, request: ChatCompletionRequest):
-            self.complete_called = True
-            return ChatResponse(text="ok"), {}
 
         async def complete_tokens(self, request: TokenCompletionRequest):
             self.complete_tokens_called = True
@@ -156,41 +145,16 @@ async def test_tool_agent_uses_token_in_when_template_provided():
     await agent.act()
 
     assert client.complete_tokens_called is True
-    assert client.complete_called is False
 
 
-@pytest.mark.asyncio
-async def test_tool_agent_uses_legacy_when_no_template():
-    """Test that ToolAgent uses legacy complete() when no chat_template."""
-
-    class TrackingClient(ChatClient):
-        def __init__(self):
-            self.complete_called = False
-            self.complete_tokens_called = False
-
-        async def complete(self, request: ChatCompletionRequest):
-            self.complete_called = True
-            return ChatResponse(text="ok"), {"raw_response": {"choices": [{"message": {"content": "ok"}}]}}
-
-        async def complete_tokens(self, request: TokenCompletionRequest):
-            self.complete_tokens_called = True
-            return ChatResponse(text="ok"), {}
-
-        def sync_weights(self, *args, **kwargs):
-            pass
-
-    client = TrackingClient()
-
-    agent = ToolAgent(
-        client=client,
-        model="mock",
-        ctx=FullDialog(),
-        parser=_mock_parser,
-        tools=[calculator_tool],
-        # No chat_template - uses legacy mode
-    )
-
-    await agent.act()
-
-    assert client.complete_called is True
-    assert client.complete_tokens_called is False
+def test_tool_agent_requires_chat_template() -> None:
+    """ToolAgent should require a chat_template for token-in inference."""
+    with pytest.raises(ValueError, match="chat_template"):
+        ToolAgent(
+            client=DummyClient(),
+            model="mock",
+            ctx=FullDialog(),
+            parser=_mock_parser,
+            tools=[calculator_tool],
+            chat_template=None,  # type: ignore[arg-type]
+        )

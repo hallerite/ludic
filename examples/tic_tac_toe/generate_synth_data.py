@@ -25,9 +25,11 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List
 
+from transformers import AutoTokenizer
+
 from ludic.agent import Agent
 from ludic.context import FullDialog
-from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec
+from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec, HFChatTemplate
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import compose_parsers, think_prefix_parser, xml_tag_parser
 from ludic.training import RolloutEngine, EnvSpec, ProtocolSpec, RolloutRequest
@@ -215,6 +217,11 @@ def apply_prompt_format(
 async def generate_synth_data(args: argparse.Namespace) -> None:
     print(f"Connecting to vLLM at http://{args.host}:{args.port}...")
 
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    chat_template = HFChatTemplate(tokenizer)
+
     client = VLLMChatClient(
         host=args.host,
         port=args.port,
@@ -231,6 +238,7 @@ async def generate_synth_data(args: argparse.Namespace) -> None:
                 model=args.model,
                 ctx=FullDialog(system_prompt=prompt_text),  # Full dialog for generation
                 parser=TICTACTOE_PARSER,
+                chat_template=chat_template,
             ),
             stop_on_parse_error=True,
         )

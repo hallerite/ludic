@@ -6,7 +6,7 @@ from ludic.agents.base_agent import Agent
 from ludic.context.full_dialog import FullDialog
 from ludic.interaction.single_agent import SingleAgentSyncProtocol
 from ludic.parsers import ParseResult
-from tests._mocks import MockClient, MockEnv
+from tests._mocks import MockClient, MockEnv, MockChatTemplate
 
 
 def pass_through_parser(raw: str) -> ParseResult:
@@ -23,6 +23,7 @@ async def test_agent_rejects_incomplete_completion_by_default() -> None:
         parser=pass_through_parser,
         incomplete_completion_penalty=-0.2,
         incomplete_completion_feedback="too long",
+        chat_template=MockChatTemplate(),
     )
     agent.reset(system_prompt=None)
     agent.on_env_reset("obs", {})
@@ -46,6 +47,7 @@ async def test_agent_can_allow_incomplete_completion() -> None:
         ctx=FullDialog(),
         parser=pass_through_parser,
         reject_incomplete_completions=False,
+        chat_template=MockChatTemplate(),
     )
     agent.reset(system_prompt=None)
     agent.on_env_reset("obs", {})
@@ -65,6 +67,7 @@ async def test_single_agent_protocol_marks_incomplete_completion_as_parse_error(
         model="mock",
         ctx=FullDialog(),
         parser=pass_through_parser,
+        chat_template=MockChatTemplate(),
     )
     protocol = SingleAgentSyncProtocol(agent=agent)
 

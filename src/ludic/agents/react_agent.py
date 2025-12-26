@@ -39,17 +39,11 @@ class ReActAgent(ToolAgent):
         """
         Extract content and tool_calls from the response.
 
-        When using chat_template (token-in mode), parses tool calls from raw text.
-        Otherwise extracts from the OpenAI response structure.
+        Parses tool calls from raw text using the chat template.
         """
-        if self._chat_template is not None:
-            # Token-in mode: parse tool calls from raw completion text
-            content = resp.text
-            tool_calls = self._chat_template.parse_tool_calls(content)
-            return content, tool_calls
-        else:
-            # Legacy mode: extract from OpenAI response
-            return self._extract_openai_message(info)
+        content = resp.text
+        tool_calls = self._chat_template.parse_tool_calls(content)
+        return content, tool_calls
 
     async def act(
         self, 

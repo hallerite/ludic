@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .client import ChatClient, VersionedClient
 from .sampling import SamplingParams
-from .request import ChatCompletionRequest, TokenCompletionRequest, InferenceSpec, ReturnSpec, ToolRequest
+from .request import TokenCompletionRequest, InferenceSpec, ReturnSpec, ToolRequest
 from .extensions import BackendExtensions, VLLMExtensions
 from .vllm_client import VLLMChatClient
 from .vllm_utils import start_vllm_server, wait_for_vllm_health
@@ -19,7 +19,6 @@ __all__ = [
     "ReturnSpec",
     "ToolRequest",
     "InferenceSpec",
-    "ChatCompletionRequest",
     "TokenCompletionRequest",
     # Extensions
     "BackendExtensions",

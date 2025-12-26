@@ -4,7 +4,7 @@ from typing import Any, Dict, Mapping, Optional, Protocol, Tuple
 import torch  # type: ignore
 
 from ludic.types import ChatResponse
-from ludic.inference.request import ChatCompletionRequest, TokenCompletionRequest
+from ludic.inference.request import TokenCompletionRequest
 
 class ChatClient(Protocol):
     """
@@ -15,12 +15,6 @@ class ChatClient(Protocol):
       - can atomically push a set of parameter tensors to the runtime
     """
 
-    async def complete(
-        self,
-        request: ChatCompletionRequest,
-    ) -> Tuple[ChatResponse, Dict[str, Any]]:
-        ...
-
     async def complete_tokens(
         self,
         request: TokenCompletionRequest,
@@ -28,12 +22,11 @@ class ChatClient(Protocol):
         """
         Complete from pre-tokenized prompt.
 
-        This uses the completions endpoint (not chat completions) with the
-        decoded prompt text. Gives full control over tokenization for
-        drift-free RL training.
+        This uses the completions endpoint (not chat completions) with
+        caller-supplied token IDs for drift-free RL training.
 
-        Implementations may raise NotImplementedError if they only support
-        chat completions.
+        Implementations may raise NotImplementedError if they do not support
+        token-in prompts.
         """
         ...
 
