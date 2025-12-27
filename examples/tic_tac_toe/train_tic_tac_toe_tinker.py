@@ -17,7 +17,7 @@ from typing import Dict, List, Tuple
 
 import torch
 import tinker
-from tinker_cookbook import checkpoint_utils, model_info, renderers
+from tinker_cookbook import checkpoint_utils
 from tinker_cookbook.utils import ml_log
 
 from environments.tic_tac_toe import TicTacToeEnv
@@ -160,14 +160,9 @@ async def run_training(args: argparse.Namespace) -> None:
     sampling_client = await training_client.save_weights_and_get_sampling_client_async()
     tokenizer = training_client.get_tokenizer()
 
-    renderer_name = args.renderer or model_info.get_recommended_renderer_name(args.model)
-    renderer = renderers.get_renderer(renderer_name, tokenizer)
-
     tinker_client = TinkerChatClient(
         sampling_client=sampling_client,
-        model_name=args.model,
         tokenizer=tokenizer,
-        renderer=renderer,
         policy_version="0",
     )
 
@@ -435,7 +430,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train Tic-Tac-Toe using Ludic + Tinker.")
     parser.add_argument("--model", default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--base-url", default=None, help="Tinker service base URL.")
-    parser.add_argument("--renderer", default=None, help="Renderer override.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--concurrency", type=int, default=64)
     parser.add_argument("--rollouts-per-update", type=int, default=64)

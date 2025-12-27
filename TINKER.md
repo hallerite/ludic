@@ -37,9 +37,8 @@ Implement `ludic.inference.client.ChatClient` (and optionally `VersionedClient`)
 so Ludic protocols can sample from Tinker.
 
 Responsibilities:
-- Render Ludic messages to `tinker.ModelInput` tokens.
-  - Use `tinker_cookbook` renderer + tokenizer for the chosen base model.
-  - Ensure identical rendering during sampling and training to avoid drift.
+- Accept a `TokenCompletionRequest` containing pre-tokenized prompt IDs.
+  - The Agent applies the chat template; the Tinker client stays token-in.
 - Call `sampling_client.sample_async(...)` with `tinker.SamplingParams`.
   - Must request chosen-token logprobs for RL.
 - Produce `ChatResponse` with:
@@ -49,10 +48,10 @@ Responsibilities:
 - Attach a `TokenTrace` to each `Step` via the normal Ludic flow.
 
 Notes:
-- Ludic expects message-based prompts; Tinker sampling uses token-based
-  `ModelInput`. The adapter must bridge this using a renderer/tokenizer.
-- Tinker does not natively expose OpenAI tool-calling. Tool use should be
-  serialized into the prompt (ReAct-style) rather than relying on tool schemas.
+- Ludic applies chat templates client-side and calls completions with token IDs,
+  so Tinker stays a pure token-in/token-out backend.
+- Tinker does not expose OpenAI tool-calling endpoints. Tool use should be
+  encoded into the prompt if needed.
 
 ## Rollout -> Datum Conversion
 

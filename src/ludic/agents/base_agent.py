@@ -73,7 +73,7 @@ class Agent:
         reject_incomplete_completions: bool = True,
         incomplete_completion_penalty: float = -0.1,
         incomplete_completion_feedback: str = _DEFAULT_INCOMPLETE_FEEDBACK,
-        chat_template: "ChatTemplate",
+        chat_template: Optional["ChatTemplate"] = None,
     ) -> None:
         """
         Initializes the Agent.
@@ -88,9 +88,8 @@ class Agent:
             incomplete_completion_penalty: Reward penalty for incomplete completions.
             incomplete_completion_feedback: Feedback message shown to agent when
                 its completion is cut off.
-            chat_template: ChatTemplate for token-in mode. The agent applies the
-                template itself and uses the completions endpoint for drift-free
-                RL training.
+            chat_template: ChatTemplate for token-in mode. If None, the agent
+                will try to build an HFChatTemplate from client.tokenizer.
         """
         self._client = client
         self._model = model
@@ -100,7 +99,15 @@ class Agent:
         self._incomplete_penalty = incomplete_completion_penalty
         self._incomplete_feedback = incomplete_completion_feedback
         if chat_template is None:
-            raise ValueError("Agent requires a chat_template for token-in inference.")
+            tokenizer = getattr(client, "tokenizer", None)
+            if tokenizer is None or not callable(getattr(tokenizer, "apply_chat_template", None)):
+                raise ValueError(
+                    "Agent requires a chat_template for token-in inference or a client "
+                    "with a HuggingFace-compatible tokenizer."
+                )
+            from ludic.inference.chat_template import HFChatTemplate
+
+            chat_template = HFChatTemplate(tokenizer)
         self._chat_template = chat_template
         self.last_info: Dict[str, Any] = {}
 

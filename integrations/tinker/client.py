@@ -1,43 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import tinker
-from tinker_cookbook import model_info, renderers
 from tinker_cookbook.tokenizer_utils import Tokenizer
 
 from ludic.inference.client import ChatClient
-from ludic.inference.request import ChatCompletionRequest
-from ludic.types import ChatResponse, Message
-
-
-def _coerce_messages(messages: Iterable[Message]) -> list[renderers.Message]:
-    out: list[renderers.Message] = []
-    for msg in messages:
-        role = msg.get("role")
-        content = msg.get("content")
-        if not isinstance(role, str) or not isinstance(content, str):
-            raise ValueError(
-                "TinkerChatClient only supports text-only messages with string role/content."
-            )
-        out.append({"role": role, "content": content})
-    return out
-
-
-def _resolve_renderer(
-    *,
-    model_name: str,
-    tokenizer: Tokenizer,
-    renderer_name: Optional[str],
-    renderer: Optional[renderers.Renderer],
-) -> renderers.Renderer:
-    if renderer is not None and renderer_name is not None:
-        raise ValueError("Provide either renderer or renderer_name, not both.")
-    if renderer is not None:
-        return renderer
-    name = renderer_name or model_info.get_recommended_renderer_name(model_name)
-    return renderers.get_renderer(name, tokenizer)
+from ludic.inference.request import TokenCompletionRequest
+from ludic.types import ChatResponse
 
 
 @dataclass
@@ -45,25 +16,13 @@ class TinkerChatClient(ChatClient):
     """
     Ludic ChatClient adapter backed by a Tinker SamplingClient.
 
-    This is intended for on-policy rollouts where sampling and training are both
-    handled by Tinker. Update the sampling client between training steps to keep
-    the rollouts strictly on-policy.
+    Token-in adapter: expects pre-tokenized prompts (TokenCompletionRequest).
+    Update the sampling client between training steps to keep rollouts on-policy.
     """
 
     sampling_client: tinker.SamplingClient
-    model_name: str
     tokenizer: Tokenizer
-    renderer_name: Optional[str] = None
-    renderer: Optional[renderers.Renderer] = None
     policy_version: Optional[str] = None
-
-    def __post_init__(self) -> None:
-        self._renderer = _resolve_renderer(
-            model_name=self.model_name,
-            tokenizer=self.tokenizer,
-            renderer_name=self.renderer_name,
-            renderer=self.renderer,
-        )
 
     def set_sampling_client(
         self,
@@ -75,26 +34,21 @@ class TinkerChatClient(ChatClient):
         if policy_version is not None:
             self.policy_version = policy_version
 
-    async def complete(
+    async def complete_tokens(
         self,
-        request: ChatCompletionRequest,
+        request: TokenCompletionRequest,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
-        if request.tools is not None:
-            raise NotImplementedError(
-                "TinkerChatClient does not support tool-calling. "
-                "Serialize tool use into text prompts instead."
-            )
+        if request.prompt_token_ids is None:
+            raise ValueError("TokenCompletionRequest.prompt_token_ids is required.")
 
-        messages = _coerce_messages(request.messages)
-        model_input = self._renderer.build_generation_prompt(messages)
+        model_input = tinker.ModelInput.from_ints(list(request.prompt_token_ids))
 
-        stop = request.sampling.stop or self._renderer.get_stop_sequences()
         sampling_params = tinker.SamplingParams(
             max_tokens=int(request.sampling.max_tokens),
             temperature=float(request.sampling.temperature),
             top_p=float(request.sampling.top_p),
-            stop=stop,
-            seed=request.seed,
+            stop=request.sampling.stop,
+            seed=int(request.seed) if request.seed is not None else None,
         )
 
         sample_result = await self.sampling_client.sample_async(
@@ -112,37 +66,34 @@ class TinkerChatClient(ChatClient):
                 "Tinker sampling did not return logprobs, but return_chosen_logprobs=True."
             )
 
-        parsed_message, _parse_ok = self._renderer.parse_response(completion_tokens)
-        text = renderers.ensure_text(parsed_message["content"])
+        if not request.return_.return_chosen_logprobs:
+            completion_logprobs = None
 
-        prompt_token_ids: Optional[List[int]]
-        try:
-            prompt_token_ids = model_input.to_ints()
-        except Exception:
-            prompt_token_ids = None
-
-        return_tokens = request.return_.return_token_ids or request.return_.return_chosen_logprobs
+        text = self.tokenizer.decode(completion_tokens, skip_special_tokens=True)
 
         response = ChatResponse(
             text=text,
-            completion_token_ids=completion_tokens if return_tokens else None,
+            completion_token_ids=completion_tokens,
             completion_logprobs=list(completion_logprobs) if completion_logprobs else None,
             finish_reason=sequence.stop_reason,
-            prompt_token_ids=prompt_token_ids if return_tokens else None,
+            prompt_token_ids=list(request.prompt_token_ids),
         )
 
         info: Dict[str, Any] = {
             "finish_reason": sequence.stop_reason,
             "policy_version": self.policy_version,
-            "renderer": type(self._renderer).__name__,
-            "prompt_length": len(prompt_token_ids) if prompt_token_ids is not None else None,
+            "prompt_length": len(request.prompt_token_ids),
             "completion_length": len(completion_tokens),
         }
-        if request.sampling.frequency_penalty or request.sampling.presence_penalty:
-            info["ignored_sampling_params"] = {
-                "frequency_penalty": float(request.sampling.frequency_penalty),
-                "presence_penalty": float(request.sampling.presence_penalty),
-            }
+        ignored_params: Dict[str, Any] = {}
+        if request.sampling.frequency_penalty:
+            ignored_params["frequency_penalty"] = float(request.sampling.frequency_penalty)
+        if request.sampling.presence_penalty:
+            ignored_params["presence_penalty"] = float(request.sampling.presence_penalty)
+        if request.return_.top_logprobs_k > 1:
+            ignored_params["top_logprobs_k"] = int(request.return_.top_logprobs_k)
+        if ignored_params:
+            info["ignored_sampling_params"] = ignored_params
 
         return response, info
 
