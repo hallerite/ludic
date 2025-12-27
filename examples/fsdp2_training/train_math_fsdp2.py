@@ -29,7 +29,7 @@ from datasets import load_dataset  # type: ignore
 from environments.math import MATHEnv
 from ludic.agent import Agent
 from ludic.context import FullDialog
-from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec
+from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec, HFChatTemplate
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.distributed import create_vllm_publisher
 from ludic.parsers import boxed_parser, extract_last_boxed_content
@@ -265,6 +265,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    chat_template = HFChatTemplate(tokenizer)
 
     mp_policy = fsdp.MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,
@@ -307,6 +308,7 @@ def main() -> None:
                 model=args.model,
                 ctx=FullDialog(system_prompt=args.system_prompt),
                 parser=action_parser,
+                chat_template=chat_template,
             )
         )
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import pytest
+from transformers import AutoTokenizer
 
+from ludic.inference import HFChatTemplate
 from ludic.inference.vllm_client import VLLMChatClient
-from ludic.inference.request import ChatCompletionRequest, ReturnSpec
+from ludic.inference.request import TokenCompletionRequest, ReturnSpec
 from ludic.inference.extensions import VLLMExtensions
 from ludic.inference.sampling import SamplingParams
 
@@ -13,6 +15,11 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+def build_prompt_token_ids(model_name: str, messages: list[dict]) -> list[int]:
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    template = HFChatTemplate(tokenizer)
+    return template.apply(messages, add_generation_prompt=True).prompt_token_ids
 
 
 @pytest.mark.asyncio
@@ -36,10 +43,11 @@ async def test_vllm_client_completion_roundtrip(
         },
     ]
 
-    resp, info = await vllm_client.complete(
-        ChatCompletionRequest(
+    prompt_token_ids = build_prompt_token_ids(vllm_model_name, messages)
+    resp, info = await vllm_client.complete_tokens(
+        TokenCompletionRequest(
             model=vllm_model_name,
-            messages=messages,
+            prompt_token_ids=prompt_token_ids,
             sampling=sampling,
             return_=ReturnSpec.for_eval(return_token_ids=True),
         )
@@ -81,12 +89,13 @@ async def test_vllm_client_same_seed_is_deterministic(
         },
     ]
 
+    prompt_token_ids = build_prompt_token_ids(vllm_model_name, messages)
     results = []
     for _ in range(3):
-        resp, _ = await vllm_client.complete(
-            ChatCompletionRequest(
+        resp, _ = await vllm_client.complete_tokens(
+            TokenCompletionRequest(
                 model=vllm_model_name,
-                messages=messages,
+                prompt_token_ids=prompt_token_ids,
                 sampling=sampling,
                 seed=seed_value,
                 return_=ReturnSpec.for_eval(return_token_ids=True),
@@ -117,10 +126,11 @@ async def test_vllm_client_returns_token_ids_and_detok(
         {"role": "user", "content": "Say 'hello'."},
     ]
 
-    resp, _ = await vllm_client.complete(
-        ChatCompletionRequest(
+    prompt_token_ids = build_prompt_token_ids(vllm_model_name, messages)
+    resp, _ = await vllm_client.complete_tokens(
+        TokenCompletionRequest(
             model=vllm_model_name,
-            messages=messages,
+            prompt_token_ids=prompt_token_ids,
             sampling=sampling,
             return_=ReturnSpec.for_eval(return_token_ids=True),
         )
@@ -141,8 +151,6 @@ async def test_vllm_global_think_processor_triggers_at_very_small_max_think(
     should immediately start forcing the '</think>' sequence, so the closing
     tag should appear right at or very near the beginning of the completion.
     """
-    from transformers import AutoTokenizer
-
     interrupt_thinking = 1  # trigger almost immediately
 
     sampling = SamplingParams()
@@ -161,10 +169,11 @@ async def test_vllm_global_think_processor_triggers_at_very_small_max_think(
         },
     ]
 
-    resp, _ = await vllm_client.complete(
-        ChatCompletionRequest(
+    prompt_token_ids = build_prompt_token_ids(vllm_model_name, messages)
+    resp, _ = await vllm_client.complete_tokens(
+        TokenCompletionRequest(
             model=vllm_model_name,
-            messages=messages,
+            prompt_token_ids=prompt_token_ids,
             sampling=sampling,
             seed=123,
             return_=ReturnSpec.for_eval(return_token_ids=True),

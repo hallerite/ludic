@@ -15,7 +15,7 @@ from vllm.distributed.utils import StatelessProcessGroup
 
 from ludic.types import ChatResponse
 from ludic.inference.client import ChatClient
-from ludic.inference.request import ChatCompletionRequest, ToolRequest
+from ludic.inference.request import TokenCompletionRequest
 from ludic.inference.extensions import BackendExtensions, VLLMExtensions
 
 log = logging.getLogger(__name__)
@@ -118,48 +118,38 @@ class VLLMChatClient(ChatClient):
             pass
         return 0
 
-    # ---- ChatClient.complete ------------------------------------
+    # ---- ChatClient.complete_tokens ------------------------------------
 
-    async def complete(
+    async def complete_tokens(
         self,
-        request: ChatCompletionRequest,
+        request: TokenCompletionRequest,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
         """
-        High-level LLM invocation with vLLM extensions.
+        Complete from pre-tokenized prompt using the completions endpoint.
+
+        This bypasses vLLM's chat template application, giving full control
+        over tokenization for drift-free RL training.
+
+        Args:
+            request: TokenCompletionRequest with prompt_token_ids (prompt_text is optional).
 
         Returns:
-            (ChatResponse, info):
-                ChatResponse contains:
-                    .text
-                    .completion_token_ids (may be None)
-                    .prompt_token_ids (may be None)
-                    .completion_logprobs (may be None)
-                    .finish_reason
-                'info' contains raw transport details and args actually sent.
+            (ChatResponse, info): ChatResponse + transport metadata.
         """
+        if request.prompt_token_ids is None:
+            raise ValueError("TokenCompletionRequest.prompt_token_ids is required for complete_tokens().")
 
-        # Sampling → OpenAI kwargs
-        request_kwargs: Dict[str, Any] = dict(
-            model=request.model,
-            messages=request.messages,
-        )
+        # Build request for completions endpoint
+        request_kwargs: Dict[str, Any] = {
+            "model": request.model,
+            "prompt": list(request.prompt_token_ids),
+        }
         request_kwargs.update(request.sampling.to_openai_kwargs())
+
         if request.seed is not None:
             request_kwargs["seed"] = int(request.seed)
 
-        # Tools (OpenAI-style)
-        if request.tools is not None:
-            tools: ToolRequest = request.tools
-            request_kwargs["tools"] = tools.tools
-            if tools.tool_choice is not None:
-                request_kwargs["tool_choice"] = tools.tool_choice
-
-        # ----------------------------------------------------------
-        # vLLM-specific extensions live under `extra_body`:
-        #
-        #   - max_think        -> extra_body["vllm_xargs"]["max_think"]
-        #   - return_token_ids -> extra_body["return_token_ids"] = True
-        # ----------------------------------------------------------
+        # vLLM extensions
         extra_body: Dict[str, Any] = {}
 
         if request.extensions is not None:
@@ -170,9 +160,7 @@ class VLLMChatClient(ChatClient):
                         raise ValueError("VLLMExtensions.max_think must be a positive integer")
                 if ext.repetition_penalty <= 0:
                     raise ValueError("VLLMExtensions.repetition_penalty must be > 0")
-                # OpenAI's Python SDK rejects unknown kwargs (like repetition_penalty),
-                # so send vLLM/HF-only knobs via `extra_body` which is merged into the
-                # JSON request body.
+
                 extra_body["repetition_penalty"] = float(ext.repetition_penalty)
 
                 if ext.max_think is not None:
@@ -189,34 +177,47 @@ class VLLMChatClient(ChatClient):
                     f"{getattr(ext, 'kind', None)!r} (type={type(ext).__name__}); expected VLLMExtensions."
                 )
 
-        # Token IDs
-        if request.return_.return_token_ids:
-            extra_body["return_token_ids"] = True
+        # Token IDs - always request for token-in/token-out consistency
+        extra_body["return_token_ids"] = True
 
-        # Request chosen-token logprobs if asked.
-        # vLLM uses OpenAI-compatible shape where `logprobs` is an int (top-k).
+        # Request chosen-token logprobs if asked
         if request.return_.return_chosen_logprobs:
             request_kwargs["logprobs"] = int(max(1, request.return_.top_logprobs_k))
 
         if extra_body:
             request_kwargs["extra_body"] = extra_body
 
-        # ----------------------------------------------------------
-        # Perform inference
-        # ----------------------------------------------------------
-        resp = await self._async_client.chat.completions.create(**request_kwargs)
+        # Call completions endpoint (not chat completions)
+        resp = await self._async_client.completions.create(**request_kwargs)
 
         choice = resp.choices[0]
-        text = choice.message.content or ""
+        text = choice.text
         finish_reason = choice.finish_reason
 
-        # Extract token IDs if present
-        prompt_token_ids = getattr(resp, "prompt_token_ids", None)
+        # Extract token IDs (required for token-in/token-out)
+        returned_prompt_token_ids = getattr(resp, "prompt_token_ids", None)
         completion_token_ids = getattr(choice, "token_ids", None)
 
-        # Extract per-token logprobs if the server returned them. vLLM follows the
-        # OpenAI-compatible shape where `choice.logprobs.token_logprobs` carries the
-        # per-token values.
+        if completion_token_ids is None:
+            raise ValueError(
+                "vLLM did not return completion token IDs. "
+                "Token-in API requires token-out. Check vLLM version and configuration."
+            )
+
+        # Verify token alignment if we got prompt_token_ids back
+        if returned_prompt_token_ids is not None:
+            if list(returned_prompt_token_ids) != list(request.prompt_token_ids):
+                log.warning(
+                    "Token mismatch: vLLM returned different prompt_token_ids than expected. "
+                    "Expected %d tokens, got %d. This may indicate tokenizer inconsistency.",
+                    len(request.prompt_token_ids),
+                    len(returned_prompt_token_ids),
+                )
+
+        # Use our known prompt tokens for the response (canonical source)
+        prompt_token_ids = request.prompt_token_ids
+
+        # Extract per-token logprobs
         completion_logprobs = None
         logprobs_obj = getattr(choice, "logprobs", None)
         if logprobs_obj is not None:
@@ -227,7 +228,6 @@ class VLLMChatClient(ChatClient):
                     or logprobs_obj.get("logprobs")
                 )
             if token_logprobs is None and hasattr(logprobs_obj, "content"):
-                # OpenAI responses may nest token logprobs inside content entries.
                 parts = []
                 for part in getattr(logprobs_obj, "content", []):
                     lp = getattr(part, "logprob", None)
@@ -251,6 +251,7 @@ class VLLMChatClient(ChatClient):
         info: Dict[str, Any] = {
             "raw_response": resp.model_dump(exclude_none=True),
             "used_args": request_kwargs,
+            "mode": "token_in",
         }
 
         return chat_resp, info

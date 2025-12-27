@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
-from ludic.types import Message
 from ludic.inference.sampling import SamplingParams
 from ludic.inference.extensions.base import BackendExtensions
 
@@ -45,22 +44,39 @@ class ReturnSpec:
 
 @dataclass(frozen=True)
 class ToolRequest:
+    """
+    Tool schemas for chat template embedding.
+
+    In token-in mode, tools are embedded into the prompt via the chat template
+    (e.g., HuggingFace's apply_chat_template(tools=...)), not sent to the
+    server. The model outputs tool calls as text, which are then parsed by
+    a ToolParser.
+
+    Note: Unlike the old chat completions API, there is no `tool_choice`
+    parameter. Tool calling behavior is entirely prompt-driven.
+    """
+
     tools: List[Dict[str, Any]]
-    tool_choice: Optional[Union[str, Dict[str, Any]]] = "auto"
 
 
 @dataclass(frozen=True)
-class ChatCompletionRequest:
+class TokenCompletionRequest:
+    """
+    Pre-tokenized completion request.
+
+    Used when the caller has already applied the chat template and wants
+    to send raw token IDs to the model. This bypasses vLLM's internal
+    template application, giving full control over tokenization for
+    drift-free RL training.
+    """
+
     model: str
-    messages: List[Message]
+    prompt_token_ids: List[int]
+    prompt_text: Optional[str] = None  # For debugging/logging
     sampling: SamplingParams = field(default_factory=SamplingParams)
     return_: ReturnSpec = field(default_factory=ReturnSpec)
     seed: Optional[int] = None
-    tools: Optional[ToolRequest] = None
     extensions: Optional[BackendExtensions] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -69,7 +85,7 @@ class InferenceSpec:
     Per-step inference configuration (minus the prompt/messages).
 
     Protocols pass this through to agents; agents construct a
-    ChatCompletionRequest using their configured model and current messages.
+    TokenCompletionRequest by applying their chat template to the current messages.
     """
 
     sampling: SamplingParams = field(default_factory=SamplingParams)

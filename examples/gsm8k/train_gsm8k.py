@@ -26,7 +26,7 @@ from environments.gsm8k import GSM8KEnv
 
 from ludic.agent import Agent
 from ludic.context import FullDialog
-from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec
+from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec, HFChatTemplate
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import boxed_parser
 from ludic.distributed.adapters import create_vllm_publisher
@@ -135,6 +135,7 @@ def main():
     # Shared client for inference
     client = VLLMChatClient(host=args.host, port=args.port, enable_weight_updates=True)
     publisher = create_vllm_publisher(client)
+    chat_template = HFChatTemplate(tokenizer)
 
     # Registries
     env_registry = {"gsm8k": lambda sample: GSM8KEnv(sample=sample, system_prompt=args.system_prompt)}
@@ -146,6 +147,7 @@ def main():
                 model=args.model,
                 ctx=FullDialog(),
                 parser=boxed_parser,
+                chat_template=chat_template,
             )
         )
 

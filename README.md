@@ -71,6 +71,45 @@ If you care about truncation semantics (env time limits vs protocol cutoffs vs m
 
 - Rejection sampling (`examples/rejection_sampling.py`): generate rollouts, filter them, and write training-ready JSONL for offline training.
 
+## Token-in Inference (Drift-Free)
+
+Ludic applies chat templates locally and sends pre-tokenized prompts to the
+vLLM `/v1/completions` endpoint. This keeps training aligned to the exact tokens
+sampled by the model, eliminating drift between training and inference.
+
+Key points:
+- Agents require a `ChatTemplate` (see `ludic.inference.HFChatTemplate`).
+- Provide a shared tokenizer per process to avoid duplicated init costs.
+- Tool calling uses a text parser (e.g., `HermesToolParser`) to extract tool calls
+  from raw completions.
+- If you need explicit stop token IDs, set them via
+  `VLLMExtensions.extra_body_overrides` (e.g., `{"stop_token_ids": [...]}`).
+
+### Migration from chat completions API
+
+The library previously used vLLM's `/v1/chat/completions` endpoint. The new
+token-in API has breaking changes:
+
+| Old API | New API |
+|---------|---------|
+| `ChatClient.complete(ChatCompletionRequest)` | `ChatClient.complete_tokens(TokenCompletionRequest)` |
+| `ChatCompletionRequest(messages=...)` | `TokenCompletionRequest(prompt_token_ids=...)` |
+| `Agent(client, model, ctx, parser)` | `Agent(client, model, ctx, parser, chat_template)` |
+| `ToolRequest(tools, tool_choice="auto")` | `ToolRequest(tools)` - tool_choice removed |
+
+The `chat_template` parameter is now **required** on all agents. Create one with:
+
+```python
+from transformers import AutoTokenizer
+from ludic.inference import HFChatTemplate, HermesToolParser
+
+tokenizer = AutoTokenizer.from_pretrained("your-model")
+chat_template = HFChatTemplate(tokenizer)
+
+# For tool-calling agents:
+chat_template = HFChatTemplate(tokenizer, tool_parser=HermesToolParser())
+```
+
 ## Requirements
 
 - Python 3.12+
@@ -103,8 +142,6 @@ uv sync --extra examples
 - Add a classic Gym-style registry for agent harnesses, environments, and interaction protocols (so they don’t have to be built on the fly).
    - this will also allow us to create general eval and training scripts instead of hand-crafted ones
 - Use proper FSDP2 wrapping in the training scripts
-- Move to Token-In/Token-Out API
-	- we currently have a Token-Out API already
 
 ### Medium Priority
 
