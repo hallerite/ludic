@@ -3,10 +3,10 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ludic.agents.base_agent import Agent
-from ludic.inference.request import InferenceSpec, ReturnSpec, ToolRequest
+from ludic.inference.request import InferenceSpec, ToolRequest
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,6 @@ class ToolAgent(Agent):
       - Tool schema generation from python callables.
       - SamplingArgs augmentation to advertise tools to the model.
       - Execution + recording of tool calls into the ContextStrategy.
-      - Extraction of content/tool_calls from OpenAI raw_response info.
 
     Tool errors:
       - Missing tools, invalid JSON arguments, and tool exceptions are
@@ -30,40 +29,18 @@ class ToolAgent(Agent):
         super().__init__(**kwargs)
         self.tool_map: Dict[str, Callable] = {t.__name__: t for t in tools}
         self.tool_schemas: List[Dict[str, Any]] = [self._func_to_schema(t) for t in tools]
+        if self.tool_schemas and not self._chat_template.supports_tools():
+            raise ValueError(
+                "ToolAgent requires a chat_template with tool parsing support "
+                "(configure a ToolParser, e.g., HermesToolParser)."
+            )
 
     def _tool_request(self) -> ToolRequest:
-        return ToolRequest(tools=list(self.tool_schemas), tool_choice="auto")
+        return ToolRequest(tools=list(self.tool_schemas))
 
     def _with_tools(self, inference: Optional[InferenceSpec]) -> InferenceSpec:
-        """
-        Return an InferenceSpec suitable for tool calling.
-
-        Enforces `return_token_ids=True` so training can stay drift-free.
-        """
-        inf = inference or InferenceSpec()
-        if inf.return_.return_token_ids:
-            return inf
-        return InferenceSpec(
-            sampling=inf.sampling,
-            return_=ReturnSpec(
-                return_token_ids=True,
-                return_chosen_logprobs=inf.return_.return_chosen_logprobs,
-                top_logprobs_k=inf.return_.top_logprobs_k,
-            ),
-            extensions=inf.extensions,
-        )
-
-    def _extract_openai_message(
-        self, info: Dict[str, Any]
-    ) -> Tuple[Optional[str], Optional[List[Dict[str, Any]]]]:
-        """
-        Extract (content, tool_calls) from OpenAI/vLLM raw_response structure.
-        """
-        raw_choice = info["raw_response"]["choices"][0]
-        message_data = raw_choice["message"]
-        content = message_data.get("content")
-        tool_calls = message_data.get("tool_calls")
-        return content, tool_calls
+        """Return an InferenceSpec suitable for tool calling."""
+        return inference or InferenceSpec()
 
     def _run_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> None:
         """Execute tool calls and record results in context."""
@@ -97,11 +74,13 @@ class ToolAgent(Agent):
 
         for name, param in sig.parameters.items():
             p_type = "string"
-            if param.annotation == int:
+            # Handle both actual types and PEP 563 string annotations
+            ann = param.annotation
+            if ann in (int, "int"):
                 p_type = "integer"
-            elif param.annotation == float:
+            elif ann in (float, "float"):
                 p_type = "number"
-            elif param.annotation == bool:
+            elif ann in (bool, "bool"):
                 p_type = "boolean"
 
             params[name] = {"type": p_type}

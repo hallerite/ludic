@@ -13,7 +13,10 @@ from __future__ import annotations
 import argparse
 from typing import Dict, List
 
+from transformers import AutoTokenizer
+
 from ludic.inference import VLLMChatClient
+from ludic.inference import HFChatTemplate
 from ludic.parsers import compose_parsers, think_prefix_parser, xml_tag_parser
 from ludic.eval.core import run_eval_sync
 from ludic.training import (
@@ -92,6 +95,10 @@ def main() -> None:
 
     with maybe_start_vllm(args):
         client = VLLMChatClient(host=args.host, port=args.port, enable_weight_updates=False)
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        chat_template = HFChatTemplate(tokenizer)
         ctx_factory = (
             (lambda sp: TruncatedThinkingContext(system_prompt=sp))
             if ctx_choice == "truncated"
@@ -105,6 +112,7 @@ def main() -> None:
                 lambda _: xml_tag_parser("move", exact=True, success_reward=0.0, error_reward=-1.0)(_),
             ),
             env_registry={"tictactoe": lambda agent_starts=True: TicTacToeEnv(agent_starts=agent_starts)},
+            chat_template=chat_template,
             system_prompt=system_prompt,
             context_factory=ctx_factory,
             stop_on_parse_error=True,

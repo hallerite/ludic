@@ -6,7 +6,6 @@ from ludic.interaction.single_agent import SingleAgentSyncProtocol
 from ludic.interaction.multi_agent import MultiAgentProtocol
 from ludic.agents.base_agent import Agent
 from ludic.inference.client import ChatResponse
-from ludic.inference.request import ChatCompletionRequest
 from ludic.parsers import (
     ParseResult,
     xml_tag_parser,
@@ -16,7 +15,7 @@ from ludic.parsers import (
 )
 from ludic.types import StepOutcome, Info
 from ludic.envs.env import LudicEnv
-from tests._mocks import MockEnv, MockClient, MockAgent
+from tests._mocks import MockEnv, MockClient, MockAgent, MockChatTemplate
 
 
 # ---------------------------------------------------------------------
@@ -46,8 +45,12 @@ async def test_happy_path_terminates_immediately():
 @pytest.mark.asyncio
 async def test_truncation_when_agent_is_wrong():
     class WrongClient(MockClient):
-        async def complete(self, request: ChatCompletionRequest, **kwargs):
-            return ChatResponse(text="nope"), {"used_request": request.to_dict()}
+        async def complete_tokens(self, request, **kwargs):
+            return ChatResponse(
+                text="nope",
+                prompt_token_ids=request.prompt_token_ids,
+                completion_token_ids=[1, 2, 3],
+            ), {"mode": "token_in"}
 
     env = MockEnv(max_steps=2, target="1")
     agent = MockAgent(client=WrongClient())
@@ -94,7 +97,8 @@ async def test_run_episode_uses_action_parser_and_logs_parsed_action():
         client=MockClient(text=raw_llm_output),
         model="mock",
         ctx=FullDialog(),
-        parser=action_parser
+        parser=action_parser,
+        chat_template=MockChatTemplate(),
     )
     
     protocol = SingleAgentSyncProtocol(agent=agent)
@@ -336,6 +340,7 @@ async def test_single_agent_protocol_logs_parser_failure_without_env_step():
         model="mock",
         ctx=FullDialog(),
         parser=always_fail_parser,
+        chat_template=MockChatTemplate(),
     )
     protocol = SingleAgentSyncProtocol(agent=agent)
 

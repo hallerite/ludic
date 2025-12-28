@@ -5,10 +5,10 @@ from typing import Dict, Any, List
 import pytest
 import torch
 
-from ludic.training.loss import ClippedSurrogateLoss, TokenClippedSurrogateLoss
+from ludic.training.loss import ClippedSurrogateLoss, TokenClippedSurrogateLoss, CISPOLoss
 from ludic.training.batching.micro_batching import collate_saw_items
 from ludic.training.types import SAWItem, SAWBatch, ActorTokenLogps, SampleAttachments
-from ludic.training.algorithm import RLAlgorithm, validate_actor_logps, make_gspo, make_grpo
+from ludic.training.algorithm import RLAlgorithm, validate_actor_logps, make_gspo, make_grpo, make_cispo
 from ludic.training.credit_assignment import MonteCarloReturn
 
 
@@ -120,3 +120,36 @@ def test_gspo_and_grpo_presets_defaults():
     assert isinstance(grpo.loss, TokenClippedSurrogateLoss)
     assert grpo.loss.clip_eps_low == pytest.approx(0.2)
     assert grpo.loss.clip_eps_high == pytest.approx(0.27)
+
+
+def test_cispo_preset_defaults():
+    """Test make_cispo creates correct algorithm with paper defaults."""
+    cispo = make_cispo(group_size=4)
+
+    # Check algorithm metadata
+    assert cispo.name == "cispo"
+    assert cispo.preprocess is not None
+
+    # Check loss configuration
+    assert isinstance(cispo.loss, CISPOLoss)
+    assert cispo.loss.clip_eps_low == pytest.approx(1e6)  # Effectively no lower bound
+    assert cispo.loss.clip_eps_high == pytest.approx(0.2)
+    assert cispo.loss.length_normalize is True
+
+
+def test_cispo_preset_custom_params():
+    """Test make_cispo respects custom parameters."""
+    cispo = make_cispo(
+        group_size=8,
+        clip_eps_high=0.5,
+        clip_eps_low=0.1,
+        length_normalize=False,
+        positive_only=True,
+        name="custom_cispo",
+    )
+
+    assert cispo.name == "custom_cispo"
+    assert isinstance(cispo.loss, CISPOLoss)
+    assert cispo.loss.clip_eps_high == pytest.approx(0.5)
+    assert cispo.loss.clip_eps_low == pytest.approx(0.1)
+    assert cispo.loss.length_normalize is False

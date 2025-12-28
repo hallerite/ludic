@@ -55,17 +55,18 @@ class ChatResponse:
     """
     Normalized inference output for training/logging.
     Keep this minimal. Put transport/vendor junk in the returned `info` dict.
+
+    Token IDs are required for token-in/token-out API consistency.
     """
     text: str
-    completion_token_ids: Optional[List[int]] = None
+    prompt_token_ids: List[int]
+    completion_token_ids: List[int]
     completion_logprobs: Optional[List[float]] = None
     finish_reason: Optional[str] = None
-    prompt_token_ids: Optional[List[int]] = None
 
     def __post_init__(self) -> None:
         if (
-            self.completion_token_ids is not None
-            and self.completion_logprobs is not None
+            self.completion_logprobs is not None
             and len(self.completion_token_ids) != len(self.completion_logprobs)
         ):
             log.warning(
@@ -96,12 +97,10 @@ class ChatResponse:
         info.update(self.to_info())
         return info
 
-    def to_trace(self) -> Optional[TokenTrace]:
+    def to_trace(self) -> TokenTrace:
         """
-        Build a TokenTrace if the response includes token IDs.
+        Build a TokenTrace from this response.
         """
-        if self.prompt_token_ids is None or self.completion_token_ids is None:
-            return None
         return TokenTrace(
             prompt_token_ids=list(self.prompt_token_ids),
             completion_token_ids=list(self.completion_token_ids),

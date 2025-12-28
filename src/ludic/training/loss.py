@@ -35,9 +35,12 @@ class Loss(Protocol):
     """
     Generic loss: given model outputs (logits) and a collated batch, return
     (scalar_loss, stats).
+
+    Stats values must be scalar tensors (on the same device as logits) to enable
+    batched D2H transfer during aggregation. Use `tensor.detach()` not `float(...)`.
     """
 
-    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Tensor]]:
         ...
 
 # We define this as a standalone helper so torch.compile can cache it cleanly.
@@ -133,13 +136,23 @@ def compute_token_logp(
 @dataclass
 class ReinforceLoss:
     """
-    Vanilla REINFORCE:
+    REINFORCE with importance sampling correction:
 
-        loss = - E[ A * log π(a|s) ]
+        loss = - E[ sg(r) * A * log π(a|s) ]
 
-    where A is taken from `batch["weight"]`.
+    where:
+        - A is taken from `batch["weight"]`
+        - r = π_new(a|s) / π_old(a|s) is the IS ratio
+        - sg(·) is stop-gradient
+
+    The IS correction accounts for the fact that in LLM-RL we are always
+    slightly off-policy due to different inference vs training kernels.
+
+    Expects batch[old_logp_key] containing log π_old(a|s).
     """
+
     length_normalize: bool = False
+    old_logp_key: str = "old_logp_action"
 
     @jaxtyped(typechecker=typechecker)
     def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
@@ -147,17 +160,34 @@ class ReinforceLoss:
         action_mask = batch["action_mask"]        # [B, T]
         advantages = batch["weight"]              # [B]
 
+        if self.old_logp_key not in batch:
+            raise KeyError(f"ReinforceLoss requires '{self.old_logp_key}' in batch.")
+
         logp_action = compute_logp_action(
             logits, input_ids, action_mask, length_normalize=self.length_normalize
         )  # [B]
 
-        loss = - (advantages * logp_action).mean()
+        old_logp = batch[self.old_logp_key]  # [B]
+        if self.length_normalize:
+            lengths = action_mask[:, 1:].to(old_logp.dtype).sum(dim=-1).clamp(min=1.0)
+            old_logp = old_logp / lengths
+
+        log_ratio = logp_action - old_logp
+        ratio = torch.exp(log_ratio)
+        # KL approximation for stats: r - log(r) - 1
+        mismatch_kl = ratio - log_ratio - 1.0
+
+        # Stop-gradient on IS weight: gradient flows only through log π
+        loss = - (ratio.detach() * advantages * logp_action).mean()
 
         stats: Dict[str, Any] = {
-            "loss": float(loss.detach().cpu()),
-            "adv_mean": float(advantages.mean().detach().cpu()),
-            "adv_std": float(advantages.std(unbiased=False).detach().cpu()),
-            "logp_mean": float(logp_action.mean().detach().cpu()),
+            "loss": loss.detach(),
+            "adv_mean": advantages.mean().detach(),
+            "adv_std": advantages.std(unbiased=False).detach(),
+            "logp_mean": logp_action.mean().detach(),
+            "ratio_mean": ratio.mean().detach(),
+            "ratio_std": ratio.std(unbiased=False).detach(),
+            "kl_actor_policy": mismatch_kl.mean().detach(),
         }
         return loss, stats
 
@@ -222,10 +252,10 @@ class MaskedCausalLMCrossEntropyLoss:
         # Stats for parity with ReinforceLoss
         per_sample_logp = -per_sample_nll
         stats: Dict[str, Any] = {
-            "loss": float(loss.detach().cpu()),
-            "logp_mean": float(per_sample_logp.mean().detach().cpu()),
-            "nll_mean": float(per_sample_nll.mean().detach().cpu()),
-            "avg_action_tokens": float(token_counts.mean().detach().cpu()),
+            "loss": loss.detach(),
+            "logp_mean": per_sample_logp.mean().detach(),
+            "nll_mean": per_sample_nll.mean().detach(),
+            "avg_action_tokens": token_counts.mean().detach(),
         }
         return loss, stats
 
@@ -233,16 +263,22 @@ class MaskedCausalLMCrossEntropyLoss:
 @dataclass
 class ReinforceBaselineLoss:
     """
-    REINFORCE with batch-mean baseline:
+    REINFORCE with batch-mean baseline and importance sampling correction:
 
         A_i = adv_i - mean(adv)
-        loss = - E[ A_i * log π(a_i|s_i) ]
+        loss = - E[ sg(r) * A_i * log π(a_i|s_i) ]
 
-    where adv_i is batch["weight"].
+    where:
+        - adv_i is batch["weight"]
+        - r = π_new(a|s) / π_old(a|s) is the IS ratio
+        - sg(·) is stop-gradient
+
+    Expects batch[old_logp_key] containing log π_old(a|s).
     """
 
     normalize: bool = False
     length_normalize: bool = False
+    old_logp_key: str = "old_logp_action"
 
     @jaxtyped(typechecker=typechecker)
     def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
@@ -250,9 +286,21 @@ class ReinforceBaselineLoss:
         action_mask = batch["action_mask"]
         adv_raw = batch["weight"]                # [B]
 
+        if self.old_logp_key not in batch:
+            raise KeyError(f"ReinforceBaselineLoss requires '{self.old_logp_key}' in batch.")
+
         logp_action = compute_logp_action(
             logits, input_ids, action_mask, length_normalize=self.length_normalize
         )  # [B]
+
+        old_logp = batch[self.old_logp_key]  # [B]
+        if self.length_normalize:
+            lengths = action_mask[:, 1:].to(old_logp.dtype).sum(dim=-1).clamp(min=1.0)
+            old_logp = old_logp / lengths
+
+        log_ratio = logp_action - old_logp
+        ratio = torch.exp(log_ratio)
+        mismatch_kl = ratio - log_ratio - 1.0
 
         baseline = adv_raw.mean()
         advantages = adv_raw - baseline
@@ -261,14 +309,18 @@ class ReinforceBaselineLoss:
             std = advantages.std(unbiased=False)
             advantages = advantages / (std + 1e-8)
 
-        loss = - (advantages * logp_action).mean()
+        # Stop-gradient on IS weight
+        loss = - (ratio.detach() * advantages * logp_action).mean()
 
         stats: Dict[str, Any] = {
-            "loss": float(loss.detach().cpu()),
-            "baseline": float(baseline.detach().cpu()),
-            "adv_mean": float(advantages.mean().detach().cpu()),
-            "adv_std": float(advantages.std(unbiased=False).detach().cpu()),
-            "logp_mean": float(logp_action.mean().detach().cpu()),
+            "loss": loss.detach(),
+            "baseline": baseline.detach(),
+            "adv_mean": advantages.mean().detach(),
+            "adv_std": advantages.std(unbiased=False).detach(),
+            "logp_mean": logp_action.mean().detach(),
+            "ratio_mean": ratio.mean().detach(),
+            "ratio_std": ratio.std(unbiased=False).detach(),
+            "kl_actor_policy": mismatch_kl.mean().detach(),
         }
         return loss, stats
 
@@ -352,15 +404,133 @@ class ClippedSurrogateLoss:
             ratio_clip_frac = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
 
         stats = {
-            "loss": float(loss.detach().cpu()),
-            "ratio_mean": float(ratio.mean().detach().cpu()),
-            "ratio_std": float(ratio.std(unbiased=False).detach().cpu()),
-            "clip_frac": float(ppo_clip_frac.detach().cpu()),
-            "ratio_clip_frac": float(ratio_clip_frac.detach().cpu()),
-            "kl_actor_policy": float(mismatch_kl.mean().detach().cpu()),
-            "adv_mean": float(advantages.mean().detach().cpu()),
-            "adv_std": float(advantages.std(unbiased=False).detach().cpu()),
-            "logp_mean": float(logp_action.mean().detach().cpu()),
+            "loss": loss.detach(),
+            "ratio_mean": ratio.mean().detach(),
+            "ratio_std": ratio.std(unbiased=False).detach(),
+            "clip_frac": ppo_clip_frac.detach(),
+            "ratio_clip_frac": ratio_clip_frac.detach(),
+            "kl_actor_policy": mismatch_kl.mean().detach(),
+            "adv_mean": advantages.mean().detach(),
+            "adv_std": advantages.std(unbiased=False).detach(),
+            "logp_mean": logp_action.mean().detach(),
+        }
+        return loss, stats
+
+
+@dataclass
+class CISPOLoss:
+    """
+    CISPO (Clipped IS-weight Policy Optimization) loss.
+
+    Unlike PPO/GRPO which clip the policy update via the min operation,
+    CISPO clips the importance sampling weight itself and uses it as a
+    stop-gradient multiplier on the REINFORCE objective. This preserves
+    gradient contributions from all tokens, especially low-probability
+    tokens crucial for reflective reasoning (e.g., "However", "Recheck").
+
+    Loss:
+        L = - E[ sg(clip(r_t, 1-ε_low, 1+ε_high)) * A * log π(a_t|s_t) ]
+
+    Where:
+        - r_t = π_new(a_t|s_t) / π_old(a_t|s_t) is the importance sampling weight
+        - sg(·) is stop-gradient (weight does not receive gradients)
+        - A is the advantage (from batch["weight"])
+
+    Expects:
+        - batch["weight"]:       A (advantages)       [B]
+        - batch["actor_logps"]:  token logps under behavior policy [B, T]
+        - input_ids / attention_mask / action_mask for π_new.
+
+    Reference: MiniMax-M1 paper (arXiv:2506.13585)
+    """
+
+    clip_eps_low: float = 1e6  # Effectively no lower bound (paper setting)
+    clip_eps_high: float = 0.2
+    length_normalize: bool = True
+
+    def __post_init__(self) -> None:
+        if self.clip_eps_high < 0:
+            raise ValueError(f"clip_eps_high must be non-negative, got {self.clip_eps_high}")
+
+    @jaxtyped(typechecker=typechecker)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]
+        action_mask = batch["action_mask"]
+        advantages = batch["weight"]  # [B]
+
+        if "actor_logps" not in batch:
+            raise KeyError("CISPOLoss requires batch['actor_logps'] for importance sampling.")
+
+        actor_logps = batch["actor_logps"]  # [B, T]
+        if actor_logps.shape != input_ids.shape:
+            raise ValueError(
+                f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
+                f"{tuple(input_ids.shape)}."
+            )
+
+        # Compute token log probs under current policy
+        token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
+        token_mask = action_mask[:, 1:].to(token_logp.dtype)  # [B, T-1]
+        token_counts = token_mask.sum(dim=-1).clamp(min=1.0)  # [B]
+        actor_logps_shifted = actor_logps[:, 1:]  # [B, T-1]
+
+        # Compute importance sampling ratios
+        log_ratio = token_logp - actor_logps_shifted
+        ratio = torch.exp(log_ratio)
+
+        # CISPO: Clip the IS weight, not the update
+        clipped_ratio = torch.clamp(
+            ratio,
+            1.0 - self.clip_eps_low,
+            1.0 + self.clip_eps_high,
+        )
+
+        # Stop-gradient on the clipped IS weight
+        # The gradient only flows through log π, not through the IS weight
+        is_weight = clipped_ratio.detach()
+
+        # REINFORCE loss with IS weight correction
+        # L = - E[is_weight * A * log π]
+        adv = advantages.unsqueeze(-1)  # [B, 1]
+        weighted_logp = is_weight * adv * token_logp * token_mask  # [B, T-1]
+
+        per_sample_obj = weighted_logp.sum(dim=-1)  # [B]
+        if self.length_normalize:
+            per_sample_obj = per_sample_obj / token_counts
+
+        loss = -per_sample_obj.mean()
+
+        # Stats
+        mask = token_mask > 0
+        if mask.any():
+            ratio_vals = ratio.masked_select(mask)
+            ratio_mean = ratio_vals.mean()
+            ratio_std = ratio_vals.std(unbiased=False)
+            # Fraction of tokens where IS weight was clipped
+            clip_frac = (
+                (ratio_vals > 1.0 + self.clip_eps_high) |
+                (ratio_vals < 1.0 - self.clip_eps_low)
+            ).float().mean()
+            # KL approximation: r - log(r) - 1
+            token_kl = ratio_vals - log_ratio.masked_select(mask) - 1.0
+            mismatch_kl = token_kl.mean()
+        else:
+            ratio_mean = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            ratio_std = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            clip_frac = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            mismatch_kl = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+
+        logp_action = (token_logp * token_mask).sum(dim=-1)
+        stats: Dict[str, Any] = {
+            "loss": loss.detach(),
+            "ratio_mean": ratio_mean.detach(),
+            "ratio_std": ratio_std.detach(),
+            "clip_frac": clip_frac.detach(),
+            "kl_actor_policy": mismatch_kl.detach(),
+            "adv_mean": advantages.mean().detach(),
+            "adv_std": advantages.std(unbiased=False).detach(),
+            "logp_mean": logp_action.mean().detach(),
+            "avg_action_tokens": token_counts.mean().detach(),
         }
         return loss, stats
 
@@ -456,16 +626,16 @@ class TokenClippedSurrogateLoss:
 
         logp_action = (token_logp * token_mask).sum(dim=-1)
         stats: Dict[str, Any] = {
-            "loss": float(loss.detach().cpu()),
-            "ratio_mean": float(ratio_mean.detach().cpu()),
-            "ratio_std": float(ratio_std.detach().cpu()),
-            "clip_frac": float(ppo_clip_frac.detach().cpu()),
-            "ratio_clip_frac": float(ratio_clip_frac.detach().cpu()),
-            "kl_actor_policy": float(mismatch_kl.detach().cpu()),
-            "adv_mean": float(advantages.mean().detach().cpu()),
-            "adv_std": float(advantages.std(unbiased=False).detach().cpu()),
-            "logp_mean": float(logp_action.mean().detach().cpu()),
-            "avg_action_tokens": float(token_counts.mean().detach().cpu()),
+            "loss": loss.detach(),
+            "ratio_mean": ratio_mean.detach(),
+            "ratio_std": ratio_std.detach(),
+            "clip_frac": ppo_clip_frac.detach(),
+            "ratio_clip_frac": ratio_clip_frac.detach(),
+            "kl_actor_policy": mismatch_kl.detach(),
+            "adv_mean": advantages.mean().detach(),
+            "adv_std": advantages.std(unbiased=False).detach(),
+            "logp_mean": logp_action.mean().detach(),
+            "avg_action_tokens": token_counts.mean().detach(),
         }
         return loss, stats
 
@@ -516,9 +686,9 @@ class KLLoss:
         loss = self.coeff * kl.mean()
 
         stats: Dict[str, Any] = {
-            "loss": float(loss.detach().cpu()),
-            "kl_mean": float(kl.mean().detach().cpu()),
-            "kl_std": float(kl.std(unbiased=False).detach().cpu()),
+            "loss": loss.detach(),
+            "kl_mean": kl.mean().detach(),
+            "kl_std": kl.std(unbiased=False).detach(),
         }
         return loss, stats
 
@@ -561,8 +731,8 @@ class EntropyBonus:
         loss = -self.coeff * mean_entropy
 
         stats: Dict[str, Any] = {
-            "loss": float(loss.detach().cpu()),
-            "entropy_mean": float(mean_entropy.detach().cpu()),
+            "loss": loss.detach(),
+            "entropy_mean": mean_entropy.detach(),
         }
         return loss, stats
 
@@ -624,12 +794,12 @@ class CompositeLoss:
                 total_loss = total_loss + scaled_loss
 
             # per-term stats
-            stats[f"{term.name}/loss"] = float(raw_loss.detach().cpu())
+            stats[f"{term.name}/loss"] = raw_loss.detach()
             stats[f"{term.name}/weight"] = term.weight
             for k, v in term_stats.items():
                 stats[f"{term.name}/{k}"] = v
 
         assert total_loss is not None
-        stats["loss"] = float(total_loss.detach().cpu())
+        stats["loss"] = total_loss.detach()
 
         return total_loss, stats

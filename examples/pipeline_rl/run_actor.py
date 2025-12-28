@@ -1,10 +1,12 @@
 import logging
 import asyncio
 
+from transformers import AutoTokenizer
+
 # Ludic Imports
 from ludic.agent import Agent
 from ludic.context import FullDialog
-from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec
+from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec, HFChatTemplate
 from ludic.parsers import xml_tag_parser
 from ludic.training import (
     RolloutEngine,
@@ -30,7 +32,7 @@ QUEUE_KEY = "ludic_tictactoe_queue"
 
 logging.basicConfig(level=logging.INFO)
 
-def create_engine(client: VLLMChatClient) -> RolloutEngine:
+def create_engine(client: VLLMChatClient, chat_template: HFChatTemplate) -> RolloutEngine:
     """Setup the Environment and Agent logic."""
     
     # 1. Environment Registry
@@ -45,7 +47,8 @@ def create_engine(client: VLLMChatClient) -> RolloutEngine:
                 client=client, 
                 model=MODEL_NAME, 
                 ctx=FullDialog(system_prompt=training_prompt), 
-                parser=xml_tag_parser("move")
+                parser=xml_tag_parser("move"),
+                chat_template=chat_template,
             ),
             stop_on_parse_error=True,
         )
@@ -83,8 +86,12 @@ async def main():
     
     # Lightweight client (Inference only, no weight updates)
     client = VLLMChatClient(host=VLLM_HOST, port=VLLM_PORT)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    chat_template = HFChatTemplate(tokenizer)
     
-    engine = create_engine(client)
+    engine = create_engine(client, chat_template)
     credit_assigner = make_reinforce(gamma=0.99).credit_assigner
 
     # Run Infinite Generation Loop

@@ -307,27 +307,30 @@ class Trainer:
         if sum_reduce_vals:
             t_sum = torch.tensor(sum_reduce_vals, dtype=torch.float32, device=device)
             dist.all_reduce(t_sum, op=dist.ReduceOp.SUM)
-            for i, k in enumerate(sum_reduce_keys):
-                reduced[k] = float(t_sum[i].item())
+            sum_vals = t_sum.cpu().tolist()
+            for k, v in zip(sum_reduce_keys, sum_vals):
+                reduced[k] = v
 
         # Batch all_reduce for mean keys using sample-weighted sums.
         if mean_reduce_vals:
             t_mean = torch.tensor(mean_reduce_vals + [local_samples], dtype=torch.float32, device=device)
             dist.all_reduce(t_mean, op=dist.ReduceOp.SUM)
-            total_samples = float(t_mean[-1].item())
+            mean_vals = t_mean.cpu().tolist()
+            total_samples = mean_vals[-1]
             if has_num_samples:
                 denom = total_samples if total_samples > 0 else float(world_size)
             else:
                 denom = float(world_size)
-            for i, k in enumerate(mean_reduce_keys):
-                reduced[k] = float(t_mean[i].item()) / denom
+            for k, v in zip(mean_reduce_keys, mean_vals[:-1]):
+                reduced[k] = v / denom
 
         # Batch all_reduce for MAX keys (gpu stats)
         if gpu_vals:
             t_max = torch.tensor(gpu_vals, dtype=torch.float32, device=device)
             dist.all_reduce(t_max, op=dist.ReduceOp.MAX)
-            for i, k in enumerate(gpu_keys):
-                reduced[k] = float(t_max[i].item())
+            max_vals = t_max.cpu().tolist()
+            for k, v in zip(gpu_keys, max_vals):
+                reduced[k] = v
 
         # Preserve the local step counter
         reduced["train_step"] = float(self._train_step_idx)
@@ -388,15 +391,17 @@ class Trainer:
         forward_activation_peak = max(0, forward_peak - (pre_forward_alloc or 0))
         alloc_after_forward = torch.cuda.memory_allocated(device)
 
+        gpu_forward_peak_mb = forward_peak / mb
+        gpu_forward_activation_peak_mb = forward_activation_peak / mb
         stats = {
-            "gpu_forward_peak_mb": forward_peak / mb,
-            "gpu_forward_activation_peak_mb": forward_activation_peak / mb,
+            "gpu_forward_peak_mb": torch.tensor(gpu_forward_peak_mb, device=device),
+            "gpu_forward_activation_peak_mb": torch.tensor(gpu_forward_activation_peak_mb, device=device),
         }
 
         logger.info(
             "GPU forward memory (MB) peak/activation_peak: %.1f / %.1f",
-            stats["gpu_forward_peak_mb"],
-            stats["gpu_forward_activation_peak_mb"],
+            gpu_forward_peak_mb,
+            gpu_forward_activation_peak_mb,
         )
 
         # Reset for backward measurement
@@ -426,19 +431,23 @@ class Trainer:
         peak = torch.cuda.max_memory_allocated(device)
         backward_activation_peak = max(0, peak - (baseline_alloc or 0))
 
+        gpu_mem_alloc_mb = alloc / mb
+        gpu_mem_reserved_mb = reserved / mb
+        gpu_backward_peak_mb = peak / mb
+        gpu_backward_activation_peak_mb = backward_activation_peak / mb
         stats = {
-            "gpu_mem_alloc_mb": alloc / mb,
-            "gpu_mem_reserved_mb": reserved / mb,
-            "gpu_backward_peak_mb": peak / mb,
-            "gpu_backward_activation_peak_mb": backward_activation_peak / mb,
+            "gpu_mem_alloc_mb": torch.tensor(gpu_mem_alloc_mb, device=device),
+            "gpu_mem_reserved_mb": torch.tensor(gpu_mem_reserved_mb, device=device),
+            "gpu_backward_peak_mb": torch.tensor(gpu_backward_peak_mb, device=device),
+            "gpu_backward_activation_peak_mb": torch.tensor(gpu_backward_activation_peak_mb, device=device),
         }
 
         logger.info(
             "GPU backward memory (MB) alloc/reserved/peak/activation_peak: %.1f / %.1f / %.1f / %.1f",
-            stats["gpu_mem_alloc_mb"],
-            stats["gpu_mem_reserved_mb"],
-            stats["gpu_backward_peak_mb"],
-            stats["gpu_backward_activation_peak_mb"],
+            gpu_mem_alloc_mb,
+            gpu_mem_reserved_mb,
+            gpu_backward_peak_mb,
+            gpu_backward_activation_peak_mb,
         )
 
         return stats, peak
@@ -464,8 +473,9 @@ class Trainer:
         device = torch.device(self.cfg.model_device)
         micro_token_budget = int(self.cfg.micro_token_budget)
         max_seq_len = int(self.cfg.max_seq_len)
+        profile_memory = bool(self.cfg.profile_memory)
 
-        all_micro_stats: List[Dict[str, float]] = []
+        all_micro_stats: List[Dict[str, Tensor]] = []
         all_saw_batches: List[SAWBatch] = []
 
         # ---- 1) Fetch Macro-Batch ---------------------------------------
@@ -563,16 +573,19 @@ class Trainer:
                 grad_sync_disabled = True
 
             # ---- 2c) Loss + backward (scaled) --------------------------
-            pre_forward_alloc = self._reset_peak_memory(device)
+            pre_forward_alloc = self._reset_peak_memory(device) if profile_memory else None
             try:
                 loss, stats = self.algo.compute_loss(self.model, batch_tensors)
 
                 # Scale loss by micro-batch size to preserve macro-batch mean.
                 scaled_loss = loss * (item_count / total_items)
-                # Forward memory stats before backward frees activations
-                forward_mem_stats, alloc_after_forward, forward_peak = (
-                    self._capture_forward_memory_stats(device, pre_forward_alloc)
-                )
+                if profile_memory:
+                    # Forward memory stats before backward frees activations
+                    forward_mem_stats, alloc_after_forward, forward_peak = (
+                        self._capture_forward_memory_stats(device, pre_forward_alloc)
+                    )
+                else:
+                    forward_mem_stats, alloc_after_forward, forward_peak = {}, None, None
 
                 scaled_loss.backward()
             finally:
@@ -581,13 +594,16 @@ class Trainer:
 
             # Attach memory stats (if available) for logging/aggregation
             stats = dict(stats)
-            backward_mem_stats, backward_peak = self._collect_memory_stats(
-                device,
-                baseline_alloc=alloc_after_forward,
-            )
+            if profile_memory:
+                backward_mem_stats, backward_peak = self._collect_memory_stats(
+                    device,
+                    baseline_alloc=alloc_after_forward,
+                )
+            else:
+                backward_mem_stats, backward_peak = {}, None
 
             # Compute overall peak/activation across forward+backward
-            if forward_peak is not None or backward_peak is not None:
+            if profile_memory and (forward_peak is not None or backward_peak is not None):
                 mb = 1024 ** 2
                 total_peak = max(
                     forward_peak or 0,
@@ -595,8 +611,8 @@ class Trainer:
                 )
                 activation_total_peak = max(0, total_peak - (pre_forward_alloc or 0))
 
-                stats["gpu_mem_peak_mb"] = total_peak / mb
-                stats["gpu_activation_peak_mb"] = activation_total_peak / mb
+                stats["gpu_mem_peak_mb"] = torch.tensor(total_peak / mb, device=device)
+                stats["gpu_activation_peak_mb"] = torch.tensor(activation_total_peak / mb, device=device)
 
             stats.update(forward_mem_stats)
             stats.update(backward_mem_stats)
@@ -624,7 +640,21 @@ class Trainer:
         if self.sync_every_steps and self.publisher is not None and self._train_step_idx % self.sync_every_steps == 0:
             self._push_weights_to_runtime()
 
-        # ---- 7) Enrich stats -------------------------------------------
+        # ---- 7) Optional Checkpoint ------------------------------------
+        if self._checkpointer is not None:
+            self._checkpointer.maybe_save(
+                self.model,
+                optimizer=self.optimizer,
+                step=self._train_step_idx,
+                metadata={"algorithm": self.algo.name},
+            )
+
+        # ---- 8) Stats aggregation (skip on non-logging steps) ----------
+        log_every = self.cfg.log_every
+        if log_every > 1 and self._train_step_idx % log_every != 0:
+            # Skip expensive stats sync on non-logging steps
+            return {"train/step": float(self._train_step_idx)}
+
         final_stats = aggregate_stats(
             all_micro_stats,
             all_saw_batches,
@@ -637,16 +667,7 @@ class Trainer:
 
         final_stats = self._maybe_reduce_stats_across_ranks(final_stats, device=device)
 
-        # ---- 8) Optional Checkpoint ------------------------------------
-        if self._checkpointer is not None:
-            self._checkpointer.maybe_save(
-                self.model,
-                optimizer=self.optimizer,
-                step=self._train_step_idx,
-                metadata={"algorithm": self.algo.name},
-            )
-
-        # ---- 9) Optional logging ---------------------------------------
+        # ---- 9) Logging ------------------------------------------------
         grouped = self._group_log_stats(final_stats)
         self._last_train_stats = dict(grouped)
         log_stats = dict(grouped)

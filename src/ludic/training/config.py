@@ -62,6 +62,14 @@ class TrainerConfig:
           the per-rank stats dict before logging/returning it.
 
     ==========================
+    Logging / Profiling
+    ==========================
+
+    - profile_memory:
+          If True, capture CUDA peak-memory stats during forward/backward.
+          This adds device synchronizations and can slow training.
+
+    ==========================
     Evaluation
     ==========================
 
@@ -102,6 +110,8 @@ class TrainerConfig:
     # PipelineRL specific settings
     max_lag: Optional[int] = None  # Drop batches older than N steps
     reduce_stats_across_ranks: bool = False
+    profile_memory: bool = False
+    log_every: int = 1
 
     # ----- collation ------------------------------
     pad_token_id: int = 0
