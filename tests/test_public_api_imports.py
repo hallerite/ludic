@@ -3,7 +3,7 @@ from __future__ import annotations
 
 def test_top_level_exports_import() -> None:
     # Smoke test: examples should be able to avoid deep-importing internals.
-    from ludic.agent import Agent, ToolAgent, ReActAgent, ReToolAgent  # noqa: F401
+    from ludic.agent import Agent, ToolAgent, ReActAgent  # noqa: F401
     from ludic.agents import Agent as Agent2  # noqa: F401
     from ludic.context import ContextStrategy, FullDialog, TruncatedThinkingContext  # noqa: F401
     from ludic.envs import LudicEnv, SingleAgentEnv, DatasetQAEnv  # noqa: F401
