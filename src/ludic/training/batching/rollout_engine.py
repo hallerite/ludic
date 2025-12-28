@@ -333,6 +333,16 @@ class RolloutEngine:
                     "truncated": s.truncated,
                     "terminated": s.terminated,
                     "info": s.info,
+                    "trace": (
+                        {
+                            "prompt_token_ids": s.trace.prompt_token_ids,
+                            "completion_token_ids": s.trace.completion_token_ids,
+                            "completion_logprobs": s.trace.completion_logprobs,
+                            "finish_reason": s.trace.finish_reason,
+                        }
+                        if s.trace is not None
+                        else None
+                    ),
                     "ts_ns": s.ts_ns,
                 }
                 for s in rollout.steps
