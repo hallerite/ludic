@@ -92,6 +92,18 @@ class VLLMTeacherScorer:
 
     Computes teacher logprobs via teacher-forced prefill using
     the /v1/completions endpoint with echo=True and max_tokens=0.
+
+    Assumptions:
+        - Teacher and student use the SAME TOKENIZER. Token IDs from
+          the student are sent directly to the teacher. If tokenizers
+          differ, logprobs will be meaningless or the request will fail.
+        - The full sequence (prompt + completion) fits within the teacher's
+          context window. If the sequence exceeds the context limit, vLLM
+          may truncate and return fewer logprobs than completion tokens,
+          causing a length mismatch error during batch collation.
+
+    For models with different tokenizers, you would need a custom scorer
+    that re-tokenizes the text with the teacher's tokenizer.
     """
 
     base_url: str
@@ -159,9 +171,14 @@ def make_vllm_teacher_scorer(
     This is used for On-Policy Distillation (OPD) where a teacher model
     provides per-token supervision via teacher-forced prefill.
 
+    Important: The teacher model MUST use the same tokenizer as the student.
+    Token IDs are passed directly without re-tokenization. Also ensure the
+    full sequence (prompt + completion) fits within the teacher's context
+    window to avoid truncation errors.
+
     Args:
         base_url: vLLM server URL (e.g., "http://localhost:8001").
-        model: Teacher model name.
+        model: Teacher model name (must share tokenizer with student).
         name: Attachment key for scores (default: "teacher_logps").
         timeout: Request timeout in seconds.
 
