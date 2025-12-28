@@ -3,6 +3,9 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
+from functools import lru_cache
+
+from transformers import AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -13,7 +16,7 @@ from prime_rl.utils.pydantic_config import parse_argv
 from environments.tic_tac_toe import TicTacToeEnv
 from ludic.agent import Agent
 from ludic.context import FullDialog
-from ludic.inference import InferenceSpec, ReturnSpec, SamplingParams, VLLMChatClient
+from ludic.inference import HFChatTemplate, InferenceSpec, ReturnSpec, SamplingParams, VLLMChatClient
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import xml_tag_parser
 from ludic.training import (
@@ -36,6 +39,18 @@ env_registry = {
     "tictactoe_agent_starts": lambda **kw: TicTacToeEnv(agent_starts=True, **kw),
     "tictactoe_opp_starts": lambda **kw: TicTacToeEnv(agent_starts=False, **kw),
 }
+
+
+# Keep this aligned with the vLLM model loaded in inference.toml.
+MODEL_NAME = "hallerite/Qwen2.5-7B-TTT"
+
+
+@lru_cache(maxsize=1)
+def _get_chat_template(model_name: str) -> HFChatTemplate:
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    return HFChatTemplate(tokenizer)
 
 
 # -------------------------------------------------------------------------
@@ -62,9 +77,10 @@ def create_single_agent_protocol(**kwargs):
 
     agent = Agent(
         client=client,
-        model="Qwen/Qwen2.5-7B-Instruct",
+        model=MODEL_NAME,
         ctx=FullDialog(system_prompt=prompt),
         parser=xml_tag_parser("move", exact=True, success_reward=0.0, error_reward=-1.0),
+        chat_template=_get_chat_template(MODEL_NAME),
     )
 
     return SingleAgentSyncProtocol(agent=agent)
