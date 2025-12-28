@@ -250,7 +250,7 @@ def main():
             temperature=args.train_temperature,
             max_tokens=args.max_completion_tokens,
         ),
-        return_=ReturnSpec.for_eval(return_token_ids=True),
+        return_=ReturnSpec.for_rl(),
     )
     base_requests = args.rollouts_per_update // args.group_size
     base_requests_fn = build_requests_fn(rng, base_requests, train_inference, args.agent_starts_as)
