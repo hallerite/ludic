@@ -460,3 +460,159 @@ async def test_react_agent_no_tool_call_returns_immediately():
     act_result = await agent.act()
     assert act_result.final_step.parse_result.action == "42"
     assert client.call_count == 1  # Only one call needed
+
+
+# ---------------------------------------------------------------------
+# Env Tools Tests
+# ---------------------------------------------------------------------
+
+
+def move_tool(direction: str) -> str:
+    """Move in a direction (env tool - not executed by agent)."""
+    return f"moved {direction}"
+
+
+@pytest.mark.asyncio
+async def test_react_agent_env_tool_returns_immediately():
+    """
+    When an env tool is called, the agent should return immediately
+    with action_target='env' without executing the tool locally.
+    """
+    # Agent calls an env tool
+    step_1 = (
+        "I will move north.\n"
+        "<tool_call>\n"
+        '{"name": "move_tool", "arguments": {"direction": "north"}}\n'
+        "</tool_call>"
+    )
+
+    client = ReplayMockClient([step_1])
+    chat_template = MockChatTemplate(tool_parser=HermesToolParser())
+
+    agent = ReActAgent(
+        client=client,
+        model="mock",
+        ctx=FullDialog(),
+        parser=xml_tag_parser("move"),
+        internal_tools=[calculator_tool],  # calculator is internal
+        env_tools=[move_tool],             # move is env
+        chat_template=chat_template,
+        max_react_steps=3,
+    )
+
+    act_result = await agent.act()
+
+    # Should return immediately with one step
+    assert len(act_result.steps) == 1
+    step = act_result.steps[0]
+
+    # Step should target environment
+    assert step.action_target == "env"
+    assert step.tool_calls is not None
+    assert len(step.tool_calls) == 1
+    assert step.tool_calls[0]["function"]["name"] == "move_tool"
+
+    # Tool should NOT be executed (no tool_results for env tools)
+    assert step.tool_results is None
+
+    # Only one inference call (no loop continuation)
+    assert client.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_react_agent_internal_tool_continues_loop():
+    """
+    Internal tools should be executed and the loop should continue.
+    """
+    # Step 1: Internal tool call (calculator)
+    step_1 = (
+        "Let me calculate.\n"
+        "<tool_call>\n"
+        '{"name": "calculator_tool", "arguments": {"a": 2, "b": 3}}\n'
+        "</tool_call>"
+    )
+    # Step 2: Final answer
+    step_2 = "The answer is <move>5</move>"
+
+    client = ReplayMockClient([step_1, step_2])
+    chat_template = MockChatTemplate(tool_parser=HermesToolParser())
+
+    agent = ReActAgent(
+        client=client,
+        model="mock",
+        ctx=FullDialog(),
+        parser=xml_tag_parser("move"),
+        internal_tools=[calculator_tool],
+        env_tools=[move_tool],
+        chat_template=chat_template,
+        max_react_steps=3,
+    )
+
+    act_result = await agent.act()
+
+    # Should have two steps: internal tool + final answer
+    assert len(act_result.steps) == 2
+
+    # First step: internal tool (executed)
+    internal_step = act_result.steps[0]
+    assert internal_step.action_target == "internal"
+    assert internal_step.tool_calls is not None
+    assert internal_step.tool_results is not None
+    assert internal_step.tool_results[0]["content"] == "5"
+
+    # Second step: final answer
+    final_step = act_result.steps[1]
+    assert final_step.action_target == "env"
+    assert final_step.parse_result.action == "5"
+
+    # Two inference calls
+    assert client.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_react_agent_mixed_tool_calls_executes_internal_first():
+    """
+    When both internal and env tools are called together,
+    internal tools should be executed but env tools should not.
+    """
+    # Agent calls both calculator (internal) and move (env) in one turn
+    step_1 = (
+        "Calculating and moving.\n"
+        "<tool_call>\n"
+        '{"name": "calculator_tool", "arguments": {"a": 1, "b": 1}}\n'
+        "</tool_call>\n"
+        "<tool_call>\n"
+        '{"name": "move_tool", "arguments": {"direction": "east"}}\n'
+        "</tool_call>"
+    )
+
+    client = ReplayMockClient([step_1])
+    chat_template = MockChatTemplate(tool_parser=HermesToolParser())
+
+    agent = ReActAgent(
+        client=client,
+        model="mock",
+        ctx=FullDialog(),
+        parser=xml_tag_parser("move"),
+        internal_tools=[calculator_tool],
+        env_tools=[move_tool],
+        chat_template=chat_template,
+        max_react_steps=3,
+    )
+
+    act_result = await agent.act()
+
+    # Should return immediately (env tool present)
+    assert len(act_result.steps) == 1
+    step = act_result.steps[0]
+    assert step.action_target == "env"
+
+    # Both tool calls should be recorded
+    assert step.tool_calls is not None
+    assert len(step.tool_calls) == 2
+
+    # Only internal tool should have been executed
+    assert step.tool_results is not None
+    assert len(step.tool_results) == 1
+    assert step.tool_results[0]["tool_name"] == "calculator_tool"
+    assert step.tool_results[0]["content"] == "2"

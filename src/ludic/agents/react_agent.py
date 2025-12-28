@@ -23,13 +23,22 @@ class ReActAgent(ToolAgent):
     It supports an execution loop where the model can call auxiliary tools
     multiple times before emitting a final answer for the environment.
 
+    Tool Scopes:
+      - internal_tools: Executed by the agent (calculator, code interpreter).
+        Results are added to context and the agent continues reasoning.
+      - env_tools: Affect environment state (move, attack, submit).
+        NOT executed by agent - passed to environment.
+
     If the max_react_steps limit is reached, it forces a final generation
     attempt without tools to produce a valid environment action.
     """
 
     def __init__(
         self,
-        tools: List[Callable],
+        *,
+        tools: Optional[List[Callable]] = None,
+        internal_tools: Optional[List[Callable]] = None,
+        env_tools: Optional[List[Callable]] = None,
         max_react_steps: int = 5,
         tool_parse_error_penalty: float = -1.0,
         tool_parse_error_feedback: str = _DEFAULT_TOOL_PARSE_ERROR_OBS,
@@ -38,7 +47,9 @@ class ReActAgent(ToolAgent):
     ):
         """
         Args:
-            tools: List of python functions the agent can call.
+            tools: (Legacy) List of internal tools. Use internal_tools instead.
+            internal_tools: Tools executed by agent (results come back to agent).
+            env_tools: Tools that affect environment (passed to env, not executed).
             max_react_steps: Maximum number of internal think/tool loops.
             tool_parse_error_penalty: Reward penalty when tool call parsing fails.
             tool_parse_error_feedback: Feedback shown when tool call parsing fails.
@@ -46,7 +57,12 @@ class ReActAgent(ToolAgent):
                 after exhausting react steps.
             **kwargs: Passed to base Agent.
         """
-        super().__init__(tools=tools, **kwargs)
+        super().__init__(
+            tools=tools,
+            internal_tools=internal_tools,
+            env_tools=env_tools,
+            **kwargs,
+        )
         self.max_react_steps = max_react_steps
         self._tool_parse_error_penalty = tool_parse_error_penalty
         self._tool_parse_error_feedback = tool_parse_error_feedback
@@ -176,7 +192,28 @@ class ReActAgent(ToolAgent):
             self._ctx.add_assistant_step(content, tool_calls)
 
             if tool_calls:
-                # --- EXECUTION PHASE ---
+                # Check if any tool call targets an environment tool
+                if self.has_env_tool_call(tool_calls):
+                    # --- ENV TOOL PHASE ---
+                    # Don't execute locally - pass to environment
+                    # Execute any internal tools first (hybrid calls)
+                    tool_results = self._run_tool_calls(tool_calls, internal_only=True)
+                    steps.append(
+                        AgentActStep(
+                            prompt_messages=messages,
+                            action=raw_action,
+                            parse_result=parse_result,
+                            info=last_info,
+                            trace=token_trace,
+                            action_target="env",
+                            loop_index=step_i,
+                            tool_calls=tool_calls,
+                            tool_results=tool_results if tool_results else None,
+                        )
+                    )
+                    return AgentActResult(steps=steps)
+
+                # --- INTERNAL TOOL PHASE ---
                 tool_results = self._run_tool_calls(tool_calls)
                 steps.append(
                     AgentActStep(
