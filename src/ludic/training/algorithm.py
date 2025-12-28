@@ -481,10 +481,9 @@ def make_opd(
     Loss: ReverseKLLoss - minimizes KL(student || teacher) per token.
 
     Prerequisites:
-        - Rollouts must include teacher logprobs via one of:
-          - RolloutEngine.generate_batch(teacher_client=...)
-          - External post-processing that populates SAWItem.attachments.teacher_logps
-        - Collator must extract teacher_logps into batch["teacher_logps"]
+        - Agent must have a TokenLevelScorer with name="teacher_logps"
+        - Use make_vllm_teacher_scorer() to create the scorer
+        - Scorer runs during Agent.act() and scores flow through to training
 
     Args:
         kl_coeff: Coefficient for KL loss. Higher values push the student
@@ -495,22 +494,25 @@ def make_opd(
 
     Example:
         ```python
-        from ludic.training import RolloutBatchSource, Trainer, make_opd
-        from ludic.training.distillation import TinkerTeacherClient
+        from ludic.training import Trainer, make_opd
+        from ludic.training.scoring import make_vllm_teacher_scorer
+        from ludic.agent import Agent
 
-        # Create teacher client
-        teacher = TinkerTeacherClient(sampling_client=teacher_sampling_client)
+        # Create teacher scorer
+        teacher_scorer = make_vllm_teacher_scorer(
+            base_url="http://localhost:8001",
+            model="Qwen/Qwen3-32B",
+        )
 
-        # Create batch source with teacher
-        batch_source = RolloutBatchSource(
-            engine=engine,
-            make_requests=make_requests_fn,
-            credit_assigner=make_opd().credit_assigner,
-            teacher_client=teacher,
+        # Attach to agent - scores flow through automatically
+        agent = Agent(
+            client=client,
+            ...,
+            scorers=[teacher_scorer],
         )
 
         # Train with OPD
-        trainer = Trainer(model=model, algorithm=make_opd(), ...)
+        trainer = Trainer(model=model, algo=make_opd(), ...)
         ```
 
     Reference: https://thinkingmachines.ai/blog/on-policy-distillation
