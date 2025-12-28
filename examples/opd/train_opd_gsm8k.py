@@ -96,9 +96,9 @@ def main():
     parser = argparse.ArgumentParser(description="OPD training on GSM8K")
 
     # Model configuration
-    parser.add_argument("--student-model", default="Qwen/Qwen3-8B-Base",
+    parser.add_argument("--student-model", default="Qwen/Qwen2.5-0.5B-Instruct",
                         help="Student model name/path")
-    parser.add_argument("--teacher-model", default="Qwen/Qwen3-32B",
+    parser.add_argument("--teacher-model", default="Qwen/Qwen2.5-7B-Instruct",
                         help="Teacher model name/path")
 
     # vLLM server configuration

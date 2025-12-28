@@ -188,7 +188,7 @@ def make_vllm_teacher_scorer(
     Example:
         >>> teacher = make_vllm_teacher_scorer(
         ...     base_url="http://localhost:8001",
-        ...     model="Qwen/Qwen3-32B",
+        ...     model="Qwen/Qwen2.5-7B-Instruct",
         ... )
         >>> agent = Agent(client=client, ..., scorers=[teacher])
     """
