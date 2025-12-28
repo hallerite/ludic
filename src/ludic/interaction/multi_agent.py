@@ -135,12 +135,13 @@ class MultiAgentProtocol(InteractionProtocol):
                 prev_obs = current_obs.get(agent_id, "")
                 for act_step in act_result.steps:
                     parse_result = act_step.parse_result
-                    parse_error = parse_result.action is None
+                    # parse_result is None for external tool calls (not final actions)
+                    parse_error = parse_result is not None and parse_result.action is None
                     extra_info = {
                         "parse_error": parse_error,
                         "action_target": act_step.action_target,
                     }
-                    if parse_error and parse_result.obs is not None:
+                    if parse_error and parse_result is not None and parse_result.obs is not None:
                         extra_info["parse_feedback_obs"] = parse_result.obs
                     if act_step.tool_calls is not None:
                         extra_info["tool_calls"] = act_step.tool_calls
@@ -150,7 +151,7 @@ class MultiAgentProtocol(InteractionProtocol):
                         client_info=act_step.info,
                         extra=extra_info,
                     )
-                    parser_reward = float(parse_result.reward)
+                    parser_reward = float(parse_result.reward) if parse_result else 0.0
                     agent_reward, agent_reward_components, _, _ = split_parser_reward(
                         parser_reward=parser_reward,
                         action_target=act_step.action_target,
