@@ -23,7 +23,7 @@ from tinker_cookbook.utils import ml_log
 from environments.tic_tac_toe import TicTacToeEnv
 from integrations.tinker import TinkerChatClient, rollouts_to_datums
 from ludic.agent import Agent
-from ludic.context import FullDialog, TruncatedThinkingContext
+from ludic.context import FullDialog
 from ludic.eval import run_eval
 from ludic.inference import InferenceSpec, SamplingParams, ReturnSpec
 from ludic.interaction import SingleAgentSyncProtocol
@@ -178,16 +178,14 @@ async def run_training(args: argparse.Namespace) -> None:
     )
 
     def protocol_factory():
-        if args.ctx == "truncated":
-            ctx = TruncatedThinkingContext(system_prompt=system_prompt)
-        else:
-            ctx = FullDialog(system_prompt=system_prompt)
+        ctx = FullDialog(system_prompt=system_prompt)
+        parser = TICTACTOE_PARSER
         return SingleAgentSyncProtocol(
             agent=Agent(
                 client=tinker_client,
                 model=args.model,
                 ctx=ctx,
-                parser=TICTACTOE_PARSER,
+                parser=parser,
             ),
             stop_on_parse_error=True,
         )
@@ -450,7 +448,6 @@ def main() -> None:
     parser.add_argument("--eval-temperature", type=float, default=0.7)
     parser.add_argument("--rollout-log", default="tictactoe_train_rollouts_tinker.jsonl")
     parser.add_argument("--max-completion-tokens", type=int, default=512)
-    parser.add_argument("--ctx", choices=["full", "truncated"], default="full")
     parser.add_argument("--positive-only", action="store_true", default=False)
     parser.add_argument("--normalize-adv", action="store_true", default=True)
     parser.add_argument("--learning-rate", type=float, default=5e-5)
