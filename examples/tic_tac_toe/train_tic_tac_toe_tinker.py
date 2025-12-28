@@ -455,7 +455,7 @@ def main() -> None:
     parser.add_argument("--normalize-adv", action="store_true", default=True)
     parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--loss-fn", default="cispo")
-    parser.add_argument("--log-path", default="/tmp/ludic-ttt-tinker")
+    parser.add_argument("--log-path", default="ludic-ttt-tinker")
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--save-kind", choices=["state", "sampler", "both"], default="both")
     parser.add_argument("--final-save", action="store_true", default=False)

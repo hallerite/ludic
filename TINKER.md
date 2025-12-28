@@ -22,6 +22,19 @@ Tinker performs sampling + optimization.
 6) Refresh sampling client via `save_weights_and_get_sampling_client(...)` and
    update `TinkerChatClient` so next rollouts are strictly on-policy.
 
+## Quickstart (Tic-Tac-Toe)
+
+Set your Tinker API key (and optionally W&B), then run the example:
+
+```bash
+TINKER_API_KEY=... WANDB_API_KEY=... PYTHONPATH=. uv run python \
+  examples/tic_tac_toe/train_tic_tac_toe_tinker.py \
+  --train-steps 20 \
+  --wandb-name ttt-tinker
+```
+
+Use `--base-url` to target a non-default Tinker service endpoint.
+
 ## Integration Surface
 
 ```

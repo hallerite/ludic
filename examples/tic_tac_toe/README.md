@@ -42,6 +42,19 @@ PYTHONPATH=. uv run python examples/tic_tac_toe/eval_tic_tac_toe_vllm.py \
 ```
 - Reports win/loss/draw/illegal/parse-error rates; writes `tictactoe_eval.jsonl` by default.
 
+## Tinker Backend (Serverless RL)
+
+Run the Tinker-backed training loop (no local vLLM required):
+
+```bash
+TINKER_API_KEY=... WANDB_API_KEY=... PYTHONPATH=. uv run python \
+  examples/tic_tac_toe/train_tic_tac_toe_tinker.py \
+  --train-steps 20 \
+  --wandb-name ttt-tinker
+```
+
+Use `--base-url` if you need to point at a custom Tinker endpoint.
+
 ### Using a LoRA adapter with vLLM
 If your policy is a LoRA adapter (for example `hallerite/Qwen2.5-7B-TTT-RL`), start vLLM with the base model and load the adapter explicitly. The `--start-server` helper does not pass LoRA flags, so launch the server yourself:
 ```bash
