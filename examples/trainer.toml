@@ -1,22 +1,19 @@
 # trainer.toml
 # IMPORTANT: keep this output_dir in sync with orchestrator.toml and inference.toml
-output_dir = "./runs/tictactoe_lora_run"
+output_dir = "checkpoints_tictactoe"
 
 [model]
-name = "Qwen/Qwen2.5-7B-Instruct"
+name = "hallerite/Qwen2.5-7B-TTT"
 
 [model.experimental.lora]
 rank = 8
 alpha = 16
-dropout = 0.05
-target_modules = [
-    "q_proj", "k_proj", "v_proj", "o_proj",
-    "gate_proj", "up_proj", "down_proj"
-]
+dropout = 0.0
+target_modules = "all-linear"
 
 [optim]
-lr = 1e-5
-weight_decay = 0.01
+lr = 5e-5
+weight_decay = 0.0
 
 [ckpt]
 interval = 10

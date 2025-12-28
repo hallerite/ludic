@@ -8,7 +8,6 @@ from pydantic import Field
 from prime_rl.orchestrator.config import OrchestratorConfig as PrimeOrchestratorConfig
 from prime_rl.transport import TrainingBatch, TrainingSample, setup_training_batch_sender
 from prime_rl.utils.client import (
-    setup_clients,
     setup_admin_clients,
     check_health,
     update_weights,
@@ -28,7 +27,7 @@ from ludic.training.types import SAWBatch, BatchSource
 
 
 # ---------------------------------------------------------------------------
-# 1. Configuration Bridge
+# Configuration bridge
 # ---------------------------------------------------------------------------
 
 class LudicConfig(PrimeOrchestratorConfig):
@@ -61,17 +60,14 @@ class LudicConfig(PrimeOrchestratorConfig):
         default=None,
     )
 
-    # You can still override defaults like batch_size here if desired
-    batch_size: int = 128
-
 
 # ---------------------------------------------------------------------------
-# 2. Data Sink (The Converter)
+# Training batch sender
 # ---------------------------------------------------------------------------
 
 class PrimeRLBatchSender:
     """
-    Converts Ludic SAWBatches (in-memory) to Prime-RL TrainingBatch (transport).
+    Converts Ludic SAWBatches (in-memory) into Prime-RL TrainingBatch payloads.
     """
 
     def __init__(
@@ -111,12 +107,9 @@ class PrimeRLBatchSender:
                 if isinstance(meta_logprobs, list):
                     completion_logprobs = list(meta_logprobs)
 
-            # Padding/Truncation safety for logprobs
+            # Pad with 0.0 if missing to keep lengths aligned.
             if len(completion_logprobs) < len(completion_ids):
-                # Pad with 0.0 if missing (prevents crash; watch data quality)
-                completion_logprobs += [0.0] * (
-                    len(completion_ids) - len(completion_logprobs)
-                )
+                completion_logprobs += [0.0] * (len(completion_ids) - len(completion_logprobs))
 
             train_examples.append(
                 TrainingSample(
@@ -142,7 +135,7 @@ class PrimeRLBatchSender:
 
 
 # ---------------------------------------------------------------------------
-# 3. The Ludic–Prime Orchestrator
+# Ludic–Prime orchestrator bridge
 # ---------------------------------------------------------------------------
 
 class PrimeOrchestrator:
@@ -163,8 +156,7 @@ class PrimeOrchestrator:
             raise ValueError("PrimeOrchestrator requires a BatchSource instance.")
         self.batch_source = batch_source
 
-        # 1. Setup infrastructure clients (Prime-RL native)
-        self.clients = setup_clients(config.client)
+        # 1. Setup admin clients for health checks + weight updates
         self.admin_clients = setup_admin_clients(config.client)
 
         # 2. Setup TrainingBatch sender (Prime transport)

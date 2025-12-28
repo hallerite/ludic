@@ -19,7 +19,7 @@ from ludic.training import (
     RolloutEngine,
     RolloutRequest,
 )
-from ludic.training.prime_rl import LudicConfig, PrimeOrchestrator
+from integrations.prime_rl import LudicConfig, PrimeOrchestrator
 
 
 # -------------------------------------------------------------------------

@@ -2,9 +2,9 @@
 
 # --- General Settings ---
 # IMPORTANT: keep this output_dir in sync with trainer.toml and inference.toml
-output_dir = "./runs/tictactoe_lora_run"
+output_dir = "checkpoints_tictactoe"
 num_train_workers = 1
-max_steps = 20
+max_steps = 30
 
 # --- Ludic Specifics ---
 env_kind = "tictactoe_agent_starts"
@@ -13,8 +13,8 @@ max_steps_per_episode = 5
 rollout_concurrency = 64
 
 # GRPO / Batch Settings
-batch_size = 128
-rollouts_per_example = 1
+batch_size = 8
+rollouts_per_example = 8
 seq_len = 1024
 
 # --- Inference Infrastructure (The vLLM Server) ---
@@ -26,5 +26,5 @@ type = "filesystem"
 
 # --- Sampling Parameters ---
 [sampling]
-temperature = 0.8      # High temp for exploration in RL
-max_tokens = 100
+temperature = 1.0      # High temp for exploration in RL
+max_tokens = 512
