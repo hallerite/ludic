@@ -738,6 +738,91 @@ class EntropyBonus:
 
 
 # ---------------------------------------------------------------------------
+# On-Policy Distillation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ReverseKLLoss:
+    """
+    On-Policy Distillation loss: per-token reverse KL from student to teacher.
+
+    Loss = E[ log π_student(a_t|s_t) - log π_teacher(a_t|s_t) ]
+
+    This pushes the student to match the teacher's distribution on the
+    student's own samples (on-policy). The loss is minimized when the student
+    assigns the same probability as the teacher to each token.
+
+    Key insight: Unlike forward KL which mode-covers, reverse KL is mode-seeking.
+    The student learns to approximate one specific behavior (the teacher's)
+    rather than spreading across all plausible behaviors.
+
+    Expects:
+        - batch["input_ids"]: [B, T] tokenized sequences
+        - batch["action_mask"]: [B, T] mask for completion tokens
+        - batch["teacher_logps"]: [B, T] per-token teacher logprobs
+
+    Reference: https://thinkingmachines.ai/blog/on-policy-distillation
+    """
+
+    coeff: float = 1.0
+    length_normalize: bool = False
+
+    @jaxtyped(typechecker=typechecker)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        if "teacher_logps" not in batch:
+            raise KeyError(
+                "ReverseKLLoss requires batch['teacher_logps']. "
+                "Ensure teacher logprobs are computed during rollout generation "
+                "(e.g., via RolloutEngine with teacher_client parameter)."
+            )
+
+        input_ids = batch["input_ids"]
+        action_mask = batch["action_mask"]
+        teacher_logps = batch["teacher_logps"]
+
+        # Current policy logprobs: [B, T-1]
+        token_logp = compute_token_logp(logits, input_ids)
+
+        # Shift teacher logps to align with predictions
+        # teacher_logps[t] is logprob of token t, but we predict token t from t-1
+        teacher_logps_shifted = teacher_logps[:, 1:]  # [B, T-1]
+        token_mask = action_mask[:, 1:].to(token_logp.dtype)  # [B, T-1]
+        token_counts = token_mask.sum(dim=-1).clamp(min=1.0)  # [B]
+
+        # Reverse KL: log(student) - log(teacher)
+        # Positive when student is more confident than teacher on a token
+        # Negative when teacher is more confident
+        reverse_kl = token_logp - teacher_logps_shifted
+
+        # Masked sum over tokens
+        per_sample_kl = (reverse_kl * token_mask).sum(dim=-1)  # [B]
+
+        if self.length_normalize:
+            per_sample_kl = per_sample_kl / token_counts
+
+        loss = self.coeff * per_sample_kl.mean()
+
+        # Stats - compute over masked tokens only
+        mask = token_mask > 0
+        if mask.any():
+            masked_kl = reverse_kl.masked_select(mask)
+            kl_mean = masked_kl.mean()
+            kl_std = masked_kl.std(unbiased=False)
+        else:
+            kl_mean = loss.new_zeros(())
+            kl_std = loss.new_zeros(())
+
+        stats: Dict[str, Any] = {
+            "loss": loss.detach(),
+            "reverse_kl_mean": kl_mean.detach(),
+            "reverse_kl_std": kl_std.detach(),
+            "avg_action_tokens": token_counts.mean().detach(),
+        }
+        return loss, stats
+
+
+# ---------------------------------------------------------------------------
 # Composite loss
 # ---------------------------------------------------------------------------
 

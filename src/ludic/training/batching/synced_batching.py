@@ -18,6 +18,10 @@ class RolloutBatchSource(BatchSource):
 
     Note: RolloutEngine now concatenates each agent turn into a single training
     sample (one SAWItem per turn), rather than emitting per-step samples.
+
+    For on-policy distillation (OPD), configure the Agent with a TokenLevelScorer
+    (e.g., make_vllm_teacher_scorer). The scorer computes teacher logprobs during
+    Agent.act() and they flow through to SAWItem.attachments.teacher_logps.
     """
 
     def __init__(

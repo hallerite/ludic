@@ -127,6 +127,27 @@ class ActorTokenLogps:
             raise TypeError("ActorTokenLogps.token_logps must be a List[float].")
 
 
+@dataclass(frozen=True)
+class TeacherLogprobs:
+    """
+    Per-token logprobs from a teacher model, used for on-policy distillation.
+
+    `token_logps[i]` corresponds to the teacher's logprob for the chosen token
+    at completion position i. This is computed by querying the teacher model
+    on the student's sampled tokens.
+
+    Reference: https://thinkingmachines.ai/blog/on-policy-distillation
+    """
+
+    token_logps: List[float]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.token_logps, list) or not all(
+            isinstance(v, (int, float)) for v in self.token_logps
+        ):
+            raise TypeError("TeacherLogprobs.token_logps must be a List[float].")
+
+
 @dataclass
 class SampleAttachments:
     """
@@ -137,6 +158,7 @@ class SampleAttachments:
     """
 
     actor_logps: Optional[ActorTokenLogps] = None
+    teacher_logps: Optional[TeacherLogprobs] = None
 
 
 class HasActorLogps(Protocol):
@@ -185,6 +207,10 @@ class SAWItem:
     @property
     def actor_logps(self) -> Optional[ActorTokenLogps]:
         return self.attachments.actor_logps
+
+    @property
+    def teacher_logps(self) -> Optional[TeacherLogprobs]:
+        return self.attachments.teacher_logps
 
 @dataclass
 class SAWBatch:

@@ -184,6 +184,7 @@ class AgentStep:
     parent_id: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_results: Optional[List[Dict[str, Any]]] = None
+    intrinsic_scores: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class EnvironmentStep:

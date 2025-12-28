@@ -26,6 +26,7 @@ from .algorithm import (
     make_gspo,
     make_cispo,
     make_sft,
+    make_opd,
 )
 from .credit_assignment import (
     GroupNormalizedReturn,
@@ -42,6 +43,7 @@ from .loss import (
     TokenClippedSurrogateLoss,
     CISPOLoss,
     KLLoss,
+    ReverseKLLoss,
     EntropyBonus,
     LossTerm,
     CompositeLoss,
@@ -84,6 +86,7 @@ __all__ = [
     "make_gspo",
     "make_cispo",
     "make_sft",
+    "make_opd",
     # Credit assignment
     "GroupNormalizedReturn",
     "MonteCarloReturn",
@@ -98,6 +101,7 @@ __all__ = [
     "TokenClippedSurrogateLoss",
     "CISPOLoss",
     "KLLoss",
+    "ReverseKLLoss",
     "EntropyBonus",
     "LossTerm",
     "CompositeLoss",

@@ -6,7 +6,7 @@ from typing import Dict, List
 import torch
 from torch import Tensor
 
-from ludic.training.types import SAWItem, ActorTokenLogps, SampleAttachments
+from ludic.training.types import SAWItem, ActorTokenLogps, TeacherLogprobs, SampleAttachments
 
 
 @dataclass(frozen=True)
@@ -95,6 +95,28 @@ def collate_saw_items(
 
         batch["actor_logps"] = actor_logps_batch
         batch["old_logp_action"] = old_logp_action
+
+    # teacher_logps is optional; required for on-policy distillation (OPD).
+    teachers = [it.teacher_logps for it in items]
+    if any(teacher is not None for teacher in teachers):
+        if any(teacher is None for teacher in teachers):
+            raise ValueError(
+                "Mixed presence of teacher_logps; either provide it for all samples or none."
+            )
+        teacher_logps_batch = torch.zeros((batch_size, max_len), dtype=torch.float32, device=device)
+        for b, (it, teacher) in enumerate(zip(items, teachers)):
+            assert teacher is not None
+            token_logps = torch.as_tensor(teacher.token_logps, dtype=torch.float32, device=device)
+            positions = torch.nonzero(action_mask[b] > 0.0, as_tuple=False).flatten()
+            if token_logps.numel() != positions.numel():
+                raise ValueError(
+                    f"Length mismatch between teacher_logps ({token_logps.numel()}) "
+                    f"and the number of action tokens ({positions.numel()})."
+                )
+            teacher_logps_batch[b, positions] = token_logps
+
+        batch["teacher_logps"] = teacher_logps_batch
+
     return batch
 
 
@@ -112,9 +134,20 @@ def _truncate_item(item: SAWItem, max_seq_len: int) -> SAWItem:
     prompt_tokens = len(input_ids) - action_tokens
 
     attachments = item.attachments
+    new_actor_logps = None
+    new_teacher_logps = None
     if attachments.actor_logps is not None:
-        token_logps = attachments.actor_logps.token_logps[:action_tokens]
-        attachments = SampleAttachments(actor_logps=ActorTokenLogps(token_logps=token_logps))
+        new_actor_logps = ActorTokenLogps(
+            token_logps=attachments.actor_logps.token_logps[:action_tokens]
+        )
+    if attachments.teacher_logps is not None:
+        new_teacher_logps = TeacherLogprobs(
+            token_logps=attachments.teacher_logps.token_logps[:action_tokens]
+        )
+    attachments = SampleAttachments(
+        actor_logps=new_actor_logps,
+        teacher_logps=new_teacher_logps,
+    )
 
     meta = dict(item.meta)
     meta["seq_len_truncated"] = True

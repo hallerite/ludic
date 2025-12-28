@@ -15,6 +15,7 @@ from ludic.training.loss import (
     TokenClippedSurrogateLoss,
     CISPOLoss,
     MaskedCausalLMCrossEntropyLoss,
+    ReverseKLLoss,
 )
 from ludic.training.credit_assignment import MonteCarloReturn, GroupNormalizedReturn, ConstantCredit
 
@@ -444,6 +445,78 @@ def make_sft(
     credit_assigner: CreditAssigner = ConstantCredit(value=1.0)
     # Use standard token-level CE over the action region for stability.
     loss: Loss = MaskedCausalLMCrossEntropyLoss(length_normalize=length_normalize)
+
+    return RLAlgorithm(
+        name=name,
+        credit_assigner=credit_assigner,
+        loss=loss,
+    )
+
+
+# ---------------------------------------------------------------------------
+# On-Policy Distillation (OPD)
+# ---------------------------------------------------------------------------
+
+
+def make_opd(
+    *,
+    kl_coeff: float = 1.0,
+    length_normalize: bool = False,
+    name: str = "opd",
+) -> RLAlgorithm:
+    """
+    On-Policy Distillation (OPD).
+
+    Dense per-token supervision from a teacher model. The student samples
+    trajectories, teacher provides logprobs, and training minimizes reverse KL.
+
+    Core idea: Sample from student, grade each token with teacher logprobs.
+    This combines on-policy learning (samples from student) with dense
+    supervision (per-token teacher signal), achieving better compute
+    efficiency than sparse RL rewards.
+
+    Credit assignment: ConstantCredit(1.0) - the per-step "advantage" is
+    implicit in the loss (negative reverse KL per token).
+
+    Loss: ReverseKLLoss - minimizes KL(student || teacher) per token.
+
+    Prerequisites:
+        - Rollouts must include teacher logprobs via one of:
+          - RolloutEngine.generate_batch(teacher_client=...)
+          - External post-processing that populates SAWItem.attachments.teacher_logps
+        - Collator must extract teacher_logps into batch["teacher_logps"]
+
+    Args:
+        kl_coeff: Coefficient for KL loss. Higher values push the student
+            harder towards the teacher's distribution. Default 1.0.
+        length_normalize: If True, divide per-sample loss by number of
+            action tokens. Useful when sequences have varying lengths.
+        name: Algorithm name for logging/metrics.
+
+    Example:
+        ```python
+        from ludic.training import RolloutBatchSource, Trainer, make_opd
+        from ludic.training.distillation import TinkerTeacherClient
+
+        # Create teacher client
+        teacher = TinkerTeacherClient(sampling_client=teacher_sampling_client)
+
+        # Create batch source with teacher
+        batch_source = RolloutBatchSource(
+            engine=engine,
+            make_requests=make_requests_fn,
+            credit_assigner=make_opd().credit_assigner,
+            teacher_client=teacher,
+        )
+
+        # Train with OPD
+        trainer = Trainer(model=model, algorithm=make_opd(), ...)
+        ```
+
+    Reference: https://thinkingmachines.ai/blog/on-policy-distillation
+    """
+    credit_assigner: CreditAssigner = ConstantCredit(value=1.0)
+    loss: Loss = ReverseKLLoss(coeff=kl_coeff, length_normalize=length_normalize)
 
     return RLAlgorithm(
         name=name,

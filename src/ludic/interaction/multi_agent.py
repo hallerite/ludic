@@ -172,6 +172,7 @@ class MultiAgentProtocol(InteractionProtocol):
                         turn_id=turn_ids[agent_id],
                         tool_calls=act_step.tool_calls,
                         tool_results=act_step.tool_results,
+                        intrinsic_scores=act_step.intrinsic_scores,
                     )
                     collector.add(agent_id, agent_step)
                     step_indices[agent_id] += 1

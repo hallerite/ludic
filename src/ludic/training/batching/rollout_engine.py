@@ -18,6 +18,7 @@ from ludic.training.types import (
     SAWItem,
     SAWBatch,
     ActorTokenLogps,
+    TeacherLogprobs,
     SampleAttachments,
     RolloutRequest,
     ProtocolSpec,
@@ -281,6 +282,10 @@ def _build_turn_saw_item(
     logprobs_mode: Optional[bool] = None
     logprobs: List[float] = []
 
+    # Collect intrinsic scores (token-level scores are concatenated across steps)
+    token_scores: Dict[str, List[float]] = {}
+    action_scores: Dict[str, float] = {}
+
     def _extend(ids: Sequence[int], *, is_action: bool) -> None:
         input_ids.extend(ids)
         attention_mask.extend([1] * len(ids))
@@ -332,6 +337,17 @@ def _build_turn_saw_item(
             logprobs_mode = True
             logprobs.extend(completion_logprobs)
 
+        # Collect intrinsic scores from agent step
+        for name, scores in step.intrinsic_scores.items():
+            if isinstance(scores, list):
+                # Token-level scores: concatenate across steps
+                if name not in token_scores:
+                    token_scores[name] = []
+                token_scores[name].extend(scores)
+            else:
+                # Action-level scores: use last step's score (or could sum/average)
+                action_scores[name] = float(scores)
+
     if require_chosen_logprobs and not logprobs_mode:
         raise ValueError(
             f"Missing completion_logprobs for rollout {rollout.id}, turn {turn.turn_id!r}, "
@@ -381,11 +397,25 @@ def _build_turn_saw_item(
         }
     )
 
-    attachments = SampleAttachments()
-    if logprobs_mode:
-        attachments = SampleAttachments(
-            actor_logps=ActorTokenLogps(token_logps=logprobs)
-        )
+    # Build attachments
+    actor_logps = ActorTokenLogps(token_logps=logprobs) if logprobs_mode else None
+    teacher_logps = None
+    if "teacher_logps" in token_scores:
+        teacher_logps = TeacherLogprobs(token_logps=token_scores["teacher_logps"])
+
+    attachments = SampleAttachments(
+        actor_logps=actor_logps,
+        teacher_logps=teacher_logps,
+    )
+
+    # Store other intrinsic scores in meta for now
+    # (could extend SampleAttachments later for more score types)
+    if token_scores:
+        meta["intrinsic_token_scores"] = {
+            k: v for k, v in token_scores.items() if k != "teacher_logps"
+        }
+    if action_scores:
+        meta["intrinsic_action_scores"] = action_scores
 
     return (
         SAWItem(
@@ -645,6 +675,12 @@ class RolloutEngine:
         - If sample_filter is provided, it's applied after SAWItems are created.
         - Filter returns True to KEEP a sample, False to DROP it.
         - Use ludic.training.filters for common predicates.
+
+        Intrinsic Scoring:
+        - Agents can have intrinsic scorers (TokenLevelScorer, ActionLevelScorer).
+        - Scores are computed during Agent.act() and flow through AgentStep.
+        - Token-level scores (e.g., teacher_logps) are attached to SAWItem.attachments.
+        - Use with make_opd() algorithm for on-policy distillation training.
         """
         rollouts = await self.generate_rollouts(
             requests=requests,

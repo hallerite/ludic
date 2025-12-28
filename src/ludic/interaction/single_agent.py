@@ -179,6 +179,7 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                     turn_id=turn_id,
                     tool_calls=act_step.tool_calls,
                     tool_results=act_step.tool_results,
+                    intrinsic_scores=act_step.intrinsic_scores,
                 )
                 steps.append(agent_step)
                 turn_agent_step_ids.append(agent_step.id)
@@ -255,6 +256,7 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                         turn_id=turn_id,
                         tool_calls=act_step.tool_calls,
                         tool_results=act_step.tool_results,
+                        intrinsic_scores=act_step.intrinsic_scores,
                     )
                     steps.append(agent_step)
                     turn_agent_step_ids.append(agent_step.id)

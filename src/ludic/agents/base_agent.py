@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Mapping, TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, Mapping, TYPE_CHECKING, Union
 
 import torch
 
@@ -13,6 +13,7 @@ from ludic.parsers import Parser, ParseResult
 
 if TYPE_CHECKING:
     from ludic.inference.chat_template import ChatTemplate
+    from ludic.training.scoring import IntrinsicScorer, TokenLevelScorer, ActionLevelScorer
 
 _DEFAULT_INCOMPLETE_FEEDBACK = (
     "Your response was cut off because it exceeded the token limit. "
@@ -65,6 +66,7 @@ class AgentActStep:
     loop_index: int
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_results: Optional[List[Dict[str, Any]]] = None
+    intrinsic_scores: Dict[str, Union[List[float], float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -97,6 +99,7 @@ class Agent:
         incomplete_completion_penalty: float = -0.1,
         incomplete_completion_feedback: str = _DEFAULT_INCOMPLETE_FEEDBACK,
         chat_template: Optional["ChatTemplate"] = None,
+        scorers: Optional[List["IntrinsicScorer"]] = None,
     ) -> None:
         """
         Initializes the Agent.
@@ -113,6 +116,9 @@ class Agent:
                 its completion is cut off.
             chat_template: ChatTemplate for token-in mode. If None, the agent
                 will try to build an HFChatTemplate from client.tokenizer.
+            scorers: Optional list of intrinsic scorers (TokenLevelScorer or
+                ActionLevelScorer) to run after each action. Scores are attached
+                to AgentActStep.intrinsic_scores.
         """
         self._client = client
         self._model = model
@@ -132,6 +138,7 @@ class Agent:
 
             chat_template = HFChatTemplate(tokenizer)
         self._chat_template = chat_template
+        self._scorers: List["IntrinsicScorer"] = scorers or []
         self.last_info: Dict[str, Any] = {}
 
     async def _infer_once(
@@ -252,6 +259,25 @@ class Agent:
             # 5. Parse (format the raw text action)
             parse_result = self._parser(raw_action)
 
+        # 6. Run intrinsic scorers
+        intrinsic_scores: Dict[str, Union[List[float], float]] = {}
+        if self._scorers:
+            from ludic.training.scoring import TokenLevelScorer, ActionLevelScorer
+
+            prompt_text = self._chat_template.apply(
+                messages, add_generation_prompt=True
+            ).prompt_text
+
+            for scorer in self._scorers:
+                if isinstance(scorer, TokenLevelScorer):
+                    scores = await scorer.score_tokens(
+                        list(token_trace.completion_token_ids)
+                    )
+                    intrinsic_scores[scorer.name] = scores
+                elif isinstance(scorer, ActionLevelScorer):
+                    score = await scorer.score_action(prompt_text, raw_action)
+                    intrinsic_scores[scorer.name] = score
+
         step = AgentActStep(
             prompt_messages=messages,
             action=raw_action,
@@ -260,6 +286,7 @@ class Agent:
             trace=token_trace,
             action_target="env",
             loop_index=0,
+            intrinsic_scores=intrinsic_scores,
         )
         return AgentActResult(steps=[step])
 
