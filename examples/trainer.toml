@@ -5,7 +5,7 @@ output_dir = "checkpoints_tictactoe"
 [model]
 name = "hallerite/Qwen2.5-7B-TTT"
 
-[model.experimental.lora]
+[model.lora]
 rank = 8
 alpha = 16
 dropout = 0.0
