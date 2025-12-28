@@ -26,7 +26,7 @@ from environments.gsm8k import GSM8KEnv
 
 from ludic.agent import Agent
 from ludic.context import FullDialog
-from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec
+from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec, HFChatTemplate
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import boxed_parser
 from ludic.distributed.adapters import create_vllm_publisher
@@ -127,14 +127,13 @@ def main():
 
     # Tokenizer + model
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16)
     model.to("cuda" if torch.cuda.is_available() else "cpu")
 
     # Shared client for inference
     client = VLLMChatClient(host=args.host, port=args.port, enable_weight_updates=True)
     publisher = create_vllm_publisher(client)
+    chat_template = HFChatTemplate(tokenizer)
 
     # Registries
     env_registry = {"gsm8k": lambda sample: GSM8KEnv(sample=sample, system_prompt=args.system_prompt)}
@@ -146,6 +145,7 @@ def main():
                 model=args.model,
                 ctx=FullDialog(),
                 parser=boxed_parser,
+                chat_template=chat_template,
             )
         )
 
@@ -203,7 +203,7 @@ def main():
         max_seq_len=args.max_seq_len,
         micro_token_budget=args.micro_token_budget,
         max_grad_norm=0.5,
-        pad_token_id=tokenizer.pad_token_id,
+        pad_token_id=tokenizer,
         eval_at_start=bool(args.eval_before_start and eval_samples),
         eval_every_n_steps=(args.eval_every if args.eval_every and args.eval_every > 0 and eval_samples else None),
         eval_concurrency=args.eval_concurrency,

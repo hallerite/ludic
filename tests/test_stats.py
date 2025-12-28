@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 from ludic.training.stats import aggregate_stats
 from ludic.training.types import SAWBatch, SAWItem
@@ -18,8 +19,8 @@ def _item() -> SAWItem:
 
 def test_aggregate_stats_weights_micro_batches():
     micro_stats = [
-        {"loss": 1.0, "logp_mean": -1.0},
-        {"loss": 3.0, "logp_mean": -3.0},
+        {"loss": torch.tensor(1.0), "logp_mean": torch.tensor(-1.0)},
+        {"loss": torch.tensor(3.0), "logp_mean": torch.tensor(-3.0)},
     ]
     saw_batches = [
         SAWBatch(
@@ -37,7 +38,7 @@ def test_aggregate_stats_weights_micro_batches():
 
 
 def test_aggregate_stats_uses_effective_rollouts_when_present():
-    micro_stats = [{"loss": 1.0}]
+    micro_stats = [{"loss": torch.tensor(1.0)}]
     saw_batches = [
         SAWBatch(
             items=[_item(), _item()],

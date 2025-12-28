@@ -1,15 +1,18 @@
 from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Mapping
+from typing import Any, Dict, List, Optional, Tuple, Mapping, TYPE_CHECKING
 
 import torch
 
 from ludic.types import Observation, Info, Message, ChatResponse, TokenTrace
 from ludic.inference.client import ChatClient
-from ludic.inference.request import ChatCompletionRequest, InferenceSpec, ToolRequest
+from ludic.inference.request import TokenCompletionRequest, InferenceSpec, ToolRequest
 from ludic.context.base import ContextStrategy
 from ludic.parsers import Parser, ParseResult
+
+if TYPE_CHECKING:
+    from ludic.inference.chat_template import ChatTemplate
 
 _DEFAULT_INCOMPLETE_FEEDBACK = (
     "Your response was cut off because it exceeded the token limit. "
@@ -93,6 +96,7 @@ class Agent:
         reject_incomplete_completions: bool = True,
         incomplete_completion_penalty: float = -0.1,
         incomplete_completion_feedback: str = _DEFAULT_INCOMPLETE_FEEDBACK,
+        chat_template: Optional["ChatTemplate"] = None,
     ) -> None:
         """
         Initializes the Agent.
@@ -107,6 +111,8 @@ class Agent:
             incomplete_completion_penalty: Reward penalty for incomplete completions.
             incomplete_completion_feedback: Feedback message shown to agent when
                 its completion is cut off.
+            chat_template: ChatTemplate for token-in mode. If None, the agent
+                will try to build an HFChatTemplate from client.tokenizer.
         """
         self._client = client
         self._model = model
@@ -115,6 +121,17 @@ class Agent:
         self._reject_incomplete = reject_incomplete_completions
         self._incomplete_penalty = incomplete_completion_penalty
         self._incomplete_feedback = incomplete_completion_feedback
+        if chat_template is None:
+            tokenizer = getattr(client, "tokenizer", None)
+            if tokenizer is None or not callable(getattr(tokenizer, "apply_chat_template", None)):
+                raise ValueError(
+                    "Agent requires a chat_template for token-in inference or a client "
+                    "with a HuggingFace-compatible tokenizer."
+                )
+            from ludic.inference.chat_template import HFChatTemplate
+
+            chat_template = HFChatTemplate(tokenizer)
+        self._chat_template = chat_template
         self.last_info: Dict[str, Any] = {}
 
     async def _infer_once(
@@ -129,20 +146,30 @@ class Agent:
         """
         Shared single inference helper.
 
-        Builds a ChatCompletionRequest, runs the client call (optionally with timeout),
-        strips token traces from the JSON info, and returns a TokenTrace separately.
+        Uses token-in mode (applies template ourselves, calls completions endpoint).
         """
         inf = inference or InferenceSpec()
-        req = ChatCompletionRequest(
+
+        # Token-in mode: apply chat template ourselves
+        tool_schemas = tools.tools if tools else None
+        template_result = self._chat_template.apply(
+            messages,
+            tools=tool_schemas,
+            add_generation_prompt=True,
+        )
+
+        req = TokenCompletionRequest(
             model=self._model,
-            messages=messages,
+            prompt_token_ids=template_result.prompt_token_ids,
+            prompt_text=template_result.prompt_text,
             sampling=inf.sampling,
             return_=inf.return_,
             seed=sampling_seed,
-            tools=tools,
             extensions=inf.extensions,
         )
-        coro = self._client.complete(req)
+
+        coro = self._client.complete_tokens(req)
+
         if timeout_s is None:
             resp, client_info = await coro
         else:

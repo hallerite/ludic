@@ -13,6 +13,7 @@ from ludic.training.loss import (
     ReinforceBaselineLoss,
     ClippedSurrogateLoss,
     TokenClippedSurrogateLoss,
+    CISPOLoss,
     MaskedCausalLMCrossEntropyLoss,
 )
 from ludic.training.credit_assignment import MonteCarloReturn, GroupNormalizedReturn, ConstantCredit
@@ -313,6 +314,77 @@ def make_gspo(
         clip_eps_high=clip_eps_high,
         length_normalize=length_normalize,
         ratio_clip=ratio_clip,
+    )
+    preprocess_fns = []
+    if drop_zero_weight:
+        preprocess_fns.append(lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps))
+    preprocess_fns.append(validate_actor_logps)
+    preprocess = compose_preprocess(*preprocess_fns)
+
+    return RLAlgorithm(
+        name=name,
+        credit_assigner=credit_assigner,
+        loss=loss,
+        preprocess=preprocess,
+    )
+
+
+def make_cispo(
+    *,
+    group_size: int,
+    group_normalize_adv: bool = True,
+    positive_only: bool = False,
+    clip_eps_low: float = 1e6,
+    clip_eps_high: float = 0.2,
+    length_normalize: bool = True,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
+    name: str = "cispo",
+) -> RLAlgorithm:
+    """
+    CISPO (Clipped IS-weight Policy Optimization) preset.
+
+    Unlike PPO/GRPO which clip token updates via the min operation, CISPO
+    clips the importance sampling weights themselves and uses them as
+    stop-gradient multipliers on the REINFORCE objective. This preserves
+    gradient contributions from all tokens, especially low-probability
+    tokens crucial for reflective reasoning behaviors.
+
+    Key insight from MiniMax-M1: Tokens like "However", "Recheck", "Wait"
+    are rare but crucial for learning reflective CoT behaviors. PPO/GRPO
+    clip these out after the first update, preventing them from contributing
+    to subsequent off-policy gradient updates. CISPO keeps all tokens.
+
+    Loss:
+        L = - E[ sg(clip(r_t, 1-ε_low, 1+ε_high)) * A * log π(a_t|s_t) ]
+
+    Args:
+        group_size: Number of rollouts per group for advantage normalization.
+        group_normalize_adv: Whether to normalize advantages within each group.
+        positive_only: If True, clip negative advantages to zero.
+        clip_eps_low: Lower bound for IS weight clipping. Paper uses large
+            value (effectively no lower bound).
+        clip_eps_high: Upper bound for IS weight clipping.
+        length_normalize: Whether to normalize by number of action tokens.
+        drop_zero_weight: Whether to drop zero-advantage samples.
+        drop_zero_weight_eps: Epsilon for zero-weight detection.
+        name: Algorithm name for logging.
+
+    Note: Rollouts must carry `group_id` in their metadata and each group
+    must have exactly `group_size` members. Use GRPORequestStrategy for
+    request expansion.
+
+    Reference: MiniMax-M1 paper (arXiv:2506.13585)
+    """
+    credit_assigner: CreditAssigner = GroupNormalizedReturn(
+        group_size=group_size,
+        normalize_adv=group_normalize_adv,
+        positive_only=positive_only,
+    )
+    loss: Loss = CISPOLoss(
+        clip_eps_low=clip_eps_low,
+        clip_eps_high=clip_eps_high,
+        length_normalize=length_normalize,
     )
     preprocess_fns = []
     if drop_zero_weight:

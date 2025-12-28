@@ -18,6 +18,7 @@ from ludic.inference import (
     VLLMChatClient,
     start_vllm_server,
     wait_for_vllm_health,
+    ChatTemplate,
     InferenceSpec,
     SamplingParams,
     ReturnSpec,
@@ -82,6 +83,7 @@ def build_single_agent_engine(
     model: str,
     parser: Callable[[str], ParseResult],
     env_registry: Mapping[str, Callable[..., Any]],
+    chat_template: ChatTemplate,
     system_prompt: Optional[str] = None,
     stop_on_parse_error: bool = False,
     context_factory: Optional[Callable[[Optional[str]], Any]] = None,
@@ -94,6 +96,7 @@ def build_single_agent_engine(
             model=model,
             ctx=make_ctx(system_prompt),
             parser=parser,
+            chat_template=chat_template,
         )
         return SingleAgentSyncProtocol(
             agent=agent,

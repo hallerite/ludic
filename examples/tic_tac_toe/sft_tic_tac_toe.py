@@ -196,8 +196,6 @@ def main() -> None:
         return
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     mp_policy = fsdp.MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,
@@ -264,7 +262,7 @@ def main() -> None:
         max_seq_len=args.max_seq_len,
         micro_token_budget=args.micro_token_budget,
         max_grad_norm=args.max_grad_norm,
-        pad_token_id=tokenizer.pad_token_id,
+        pad_token_id=tokenizer,
         lr=args.lr,
         reduce_stats_across_ranks=True,
         eval_at_start=False,

@@ -4,7 +4,7 @@ import pytest
 from transformers import AutoTokenizer  # Only for verification
 
 from ludic.inference.vllm_client import VLLMChatClient
-from ludic.inference import InferenceSpec, SamplingParams, ReturnSpec
+from ludic.inference import InferenceSpec, SamplingParams, ReturnSpec, HFChatTemplate, HermesToolParser
 from ludic.agents.react_agent import ReActAgent
 from ludic.context.full_dialog import FullDialog
 from tests._mocks import _mock_parser
@@ -42,13 +42,17 @@ async def test_react_agent_vllm_tool_call_loop(
     4. Agent must: Think -> Call Tool -> See 'BLUE-42' -> Output Final Answer.
     """
     
+    tokenizer = AutoTokenizer.from_pretrained(vllm_model_name, trust_remote_code=True)
+    chat_template = HFChatTemplate(tokenizer, tool_parser=HermesToolParser())
+
     agent = ReActAgent(
         client=vllm_client,
         model=vllm_model_name,
         ctx=FullDialog(),
         parser=_mock_parser,
         tools=[get_secret_code],
-        max_react_steps=3
+        max_react_steps=3,
+        chat_template=chat_template,
     )
 
     # 2. Setup the Prompt

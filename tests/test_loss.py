@@ -14,6 +14,7 @@ from ludic.training.loss import (
     ReinforceBaselineLoss,
     ClippedSurrogateLoss,
     TokenClippedSurrogateLoss,
+    CISPOLoss,
     CompositeLoss,
     LossTerm,
 )
@@ -89,22 +90,28 @@ def test_compute_logp_action_multitoken_and_norm():
 # ---- test_reinforce_loss ----
 
 def test_reinforce_loss():
+    """Test REINFORCE with IS correction (on-policy case where ratio=1)."""
     loss_fn = ReinforceLoss()
 
     # B=1, T=2, V=2
     logits = torch.tensor([[[1.0, 2.0], [3.0, 1.0]]], dtype=torch.float32)
     # logprobs -> [[[-1.313, -0.313], [-0.127, -2.127]]]
-    
+
+    # Compute logp_action for on-policy old_logp
+    input_ids = torch.tensor([[1, 0]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1]], dtype=torch.float32)
+    # With causal shift, logp_action = logp[0, 0, 0] = -1.3133
+    old_logp = compute_logp_action(logits, input_ids, action_mask)
+
     batch = {
-        "input_ids": torch.tensor([[1, 0]], dtype=torch.long),
-        "action_mask": torch.tensor([[0, 1]], dtype=torch.float32),
-        "weight": torch.tensor([2.0], dtype=torch.float32), # Advantages
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([2.0], dtype=torch.float32),  # Advantages
+        "old_logp_action": old_logp.detach(),  # On-policy: ratio will be 1.0
     }
 
-    # With causal shift, only position 0 logits are used to score token at pos 1
-    # logp_action = logp[0, 0, 0] = -1.3133
-    # advantages = 2.0
-    # loss = - (adv * logp_action).mean() = - (2.0 * -1.3133) = 2.6266
+    # On-policy: ratio = 1.0, logp = -1.3133
+    # loss = - sg(ratio) * adv * logp = - 1.0 * 2.0 * (-1.3133) = 2.6266
     expected_loss = 2.6266
 
     loss, stats = loss_fn.compute(logits, batch)
@@ -112,6 +119,52 @@ def test_reinforce_loss():
     assert torch.allclose(loss, torch.tensor(expected_loss), atol=1e-3)
     assert stats["adv_mean"] == pytest.approx(2.0)
     assert stats["logp_mean"] == pytest.approx(-1.3133, abs=1e-3)
+    assert stats["ratio_mean"] == pytest.approx(1.0, abs=1e-3)
+    assert stats["kl_actor_policy"] == pytest.approx(0.0, abs=1e-3)
+
+
+def test_reinforce_loss_off_policy():
+    """Test REINFORCE with IS correction (off-policy case)."""
+    # B=1, T=2, V=2
+    logits = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+    input_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1]], dtype=torch.float32)
+
+    logp_action = compute_logp_action(logits, input_ids, action_mask)
+    # logp_action = log(0.5) = -0.693
+    # Set old_logp so ratio = 2.0 (current policy is 2x more likely than behavior)
+    ratio_target = 2.0
+    old_logp_action = logp_action - torch.log(torch.tensor(ratio_target))
+
+    batch = {
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([1.0], dtype=torch.float32),
+        "old_logp_action": old_logp_action.detach(),
+    }
+
+    # loss = - sg(ratio) * adv * logp = - 2.0 * 1.0 * (-0.693) = 1.386
+    loss_fn = ReinforceLoss()
+    loss, stats = loss_fn.compute(logits, batch)
+
+    expected_loss = -2.0 * 1.0 * float(logp_action)
+    assert torch.allclose(loss, torch.tensor(expected_loss), atol=1e-3)
+    assert stats["ratio_mean"] == pytest.approx(2.0, abs=1e-3)
+
+
+def test_reinforce_loss_requires_old_logp():
+    """Test that ReinforceLoss raises KeyError when old_logp_action is missing."""
+    logits = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+    batch = {
+        "input_ids": torch.tensor([[0, 1]], dtype=torch.long),
+        "action_mask": torch.tensor([[0, 1]], dtype=torch.float32),
+        "weight": torch.tensor([1.0], dtype=torch.float32),
+        # Missing old_logp_action
+    }
+
+    loss_fn = ReinforceLoss()
+    with pytest.raises(KeyError, match="old_logp_action"):
+        loss_fn.compute(logits, batch)
 
 
 # ---- test_reinforce_baseline_loss ----
@@ -126,10 +179,17 @@ def test_reinforce_baseline_loss(normalize):
         [[2.0, 1.0], [1.0, 2.0]],  # sample 1: logp(id=0 | pos0) = -0.313
     ], dtype=torch.float32)
 
+    input_ids = torch.tensor([[1, 0], [0, 0]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1], [0, 1]], dtype=torch.float32)
+
+    # Compute on-policy old_logp (ratio will be 1.0)
+    old_logp = compute_logp_action(logits, input_ids, action_mask)
+
     batch = {
-        "input_ids": torch.tensor([[1, 0], [0, 0]], dtype=torch.long),
-        "action_mask": torch.tensor([[0, 1], [0, 1]], dtype=torch.float32),
-        "weight": torch.tensor([1.5, 0.5], dtype=torch.float32), # Raw returns
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([1.5, 0.5], dtype=torch.float32),  # Raw returns
+        "old_logp_action": old_logp.detach(),
     }
 
     # With causal shift, both samples score the token at position 1 using logits from position 0
@@ -137,18 +197,19 @@ def test_reinforce_baseline_loss(normalize):
     # raw_returns = [1.5, 0.5]
     # baseline = raw_returns.mean() = 1.0
     # advantages = [1.5 - 1.0, 0.5 - 1.0] = [0.5, -0.5]
-    
+    # On-policy: ratio = 1.0
+
     if normalize:
         # std = advantages.std(unbiased=False) = 0.5
         # advantages = [0.5 / 0.5, -0.5 / 0.5] = [1.0, -1.0]
-        # loss = - (advantages * logp_action).mean()
-        # loss = - ([1.0, -1.0] * [-1.313, -0.313]).mean()
+        # loss = - sg(ratio) * (advantages * logp_action).mean()
+        # loss = - 1.0 * ([1.0, -1.0] * [-1.313, -0.313]).mean()
         # loss = - ([-1.313, 0.313]).mean() = 0.5
         expected_loss = 0.5
     else:
         # advantages = [0.5, -0.5]
-        # loss = - (advantages * logp_action).mean()
-        # loss = - ([0.5, -0.5] * [-1.313, -0.313]).mean()
+        # loss = - sg(ratio) * (advantages * logp_action).mean()
+        # loss = - 1.0 * ([0.5, -0.5] * [-1.313, -0.313]).mean()
         # loss = - ([-0.6565, 0.1565]).mean() = 0.25
         expected_loss = 0.25
 
@@ -283,6 +344,169 @@ def test_grpo_token_loss_upper_clip():
     loss_fn = TokenClippedSurrogateLoss(clip_eps_low=0.1, clip_eps_high=0.1)
     loss, _ = loss_fn.compute(logits, batch)
     assert torch.allclose(loss, torch.tensor(-1.1), atol=1e-4)
+
+
+# ---- test_cispo_loss ----
+
+def test_cispo_loss_basic():
+    """Test basic CISPO loss computation with on-policy data (ratio=1)."""
+    logits = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+    input_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1]], dtype=torch.float32)
+
+    # On-policy: actor_logps matches current policy
+    token_logp = torch.log_softmax(logits[:, :-1, :], dim=-1)[0, 0, 1]
+    actor_logps = torch.tensor([[0.0, float(token_logp)]], dtype=torch.float32)
+
+    batch = {
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([2.0], dtype=torch.float32),
+        "actor_logps": actor_logps,
+    }
+
+    # With ratio=1 and length_normalize=True (default):
+    # loss = - is_weight * adv * logp = - 1.0 * 2.0 * token_logp / 1
+    # token_logp = log(0.5) = -0.693
+    # loss = - 1.0 * 2.0 * (-0.693) = 1.386
+    loss_fn = CISPOLoss()
+    loss, stats = loss_fn.compute(logits, batch)
+
+    expected_loss = -1.0 * 2.0 * float(token_logp)
+    assert torch.allclose(loss, torch.tensor(expected_loss), atol=1e-3)
+    assert stats["ratio_mean"] == pytest.approx(1.0, abs=1e-4)
+    assert stats["clip_frac"] == pytest.approx(0.0)
+    assert stats["adv_mean"] == pytest.approx(2.0)
+
+
+def test_cispo_loss_clips_high_ratio():
+    """Test that CISPO clips high IS weights (ratio > 1 + eps_high)."""
+    logits = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+    input_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1]], dtype=torch.float32)
+
+    token_logp = torch.log_softmax(logits[:, :-1, :], dim=-1)[0, 0, 1]
+    # Set actor_logp so ratio = 2.0 (current policy is 2x more likely)
+    ratio_target = 2.0
+    actor_logp = token_logp - torch.log(torch.tensor(ratio_target))
+    actor_logps = torch.tensor([[0.0, float(actor_logp)]], dtype=torch.float32)
+
+    batch = {
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([1.0], dtype=torch.float32),
+        "actor_logps": actor_logps,
+    }
+
+    # With clip_eps_high=0.1, ratio=2.0 gets clipped to 1.1
+    # loss = - clipped_ratio * adv * logp = - 1.1 * 1.0 * token_logp
+    loss_fn = CISPOLoss(clip_eps_high=0.1)
+    loss, stats = loss_fn.compute(logits, batch)
+
+    expected_loss = -1.1 * 1.0 * float(token_logp)
+    assert torch.allclose(loss, torch.tensor(expected_loss), atol=1e-3)
+    assert stats["ratio_mean"] == pytest.approx(2.0, abs=1e-3)
+    assert stats["clip_frac"] == pytest.approx(1.0)  # All tokens clipped
+
+
+def test_cispo_loss_no_lower_clip_by_default():
+    """Test that CISPO effectively has no lower bound (eps_low=1e6)."""
+    logits = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+    input_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1]], dtype=torch.float32)
+
+    token_logp = torch.log_softmax(logits[:, :-1, :], dim=-1)[0, 0, 1]
+    # Set actor_logp so ratio = 0.1 (current policy is 10x less likely)
+    ratio_target = 0.1
+    actor_logp = token_logp - torch.log(torch.tensor(ratio_target))
+    actor_logps = torch.tensor([[0.0, float(actor_logp)]], dtype=torch.float32)
+
+    batch = {
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([-1.0], dtype=torch.float32),
+        "actor_logps": actor_logps,
+    }
+
+    # With default eps_low=1e6, ratio=0.1 is NOT clipped
+    # loss = - 0.1 * (-1.0) * token_logp = 0.1 * token_logp
+    loss_fn = CISPOLoss()
+    loss, stats = loss_fn.compute(logits, batch)
+
+    expected_loss = -0.1 * (-1.0) * float(token_logp)
+    assert torch.allclose(loss, torch.tensor(expected_loss), atol=1e-3)
+    assert stats["ratio_mean"] == pytest.approx(0.1, abs=1e-3)
+    assert stats["clip_frac"] == pytest.approx(0.0)  # No clipping
+
+
+def test_cispo_loss_length_normalize():
+    """Test that length normalization divides by action token count."""
+    # B=1, T=3, V=2
+    logits = torch.tensor([[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+    input_ids = torch.tensor([[0, 1, 0]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1, 1]], dtype=torch.float32)  # 2 action tokens
+
+    # On-policy
+    token_logps = torch.log_softmax(logits[:, :-1, :], dim=-1)
+    actor_logps = torch.tensor([[0.0, float(token_logps[0, 0, 1]), float(token_logps[0, 1, 0])]])
+
+    batch = {
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([1.0], dtype=torch.float32),
+        "actor_logps": actor_logps,
+    }
+
+    # With length_normalize=True (default), divide by 2 action tokens
+    loss_norm, stats_norm = CISPOLoss(length_normalize=True).compute(logits, batch)
+    loss_no_norm, stats_no_norm = CISPOLoss(length_normalize=False).compute(logits, batch)
+
+    # loss_no_norm should be 2x loss_norm (since 2 tokens)
+    assert torch.allclose(loss_no_norm, loss_norm * 2, atol=1e-4)
+    assert stats_norm["avg_action_tokens"] == pytest.approx(2.0)
+
+
+def test_cispo_loss_gradient_only_through_logp():
+    """Test that gradients flow through log π, not through the IS weight."""
+    logits = torch.tensor([[[1.0, 2.0], [3.0, 1.0]]], dtype=torch.float32, requires_grad=True)
+    input_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1]], dtype=torch.float32)
+
+    token_logp = torch.log_softmax(logits[:, :-1, :], dim=-1)[0, 0, 1]
+    # Off-policy with ratio=2.0
+    actor_logp = token_logp.detach() - torch.log(torch.tensor(2.0))
+    actor_logps = torch.tensor([[0.0, float(actor_logp)]], dtype=torch.float32)
+
+    batch = {
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([1.0], dtype=torch.float32),
+        "actor_logps": actor_logps,
+    }
+
+    loss_fn = CISPOLoss(clip_eps_high=0.5)
+    loss, _ = loss_fn.compute(logits, batch)
+    loss.backward()
+
+    # Gradient should exist and be non-zero
+    assert logits.grad is not None
+    assert torch.abs(logits.grad).sum() > 0
+
+
+def test_cispo_requires_actor_logps():
+    """Test that CISPOLoss raises KeyError when actor_logps is missing."""
+    logits = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+    batch = {
+        "input_ids": torch.tensor([[0, 1]], dtype=torch.long),
+        "action_mask": torch.tensor([[0, 1]], dtype=torch.float32),
+        "weight": torch.tensor([1.0], dtype=torch.float32),
+        # Missing actor_logps
+    }
+
+    loss_fn = CISPOLoss()
+    with pytest.raises(KeyError, match="actor_logps"):
+        loss_fn.compute(logits, batch)
+
 
 # ---- test_composite_loss ----
 

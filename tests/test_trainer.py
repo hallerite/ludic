@@ -40,14 +40,14 @@ class WeightMeanLoss(Loss):
     def compute(self, logits: torch.Tensor, batch: dict[str, torch.Tensor]):
         weight_mean = batch["weight"].mean()
         loss = logits.mean() * weight_mean
-        stats = {"loss": float(weight_mean.detach().cpu())}
+        stats = {"loss": weight_mean.detach()}
         return loss, stats
 
 
 class LogitsMeanLoss(Loss):
     def compute(self, logits: torch.Tensor, batch: dict[str, torch.Tensor]):
         loss = logits.mean()
-        stats = {"loss": float(loss.detach().cpu())}
+        stats = {"loss": loss.detach()}
         return loss, stats
 
 
@@ -102,6 +102,24 @@ def _trainer_for_batch(
         ),
         reducers=reducers,
     )
+
+
+def test_trainer_config_extracts_pad_token_from_tokenizer():
+    """TrainerConfig accepts a tokenizer and extracts pad_token_id."""
+    # Mock tokenizer with pad_token_id
+    tokenizer = SimpleNamespace(pad_token_id=42, eos_token_id=1)
+    cfg = TrainerConfig(pad_token_id=tokenizer, model_device="cpu")
+    assert cfg.pad_token_id == 42
+
+    # Falls back to eos_token_id if pad_token_id is None
+    tokenizer_no_pad = SimpleNamespace(pad_token_id=None, eos_token_id=99)
+    cfg2 = TrainerConfig(pad_token_id=tokenizer_no_pad, model_device="cpu")
+    assert cfg2.pad_token_id == 99
+
+    # Raises if neither is set
+    tokenizer_neither = SimpleNamespace(pad_token_id=None, eos_token_id=None)
+    with pytest.raises(ValueError, match="pad_token_id"):
+        TrainerConfig(pad_token_id=tokenizer_neither, model_device="cpu")
 
 
 def test_trainer_requires_publisher_with_sync():

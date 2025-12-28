@@ -26,6 +26,10 @@ examples = [
     "datasets==4.4.1", # pinned to the versions in uv.lock that are known to work
     "math-verify==0.8.0", # pinned to the versions in uv.lock that are known to work
 ]
+tinker = [
+    "tinker==0.7.0", # pinned to the versions in uv.lock that are known to work
+    "tinker-cookbook @ git+ssh://git@github.com/thinking-machines-lab/tinker-cookbook.git@d2adfe562edb9cc97b43ceab537a3beeff892442",
+]
 
 [build-system]
 requires = ["uv_build>=0.9.5,<0.10.0"]
@@ -49,9 +53,10 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+addopts = ["-m", "not diagnostic"]
 markers = [
     "integration: marks tests as integration tests",
     "gpu: marks tests as needing a GPU",
-    "report: marks tests that primarily emit diagnostic reports rather than asserting strict correctness",
+    "diagnostic: marks tests that primarily emit diagnostic reports rather than asserting strict correctness",
 ]
 testpaths = ["tests"]

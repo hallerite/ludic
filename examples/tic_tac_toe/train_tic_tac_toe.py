@@ -24,7 +24,7 @@ from peft import get_peft_model, LoraConfig, TaskType
 from environments.tic_tac_toe import TicTacToeEnv
 from ludic.agent import Agent
 from ludic.context import FullDialog, TruncatedThinkingContext
-from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec
+from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec, HFChatTemplate
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.distributed.adapters import create_vllm_publisher
 from ludic.parsers import compose_parsers, think_prefix_parser, xml_tag_parser
@@ -175,8 +175,7 @@ def main():
 
     # Tokenizer + model
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    chat_template = HFChatTemplate(tokenizer)
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model,
         dtype=torch.bfloat16,
@@ -222,6 +221,7 @@ def main():
                 model=args.model,
                 ctx=ctx,
                 parser=TICTACTOE_PARSER,
+                chat_template=chat_template,
             ),
             stop_on_parse_error=True,
         )
@@ -271,7 +271,7 @@ def main():
         max_seq_len=args.max_seq_len,
         micro_token_budget=args.micro_token_budget,
         max_grad_norm=0.5,
-        pad_token_id=tokenizer.pad_token_id,
+        pad_token_id=tokenizer,
         lr=5e-5,
         eval_at_start=bool(args.eval_before_start and args.eval_episodes and args.eval_episodes > 0),
         eval_every_n_steps=(args.eval_every if args.eval_every and args.eval_every > 0 else None),

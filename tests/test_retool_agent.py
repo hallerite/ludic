@@ -6,8 +6,10 @@ from ludic.agents import ReToolAgent, ReToolParser, CodeExecutionResult
 from ludic.context.full_dialog import FullDialog
 from ludic.parsers import boxed_parser
 from ludic.inference.client import ChatClient, ChatResponse
-from ludic.inference.request import ChatCompletionRequest
+from ludic.inference.request import TokenCompletionRequest
 from typing import Any, Dict, Tuple
+
+from tests._mocks import MockChatTemplate
 
 
 # ---------------------------------------------------------------------
@@ -97,9 +99,9 @@ class ReToolMockClient(ChatClient):
         self.responses = list(responses)
         self.call_count = 0
 
-    async def complete(
+    async def complete_tokens(
         self,
-        request: ChatCompletionRequest,
+        request: TokenCompletionRequest,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
         if self.call_count >= len(self.responses):
             raise RuntimeError("Unexpected call to mock client")
@@ -110,10 +112,10 @@ class ReToolMockClient(ChatClient):
         resp = ChatResponse(
             text=text,
             finish_reason="stop",
-            prompt_token_ids=list(range(len(request.messages))),
+            prompt_token_ids=request.prompt_token_ids,
             completion_token_ids=list(range(10, 10 + len(text))),
         )
-        return resp, {}
+        return resp, {"mode": "token_in"}
 
     def sync_weights(self, *args, **kwargs) -> str:
         """Mock implementation of sync_weights."""
@@ -153,6 +155,7 @@ async def test_retool_agent_single_code_block_then_answer():
         parser=boxed_parser,
         code_sandbox=mock_code_sandbox,
         max_code_blocks=10,
+        chat_template=MockChatTemplate(),
     )
 
     obs = "What is 2 + 2?"
@@ -191,6 +194,7 @@ async def test_retool_agent_direct_answer_no_code():
         parser=boxed_parser,
         code_sandbox=mock_code_sandbox,
         max_code_blocks=10,
+        chat_template=MockChatTemplate(),
     )
 
     obs = "What is 6 * 7?"
@@ -222,6 +226,7 @@ async def test_retool_agent_respects_max_code_blocks():
         parser=boxed_parser,
         code_sandbox=mock_code_sandbox,
         max_code_blocks=2,  # Only allow 2 code blocks
+        chat_template=MockChatTemplate(),
     )
 
     obs = "Calculate..."
@@ -260,6 +265,7 @@ async def test_retool_agent_code_execution_error():
         parser=boxed_parser,
         code_sandbox=error_sandbox,
         max_code_blocks=10,
+        chat_template=MockChatTemplate(),
     )
 
     obs = "Calculate..."
@@ -289,6 +295,7 @@ async def test_retool_agent_parse_failure_no_code_no_answer():
         parser=boxed_parser,
         code_sandbox=mock_code_sandbox,
         max_code_blocks=10,
+        chat_template=MockChatTemplate(),
     )
 
     obs = "Calculate..."

@@ -29,7 +29,7 @@ from datasets import load_dataset  # type: ignore
 from environments.math import MATHEnv
 from ludic.agent import Agent
 from ludic.context import FullDialog
-from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec
+from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec, HFChatTemplate
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.distributed import create_vllm_publisher
 from ludic.parsers import boxed_parser, extract_last_boxed_content
@@ -263,8 +263,7 @@ def main() -> None:
 
     # Tokenizer + model
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    chat_template = HFChatTemplate(tokenizer)
 
     mp_policy = fsdp.MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,
@@ -307,6 +306,7 @@ def main() -> None:
                 model=args.model,
                 ctx=FullDialog(system_prompt=args.system_prompt),
                 parser=action_parser,
+                chat_template=chat_template,
             )
         )
 
@@ -362,7 +362,7 @@ def main() -> None:
         max_seq_len=args.max_seq_len,
         micro_token_budget=args.micro_token_budget,
         max_grad_norm=0.5,
-        pad_token_id=tokenizer.pad_token_id,
+        pad_token_id=tokenizer,
         reduce_stats_across_ranks=True,
         eval_at_start=bool(args.eval_before_start and do_eval),
         eval_every_n_steps=(int(args.eval_every) if args.eval_every and args.eval_every > 0 and do_eval else None),

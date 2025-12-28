@@ -1,5 +1,17 @@
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional, Union
+
+
+def _extract_pad_token_id(tokenizer: Any) -> int:
+    """Extract pad_token_id from a tokenizer, with eos_token_id fallback."""
+    if (pad := getattr(tokenizer, "pad_token_id", None)) is not None:
+        return pad
+    if (eos := getattr(tokenizer, "eos_token_id", None)) is not None:
+        return eos
+    raise ValueError(
+        "Tokenizer has no pad_token_id or eos_token_id. "
+        "Set tokenizer.pad_token_id explicitly before passing to TrainerConfig."
+    )
 
 
 @dataclass
@@ -9,6 +21,16 @@ class TrainerConfig:
 
     This is *purely* about optimization / model device / collation.
     Rollout and batch-generation config live in BatchSource / Orchestrator.
+
+    ==========================
+    Required
+    ==========================
+
+    - pad_token_id:
+          Token ID used when padding sequences during SAW collation.
+          Pass your tokenizer directly and the pad_token_id will be
+          extracted automatically (with eos_token_id as fallback).
+          You can also pass an int if you know the exact token ID.
 
     ==========================
     Model / Optimization
@@ -31,27 +53,20 @@ class TrainerConfig:
 
     - max_seq_len:
           Max token length for any single sample. Trainer raises if exceeded.
-          
+
     - micro_token_budget:
           Max padded tokens per micro-batch (roughly batch_size * max_seq_len).
           Trainer splits macro-batches into micro-batches that fit this budget.
           Must be >= max_seq_len.
-          
+
     - sync_every_steps:
-          Frequency (in macro-steps) at which to push updated policy 
+          Frequency (in macro-steps) at which to push updated policy
           weights to the Agent's runtime (e.g., vLLM). Set to 0 to disable
           syncing (e.g., pure offline/local training).
 
     - mixed_precision_dtype:
-          Optional string to configure FSDP's mixed precision policy. 
+          Optional string to configure FSDP's mixed precision policy.
           Use "bf16" or "fp16". If None, defaults to full precision (fp32).
-
-    ==========================
-    Collation
-    ==========================
-
-    - pad_token_id:
-          Used when padding sequences during SAW collation.
 
     ==========================
     Distributed
@@ -60,6 +75,14 @@ class TrainerConfig:
     - reduce_stats_across_ranks:
           If True (and torch.distributed is initialized), Trainer will all-reduce
           the per-rank stats dict before logging/returning it.
+
+    ==========================
+    Logging / Profiling
+    ==========================
+
+    - profile_memory:
+          If True, capture CUDA peak-memory stats during forward/backward.
+          This adds device synchronizations and can slow training.
 
     ==========================
     Evaluation
@@ -82,6 +105,9 @@ class TrainerConfig:
           Optional per-call timeout for eval rollouts.
     """
 
+    # ----- required (no default) ------------------
+    pad_token_id: Union[int, Any]  # int or tokenizer-like object
+
     # ----- model / optimization -------------------
     model_device: str = "cuda"
     runtime_device: Optional[str] = None
@@ -102,9 +128,8 @@ class TrainerConfig:
     # PipelineRL specific settings
     max_lag: Optional[int] = None  # Drop batches older than N steps
     reduce_stats_across_ranks: bool = False
-
-    # ----- collation ------------------------------
-    pad_token_id: int = 0
+    profile_memory: bool = False
+    log_every: int = 1
 
     # ----- evaluation -----------------------------
     eval_at_start: bool = False
@@ -112,3 +137,7 @@ class TrainerConfig:
     eval_concurrency: int = 32
     eval_max_steps: int = 1
     eval_timeout_s: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pad_token_id, int):
+            self.pad_token_id = _extract_pad_token_id(self.pad_token_id)
