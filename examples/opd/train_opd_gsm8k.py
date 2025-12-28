@@ -49,7 +49,7 @@ from ludic.training import (
     make_opd,
     RequestsExhausted,
 )
-from ludic.training import Reducer, PrintLogger, default_reducers
+from ludic.training import Reducer, PrintLogger, RichLiveLogger, TeeLogger, WandbLogger, default_reducers
 from ludic.training.scoring import make_vllm_teacher_scorer
 
 # Try to import environments
@@ -137,6 +137,10 @@ def main():
     # System prompt
     parser.add_argument("--system-prompt", type=str,
                         default="First, think step by step. Then put your final answer inside \\boxed{...}.")
+
+    # Logging
+    parser.add_argument("--logger", type=str, default="rich",
+                        help="Comma-separated loggers: rich, print, wandb, none.")
 
     args = parser.parse_args()
 
@@ -281,7 +285,41 @@ def main():
         "train/avg_completion_length",
         "train/num_samples",
     ]
-    train_logger = PrintLogger(prefix="[opd]", keys=logger_keys, precision=4)
+
+    train_logger = None
+    raw_logger = args.logger or "rich"
+    logger_tokens = [tok.strip().lower() for tok in raw_logger.replace("+", ",").split(",") if tok.strip()]
+    valid_loggers = {"rich", "print", "wandb", "none"}
+    unknown = [tok for tok in logger_tokens if tok not in valid_loggers]
+    if unknown:
+        raise SystemExit(f"Unknown logger(s): {unknown}. Valid: {sorted(valid_loggers)}")
+    if "none" in logger_tokens:
+        logger_tokens = ["none"]
+
+    console_logger = None
+    if "print" in logger_tokens:
+        console_logger = PrintLogger(prefix="[opd]", keys=logger_keys, precision=4)
+    elif "rich" in logger_tokens:
+        import sys
+        if not sys.stdout.isatty():
+            console_logger = PrintLogger(prefix="[opd]", keys=logger_keys, precision=4)
+        else:
+            console_logger = RichLiveLogger(
+                keys=logger_keys,
+                spark_key="train/reverse_kl_mean",
+                history=100,
+                precision=4,
+            )
+
+    wandb_logger = None
+    if "wandb" in logger_tokens:
+        wandb_logger = WandbLogger(config=dict(vars(args)))
+
+    if logger_tokens != ["none"]:
+        if console_logger and wandb_logger:
+            train_logger = TeeLogger(console_logger, wandb_logger)
+        else:
+            train_logger = console_logger or wandb_logger
 
     # Create trainer
     trainer = Trainer(
