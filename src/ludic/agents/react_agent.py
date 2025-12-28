@@ -24,10 +24,10 @@ class ReActAgent(ToolAgent):
     multiple times before emitting a final answer for the environment.
 
     Tool Scopes:
-      - internal_tools: Executed by the agent (calculator, code interpreter).
+      - tools: Executed by the agent (calculator, code interpreter).
         Results are added to context and the agent continues reasoning.
-      - env_tools: Affect environment state (move, attack, submit).
-        NOT executed by agent - passed to environment.
+      - external_tools: Not executed by agent - returned to protocol.
+        The protocol decides how to handle them (delegation, env, etc.).
 
     If the max_react_steps limit is reached, it forces a final generation
     attempt without tools to produce a valid environment action.
@@ -37,8 +37,7 @@ class ReActAgent(ToolAgent):
         self,
         *,
         tools: Optional[List[Callable]] = None,
-        internal_tools: Optional[List[Callable]] = None,
-        env_tools: Optional[List[Callable]] = None,
+        external_tools: Optional[List[Callable]] = None,
         max_react_steps: int = 5,
         tool_parse_error_penalty: float = -1.0,
         tool_parse_error_feedback: str = _DEFAULT_TOOL_PARSE_ERROR_OBS,
@@ -47,9 +46,9 @@ class ReActAgent(ToolAgent):
     ):
         """
         Args:
-            tools: (Legacy) List of internal tools. Use internal_tools instead.
-            internal_tools: Tools executed by agent (results come back to agent).
-            env_tools: Tools that affect environment (passed to env, not executed).
+            tools: Tools executed by agent (results come back to agent).
+            external_tools: Tools agent can call but doesn't execute.
+                Returned to protocol which decides how to handle them.
             max_react_steps: Maximum number of internal think/tool loops.
             tool_parse_error_penalty: Reward penalty when tool call parsing fails.
             tool_parse_error_feedback: Feedback shown when tool call parsing fails.
@@ -59,8 +58,7 @@ class ReActAgent(ToolAgent):
         """
         super().__init__(
             tools=tools,
-            internal_tools=internal_tools,
-            env_tools=env_tools,
+            external_tools=external_tools,
             **kwargs,
         )
         self.max_react_steps = max_react_steps
@@ -192,20 +190,23 @@ class ReActAgent(ToolAgent):
             self._ctx.add_assistant_step(content, tool_calls)
 
             if tool_calls:
-                # Check if any tool call targets an environment tool
-                if self.has_env_tool_call(tool_calls):
-                    # --- ENV TOOL PHASE ---
-                    # Don't execute locally - pass to environment
+                # Check if any tool call targets an external tool
+                if self.has_external_tool_call(tool_calls):
+                    # --- EXTERNAL TOOL PHASE ---
+                    # Don't execute locally - return to protocol
                     # Execute any internal tools first (hybrid calls)
                     tool_results = self._run_tool_calls(tool_calls, internal_only=True)
+
+                    # External tool calls don't have parse_result - the protocol
+                    # will handle them and return a result, then agent continues.
                     steps.append(
                         AgentActStep(
                             prompt_messages=messages,
                             action=raw_action,
-                            parse_result=parse_result,
+                            parse_result=None,  # Not a final action
                             info=last_info,
                             trace=token_trace,
-                            action_target="env",
+                            action_target="external",
                             loop_index=step_i,
                             tool_calls=tool_calls,
                             tool_results=tool_results if tool_results else None,

@@ -113,7 +113,7 @@ def main():
     parser.add_argument(
         "--rollouts-per-update",
         type=int,
-        default=8,
+        default=128,
         help="Total rollouts per update (must be divisible by --group-size).",
     )
     parser.add_argument("--train-steps", type=int, default=30, help="Number of trainer steps.")
@@ -144,7 +144,7 @@ def main():
     parser.add_argument("--checkpoint-every", type=int, default=10, help="Checkpoint every N steps (0 to disable).")
     parser.add_argument("--max-to-keep", type=int, default=2, help="Max checkpoints to keep.")
     parser.add_argument("--max-seq-len", type=int, default=1024, help="Max tokens per sample.")
-    parser.add_argument("--micro-token-budget", type=int, default=8192, help="Max padded tokens per micro-batch.")
+    parser.add_argument("--micro-token-budget", type=int, default=16384, help="Max padded tokens per micro-batch.")
     parser.add_argument("--max-completion-tokens", type=int, default=512, help="Max completion tokens per rollout.")
     parser.add_argument("--ctx", choices=["full", "truncated"], default="full",
                         help="Context strategy: 'full' (FullDialog) or 'truncated' (TruncatedThinkingContext)")

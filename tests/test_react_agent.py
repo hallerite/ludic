@@ -494,8 +494,8 @@ async def test_react_agent_env_tool_returns_immediately():
         model="mock",
         ctx=FullDialog(),
         parser=xml_tag_parser("move"),
-        internal_tools=[calculator_tool],  # calculator is internal
-        env_tools=[move_tool],             # move is env
+        tools=[calculator_tool],           # calculator is internal
+        external_tools=[move_tool],        # move is external (handled by protocol)
         chat_template=chat_template,
         max_react_steps=3,
     )
@@ -506,14 +506,18 @@ async def test_react_agent_env_tool_returns_immediately():
     assert len(act_result.steps) == 1
     step = act_result.steps[0]
 
-    # Step should target environment
-    assert step.action_target == "env"
+    # Step should target external (protocol will handle)
+    assert step.action_target == "external"
     assert step.tool_calls is not None
     assert len(step.tool_calls) == 1
     assert step.tool_calls[0]["function"]["name"] == "move_tool"
 
-    # Tool should NOT be executed (no tool_results for env tools)
+    # Tool should NOT be executed (no tool_results for external tools)
     assert step.tool_results is None
+
+    # External tool calls have parse_result=None - they're not final actions.
+    # The protocol handles them and feeds results back to the agent.
+    assert step.parse_result is None
 
     # Only one inference call (no loop continuation)
     assert client.call_count == 1
@@ -542,8 +546,8 @@ async def test_react_agent_internal_tool_continues_loop():
         model="mock",
         ctx=FullDialog(),
         parser=xml_tag_parser("move"),
-        internal_tools=[calculator_tool],
-        env_tools=[move_tool],
+        tools=[calculator_tool],
+        external_tools=[move_tool],
         chat_template=chat_template,
         max_react_steps=3,
     )
@@ -560,9 +564,10 @@ async def test_react_agent_internal_tool_continues_loop():
     assert internal_step.tool_results is not None
     assert internal_step.tool_results[0]["content"] == "5"
 
-    # Second step: final answer
+    # Second step: final answer to environment
     final_step = act_result.steps[1]
     assert final_step.action_target == "env"
+    assert final_step.parse_result is not None
     assert final_step.parse_result.action == "5"
 
     # Two inference calls
@@ -594,18 +599,18 @@ async def test_react_agent_mixed_tool_calls_executes_internal_first():
         model="mock",
         ctx=FullDialog(),
         parser=xml_tag_parser("move"),
-        internal_tools=[calculator_tool],
-        env_tools=[move_tool],
+        tools=[calculator_tool],
+        external_tools=[move_tool],
         chat_template=chat_template,
         max_react_steps=3,
     )
 
     act_result = await agent.act()
 
-    # Should return immediately (env tool present)
+    # Should return immediately (external tool present)
     assert len(act_result.steps) == 1
     step = act_result.steps[0]
-    assert step.action_target == "env"
+    assert step.action_target == "external"
 
     # Both tool calls should be recorded
     assert step.tool_calls is not None

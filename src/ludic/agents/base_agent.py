@@ -58,10 +58,10 @@ def _strip_token_trace_info(info: Dict[str, Any]) -> Dict[str, Any]:
 class AgentActStep:
     prompt_messages: List[Message]
     action: str
-    parse_result: ParseResult
+    parse_result: Optional[ParseResult]  # None for external tool calls (not final actions)
     info: Dict[str, Any]
     trace: TokenTrace
-    action_target: str  # "internal" | "env"
+    action_target: str  # "internal" | "external" | "env"
     loop_index: int
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_results: Optional[List[Dict[str, Any]]] = None

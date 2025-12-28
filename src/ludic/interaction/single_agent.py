@@ -1,5 +1,6 @@
 from __future__ import annotations
-from typing import Optional, List
+from typing import Any, Callable, Dict, Optional, List
+import logging
 import uuid
 
 from ludic.envs.env import LudicEnv
@@ -10,14 +11,27 @@ from .base import InteractionProtocol
 from .info import merge_step_info
 from .rewards import split_parser_reward
 
+logger = logging.getLogger(__name__)
+
+# Type for external tool handlers: takes tool_calls, returns list of result dicts
+# Each result dict should have: tool_call_id, tool_name, content
+ExternalToolHandler = Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]
+
+
 class SingleAgentSyncProtocol(InteractionProtocol):
     """
     Implements the standard single-agent, synchronous interaction loop.
-    
+
     This protocol consumes a LudicEnv but ASSUMES it has exactly
     one agent and that this agent is active every step.
-    
+
     It works perfectly with any env inheriting from SingleAgentEnv.
+
+    Action targets:
+      - "internal": Agent handled internally, loop continues automatically.
+      - "external": Agent returns to protocol. If external_tool_handler is set,
+        protocol handles it and feeds result back to agent. Otherwise, error.
+      - "env": Final action for environment. Parsed and sent to env.step().
 
     Parser failures:
       If the agent's parser returns ParseResult.action=None, the protocol
@@ -33,25 +47,32 @@ class SingleAgentSyncProtocol(InteractionProtocol):
       back to env.suggested_sysprompt. There is no protocol-level prompt
       override.
     """
-    
+
     def __init__(
         self,
         agent: Agent,
         *,
         stop_on_parse_error: bool = False,
+        external_tool_handler: Optional[ExternalToolHandler] = None,
     ):
         """
         Initializes the protocol.
-        
+
         Args:
             agent: A fully-configured Agent instance.
             stop_on_parse_error:
                 If True, terminate the episode after the first parser failure.
                 If False (default), continue and feed the synthetic
                 observation back to the agent.
+            external_tool_handler:
+                Optional handler for external tool calls. If provided, when
+                agent returns with action_target="external", this handler is
+                called with the tool_calls and the result is fed back to the
+                agent's context. The agent then continues reasoning.
         """
         self.agent = agent
         self.stop_on_parse_error = stop_on_parse_error
+        self.external_tool_handler = external_tool_handler
 
     async def run(
         self,
@@ -118,7 +139,8 @@ class SingleAgentSyncProtocol(InteractionProtocol):
             # --- B. Record Agent Steps ---
             for act_step in act_result.steps:
                 parse_result = act_step.parse_result
-                parse_error = parse_result.action is None
+                # parse_result is None for external tool calls (not final actions)
+                parse_error = parse_result is not None and parse_result.action is None
                 terminated_on_parse = bool(
                     parse_error and act_step.action_target == "env" and self.stop_on_parse_error
                 )
@@ -126,7 +148,7 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                     "parse_error": parse_error,
                     "action_target": act_step.action_target,
                 }
-                if parse_error and parse_result.obs is not None:
+                if parse_error and parse_result is not None and parse_result.obs is not None:
                     extra_info["parse_feedback_obs"] = parse_result.obs
                 if act_step.tool_calls is not None:
                     extra_info["tool_calls"] = act_step.tool_calls
@@ -136,7 +158,7 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                     client_info=act_step.info,
                     extra=extra_info,
                 )
-                parser_reward = float(parse_result.reward)
+                parser_reward = float(parse_result.reward) if parse_result else 0.0
                 agent_reward, agent_reward_components, _, _ = split_parser_reward(
                     parser_reward=parser_reward,
                     action_target=act_step.action_target,
@@ -162,9 +184,88 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                 turn_agent_step_ids.append(agent_step.id)
                 step_index += 1
 
-            # --- C. Handle Env Action ---
+            # --- C. Handle External Tool Calls ---
             final_step = act_result.final_step
+
+            while final_step.action_target == "external":
+                if self.external_tool_handler is None:
+                    raise RuntimeError(
+                        "Agent returned external tool call but no external_tool_handler "
+                        "is configured. Either provide an external_tool_handler to the "
+                        "protocol or remove external_tools from the agent."
+                    )
+
+                # Call the external handler with the tool calls
+                tool_results = self.external_tool_handler(final_step.tool_calls or [])
+
+                # Feed results back to agent's context
+                for result in tool_results:
+                    agent._ctx.add_tool_result(
+                        result["tool_call_id"],
+                        result["tool_name"],
+                        result["content"],
+                    )
+
+                # Continue agent reasoning
+                act_result = await agent.act(
+                    inference=inf,
+                    sampling_seed=sampling_seed,
+                    timeout_s=timeout_s,
+                )
+
+                # Record the new agent steps
+                for act_step in act_result.steps:
+                    parse_result = act_step.parse_result
+                    parse_error = parse_result is not None and parse_result.action is None
+                    terminated_on_parse = bool(
+                        parse_error and act_step.action_target == "env" and self.stop_on_parse_error
+                    )
+                    extra_info = {
+                        "parse_error": parse_error,
+                        "action_target": act_step.action_target,
+                    }
+                    if parse_error and parse_result.obs is not None:
+                        extra_info["parse_feedback_obs"] = parse_result.obs
+                    if act_step.tool_calls is not None:
+                        extra_info["tool_calls"] = act_step.tool_calls
+                    if act_step.tool_results is not None:
+                        extra_info["tool_results"] = act_step.tool_results
+                    step_info = merge_step_info(
+                        client_info=act_step.info,
+                        extra=extra_info,
+                    )
+                    parser_reward = float(parse_result.reward) if parse_result else 0.0
+                    agent_reward, agent_reward_components, _, _ = split_parser_reward(
+                        parser_reward=parser_reward,
+                        action_target=act_step.action_target,
+                        parse_error=parse_error,
+                    )
+                    agent_step = AgentStep(
+                        index=step_index,
+                        prompt_messages=act_step.prompt_messages,
+                        action=act_step.action,
+                        action_target=act_step.action_target,
+                        loop_index=act_step.loop_index,
+                        reward=agent_reward,
+                        reward_components=agent_reward_components,
+                        truncated=False,
+                        terminated=terminated_on_parse,
+                        info=step_info,
+                        trace=act_step.trace,
+                        turn_id=turn_id,
+                        tool_calls=act_step.tool_calls,
+                        tool_results=act_step.tool_results,
+                    )
+                    steps.append(agent_step)
+                    turn_agent_step_ids.append(agent_step.id)
+                    step_index += 1
+
+                # Update final_step for next iteration check
+                final_step = act_result.final_step
+
+            # --- D. Handle Env Action ---
             if final_step.action_target != "env":
+                # Internal action - agent handled internally, continue to next env step
                 continue
 
             parse_result = final_step.parse_result

@@ -10,7 +10,7 @@ from ludic.inference.request import InferenceSpec, ToolRequest
 
 logger = logging.getLogger(__name__)
 
-ToolScope = Literal["internal", "env"]
+ToolScope = Literal["internal", "external"]
 
 
 class ToolAgent(Agent):
@@ -23,10 +23,11 @@ class ToolAgent(Agent):
       - Execution + recording of tool calls into the ContextStrategy.
 
     Tool Scopes:
-      - internal_tools: Tools executed by the agent (calculator, code interpreter).
+      - tools: Tools executed by the agent (calculator, code interpreter).
         Results are added to context and the agent continues reasoning.
-      - env_tools: Tools that affect environment state (move, attack, submit).
-        These are NOT executed by the agent - they are passed to the environment.
+      - external_tools: Tools the agent can call but doesn't execute.
+        These are returned to the protocol, which decides how to handle them
+        (e.g., delegation, environment interaction, etc.).
 
     Tool errors:
       - Missing tools, invalid JSON arguments, and tool exceptions are
@@ -37,40 +38,30 @@ class ToolAgent(Agent):
         self,
         *,
         tools: Optional[Sequence[Callable]] = None,
-        internal_tools: Optional[Sequence[Callable]] = None,
-        env_tools: Optional[Sequence[Callable]] = None,
+        external_tools: Optional[Sequence[Callable]] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
         # Normalize tool inputs
-        internal = list(internal_tools or [])
-        env = list(env_tools or [])
-
-        # Backward compatibility: 'tools' defaults to internal
-        if tools is not None:
-            if internal_tools is not None or env_tools is not None:
-                raise ValueError(
-                    "Cannot specify both 'tools' and 'internal_tools'/'env_tools'. "
-                    "Use either the legacy 'tools' parameter or the new separate parameters."
-                )
-            internal = list(tools)
+        internal = list(tools or [])
+        external = list(external_tools or [])
 
         # Build tool maps and track scopes
         self._internal_tools: Dict[str, Callable] = {t.__name__: t for t in internal}
-        self._env_tools: Dict[str, Callable] = {t.__name__: t for t in env}
-        self._env_tool_names: Set[str] = set(self._env_tools.keys())
+        self._external_tools: Dict[str, Callable] = {t.__name__: t for t in external}
+        self._external_tool_names: Set[str] = set(self._external_tools.keys())
 
         # Combined map for schema generation (all tools are advertised)
-        self.tool_map: Dict[str, Callable] = {**self._internal_tools, **self._env_tools}
+        self.tool_map: Dict[str, Callable] = {**self._internal_tools, **self._external_tools}
 
         # Check for name collisions
-        overlap = set(self._internal_tools.keys()) & set(self._env_tools.keys())
+        overlap = set(self._internal_tools.keys()) & set(self._external_tools.keys())
         if overlap:
-            raise ValueError(f"Tool names must be unique across internal and env tools: {overlap}")
+            raise ValueError(f"Tool names must be unique across internal and external tools: {overlap}")
 
         # Generate schemas for all tools
-        all_tools = internal + env
+        all_tools = internal + external
         self.tool_schemas: List[Dict[str, Any]] = [self._func_to_schema(t) for t in all_tools]
 
         if self.tool_schemas and not self._chat_template.supports_tools():
@@ -83,17 +74,17 @@ class ToolAgent(Agent):
         """Return the scope of a tool by name, or None if not found."""
         if tool_name in self._internal_tools:
             return "internal"
-        if tool_name in self._env_tools:
-            return "env"
+        if tool_name in self._external_tools:
+            return "external"
         return None
 
-    def is_env_tool(self, tool_name: str) -> bool:
-        """Check if a tool is an environment tool."""
-        return tool_name in self._env_tool_names
+    def is_external_tool(self, tool_name: str) -> bool:
+        """Check if a tool is an external tool (not executed by agent)."""
+        return tool_name in self._external_tool_names
 
-    def has_env_tool_call(self, tool_calls: List[Dict[str, Any]]) -> bool:
-        """Check if any of the tool calls target an environment tool."""
-        return any(self.is_env_tool(tc["function"]["name"]) for tc in tool_calls)
+    def has_external_tool_call(self, tool_calls: List[Dict[str, Any]]) -> bool:
+        """Check if any of the tool calls target an external tool."""
+        return any(self.is_external_tool(tc["function"]["name"]) for tc in tool_calls)
 
     def _tool_request(self) -> ToolRequest:
         return ToolRequest(tools=list(self.tool_schemas))
@@ -114,7 +105,7 @@ class ToolAgent(Agent):
         Args:
             tool_calls: List of tool call dicts from the model.
             internal_only: If True (default), only execute internal tools.
-                          Env tools are skipped (they should be handled by the environment).
+                          External tools are skipped (handled by protocol).
 
         Returns:
             List of result dicts for executed tools.
@@ -125,8 +116,8 @@ class ToolAgent(Agent):
             args_json = tc["function"]["arguments"]
             call_id = tc["id"]
 
-            # Skip env tools if internal_only
-            if internal_only and self.is_env_tool(fn_name):
+            # Skip external tools if internal_only
+            if internal_only and self.is_external_tool(fn_name):
                 continue
 
             result_str = ""
