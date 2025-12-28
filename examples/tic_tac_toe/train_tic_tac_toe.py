@@ -175,8 +175,6 @@ def main():
 
     # Tokenizer + model
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
     chat_template = HFChatTemplate(tokenizer)
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model,
@@ -273,7 +271,7 @@ def main():
         max_seq_len=args.max_seq_len,
         micro_token_budget=args.micro_token_budget,
         max_grad_norm=0.5,
-        pad_token_id=tokenizer.pad_token_id,
+        pad_token_id=tokenizer,
         lr=5e-5,
         eval_at_start=bool(args.eval_before_start and args.eval_episodes and args.eval_episodes > 0),
         eval_every_n_steps=(args.eval_every if args.eval_every and args.eval_every > 0 else None),

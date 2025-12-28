@@ -127,8 +127,6 @@ def main():
 
     # Tokenizer + model
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16)
     model.to("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -205,7 +203,7 @@ def main():
         max_seq_len=args.max_seq_len,
         micro_token_budget=args.micro_token_budget,
         max_grad_norm=0.5,
-        pad_token_id=tokenizer.pad_token_id,
+        pad_token_id=tokenizer,
         eval_at_start=bool(args.eval_before_start and eval_samples),
         eval_every_n_steps=(args.eval_every if args.eval_every and args.eval_every > 0 and eval_samples else None),
         eval_concurrency=args.eval_concurrency,

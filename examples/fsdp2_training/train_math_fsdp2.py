@@ -263,8 +263,6 @@ def main() -> None:
 
     # Tokenizer + model
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
     chat_template = HFChatTemplate(tokenizer)
 
     mp_policy = fsdp.MixedPrecisionPolicy(
@@ -364,7 +362,7 @@ def main() -> None:
         max_seq_len=args.max_seq_len,
         micro_token_budget=args.micro_token_budget,
         max_grad_norm=0.5,
-        pad_token_id=tokenizer.pad_token_id,
+        pad_token_id=tokenizer,
         reduce_stats_across_ranks=True,
         eval_at_start=bool(args.eval_before_start and do_eval),
         eval_every_n_steps=(int(args.eval_every) if args.eval_every and args.eval_every > 0 and do_eval else None),
