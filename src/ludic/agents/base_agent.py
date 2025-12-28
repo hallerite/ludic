@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Mapping, TYPE_CHECKING, Union
+from typing import Any, Awaitable, Dict, List, Optional, Tuple, Mapping, TYPE_CHECKING, Union
 
 import torch
 
@@ -67,6 +67,7 @@ class AgentActStep:
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_results: Optional[List[Dict[str, Any]]] = None
     intrinsic_scores: Dict[str, Union[List[float], float]] = field(default_factory=dict)
+    pending_score_tasks: Dict[str, Awaitable[Union[List[float], float]]] = field(default_factory=dict)
 
 
 @dataclass
@@ -259,8 +260,8 @@ class Agent:
             # 5. Parse (format the raw text action)
             parse_result = self._parser(raw_action)
 
-        # 6. Run intrinsic scorers
-        intrinsic_scores: Dict[str, Union[List[float], float]] = {}
+        # 6. Fire off intrinsic scorers (don't await - resolve later for parallelism)
+        pending_score_tasks: Dict[str, Awaitable[Union[List[float], float]]] = {}
         if self._scorers:
             from ludic.training.scoring import TokenLevelScorer, ActionLevelScorer
 
@@ -270,13 +271,16 @@ class Agent:
 
             for scorer in self._scorers:
                 if isinstance(scorer, TokenLevelScorer):
-                    scores = await scorer.score_tokens(
-                        list(token_trace.completion_token_ids)
+                    # Fire and forget - create task but don't await
+                    task = asyncio.create_task(
+                        scorer.score_tokens(list(token_trace.completion_token_ids))
                     )
-                    intrinsic_scores[scorer.name] = scores
+                    pending_score_tasks[scorer.name] = task
                 elif isinstance(scorer, ActionLevelScorer):
-                    score = await scorer.score_action(prompt_text, raw_action)
-                    intrinsic_scores[scorer.name] = score
+                    task = asyncio.create_task(
+                        scorer.score_action(prompt_text, raw_action)
+                    )
+                    pending_score_tasks[scorer.name] = task
 
         step = AgentActStep(
             prompt_messages=messages,
@@ -286,7 +290,7 @@ class Agent:
             trace=token_trace,
             action_target="env",
             loop_index=0,
-            intrinsic_scores=intrinsic_scores,
+            pending_score_tasks=pending_score_tasks,
         )
         return AgentActResult(steps=[step])
 

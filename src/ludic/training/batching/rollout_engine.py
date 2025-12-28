@@ -550,6 +550,52 @@ class RolloutEngine:
 
             return rollouts
 
+    async def _resolve_pending_scores(self, rollouts: List[Rollout]) -> None:
+        """
+        Resolve all pending score tasks from agent steps.
+
+        Intrinsic scorers (e.g., teacher logprobs) fire-and-forget during Agent.act().
+        This method awaits all pending tasks and stores results in intrinsic_scores.
+
+        This design allows scoring to run in parallel with:
+        - Other agent steps within the same rollout
+        - Other rollouts running concurrently
+
+        After this method returns, all AgentStep.intrinsic_scores are populated.
+        """
+        # Collect all pending tasks with their target locations
+        pending: List[Tuple[AgentStep, str, asyncio.Task]] = []
+
+        for rollout in rollouts:
+            for step in rollout.steps:
+                if isinstance(step, AgentStep) and step.pending_score_tasks:
+                    for name, task in step.pending_score_tasks.items():
+                        pending.append((step, name, task))
+
+        if not pending:
+            return
+
+        # Await all tasks concurrently
+        tasks = [t for (_, _, t) in pending]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Store results back in steps
+        for (step, name, _), result in zip(pending, results):
+            if isinstance(result, Exception):
+                # Log but don't fail - scorer errors shouldn't break training
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Scorer '{name}' failed for step {step.index}: {result}"
+                )
+            else:
+                step.intrinsic_scores[name] = result
+
+        # Clear pending tasks (they're resolved now)
+        for rollout in rollouts:
+            for step in rollout.steps:
+                if isinstance(step, AgentStep):
+                    step.pending_score_tasks = {}
+
     def _append_jsonl(self, rollout: Rollout) -> None:
         assert self.jsonl_path is not None
         def _serialize_step(step: Step) -> Dict[str, Any]:
@@ -688,6 +734,11 @@ class RolloutEngine:
             timeout_s=timeout_s,
             concurrency=concurrency,
         )
+
+        # Resolve pending score tasks from all agent steps
+        # This allows scoring to run in parallel with rollout generation
+        await self._resolve_pending_scores(rollouts)
+
         weights = credit_assigner.compute(rollouts)
 
         items_with_lengths: List[Tuple[SAWItem, int, int]] = []

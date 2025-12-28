@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Union, Optional, Literal, Mapping
+from typing import Any, Awaitable, Dict, List, Union, Optional, Literal, Mapping
 import logging
 import time
 import uuid
@@ -185,6 +185,7 @@ class AgentStep:
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_results: Optional[List[Dict[str, Any]]] = None
     intrinsic_scores: Dict[str, Any] = field(default_factory=dict)
+    pending_score_tasks: Dict[str, Awaitable[Any]] = field(default_factory=dict)
 
 @dataclass
 class EnvironmentStep:

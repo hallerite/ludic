@@ -180,6 +180,7 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                     tool_calls=act_step.tool_calls,
                     tool_results=act_step.tool_results,
                     intrinsic_scores=act_step.intrinsic_scores,
+                    pending_score_tasks=act_step.pending_score_tasks,
                 )
                 steps.append(agent_step)
                 turn_agent_step_ids.append(agent_step.id)
@@ -257,6 +258,7 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                         tool_calls=act_step.tool_calls,
                         tool_results=act_step.tool_results,
                         intrinsic_scores=act_step.intrinsic_scores,
+                        pending_score_tasks=act_step.pending_score_tasks,
                     )
                     steps.append(agent_step)
                     turn_agent_step_ids.append(agent_step.id)
