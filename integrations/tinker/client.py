@@ -69,7 +69,11 @@ class TinkerChatClient(ChatClient):
         if not request.return_.return_chosen_logprobs:
             completion_logprobs = None
 
-        text = self.tokenizer.decode(completion_tokens, skip_special_tokens=True)
+        text = self.tokenizer.decode(
+            completion_tokens,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
 
         response = ChatResponse(
             text=text,
