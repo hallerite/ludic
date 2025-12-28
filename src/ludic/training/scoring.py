@@ -28,20 +28,27 @@ class TokenLevelScorer(Protocol):
     - Token-level reward models
     - Per-token confidence scores
 
-    The scorer receives completion token IDs and returns one score per token.
+    The scorer receives prompt and completion token IDs, returns one score
+    per completion token.
     """
 
     name: str
 
-    async def score_tokens(self, token_ids: List[int]) -> List[float]:
+    async def score_tokens(
+        self,
+        prompt_token_ids: List[int],
+        completion_token_ids: List[int],
+    ) -> List[float]:
         """
         Compute per-token scores for the given completion.
 
         Args:
-            token_ids: Completion token IDs (not including prompt).
+            prompt_token_ids: Prompt token IDs (for conditioning context).
+            completion_token_ids: Completion token IDs to score.
 
         Returns:
-            List of scores, one per token. Length must equal len(token_ids).
+            List of scores, one per completion token.
+            Length must equal len(completion_token_ids).
         """
         ...
 
@@ -92,18 +99,28 @@ class VLLMTeacherScorer:
     name: str = "teacher_logps"
     timeout: float = 60.0
 
-    async def score_tokens(self, token_ids: List[int]) -> List[float]:
+    async def score_tokens(
+        self,
+        prompt_token_ids: List[int],
+        completion_token_ids: List[int],
+    ) -> List[float]:
         """
         Compute per-token logprobs from teacher model.
 
         Uses vLLM's echo mode to get logprobs for existing tokens.
+        The full sequence (prompt + completion) is sent so the teacher
+        can properly condition on the prompt context.
         """
         import aiohttp
+
+        # Send full sequence so teacher conditions on prompt
+        full_sequence = prompt_token_ids + completion_token_ids
+        prompt_len = len(prompt_token_ids)
 
         url = f"{self.base_url}/v1/completions"
         payload = {
             "model": self.model,
-            "prompt": token_ids,
+            "prompt": full_sequence,
             "max_tokens": 0,
             "echo": True,
             "logprobs": 1,
@@ -121,12 +138,12 @@ class VLLMTeacherScorer:
         logprobs_data = data["choices"][0].get("logprobs", {})
         token_logprobs = logprobs_data.get("token_logprobs", [])
 
-        # First token has no prior context, skip it
-        # Return logprobs for completion tokens only
-        if token_logprobs and token_logprobs[0] is None:
-            token_logprobs = token_logprobs[1:]
+        # Extract only completion token logprobs (skip prompt tokens)
+        # First token of full sequence has logprob=None, but completion tokens
+        # all have valid logprobs since they're conditioned on prior tokens
+        completion_logprobs = token_logprobs[prompt_len:]
 
-        return [float(lp) if lp is not None else 0.0 for lp in token_logprobs]
+        return [float(lp) if lp is not None else 0.0 for lp in completion_logprobs]
 
 
 def make_vllm_teacher_scorer(

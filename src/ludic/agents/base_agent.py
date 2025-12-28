@@ -273,7 +273,10 @@ class Agent:
                 if isinstance(scorer, TokenLevelScorer):
                     # Fire and forget - create task but don't await
                     task = asyncio.create_task(
-                        scorer.score_tokens(list(token_trace.completion_token_ids))
+                        scorer.score_tokens(
+                            list(token_trace.prompt_token_ids),
+                            list(token_trace.completion_token_ids),
+                        )
                     )
                     pending_score_tasks[scorer.name] = task
                 elif isinstance(scorer, ActionLevelScorer):
