@@ -14,9 +14,14 @@ Let me convince you.
 
 - It's a **library** – not a *framework*. You can rip out parts and swap in your own as you please – everything is loosely coupled.
 - There is a clear separation between **Agent** and **Environment**
-	- **Environments** are pure state-transition functions which may also emit rewards on state-stransition; they are also multi-agent by design.
-	- **Agents** are LLMs with state, placed into a harness that deals with context management, parsing LLM outputs into the format the environment wants it, auxiliary tools & many other things
+	- **Environments** are pure state-transition functions which may also emit rewards on state-transition; they are also multi-agent by design.
+	- **Agents** are LLMs with state, placed into a harness that deals with context management, parsing LLM outputs into the format the environment wants it, tools (internal or external) & many other things
 	- The **Interaction Protocol** explicitly defines the agent–env loop. This allows for reusing different agent harnesses with different envs and vice versa. An `InteractionProtocol` has a method named `run()` that returns a list of **Rollouts** – one for each agent perspective.
+- Rollouts capture both **AgentSteps** and **EnvironmentSteps**:
+  - **AgentStep**: Every model call, including internal tool loops. Each has a `TokenTrace` for training.
+  - **EnvironmentStep**: State transitions from `env.step()`. References the AgentSteps that produced the action.
+  - Why? Training needs the full reasoning trace. A ReAct agent might call tools 3 times before outputting an action—all those calls have tokens we want to train on.
+  - Online batching concatenates all AgentSteps in a turn into one training sample (see `CONSIDERATIONS.md`).
 - The **Trainer** asks a **batch source** for the next batch by calling **batch_source.get_next_batch()**. The batch source then yields a batch of **State-Action-Weight** pairs. These are the biggest unit of data that the trainer is concerned with – they are essentially the experience that the agent gathered: the *state*, in which the agent took some *action* and the *weight* we want to attach to this action. This weight can be either the ground-truth reward or the rollout return or the group-relative advantage, among many other things. The trainer thus does not know about the concept of an episode or a rollout.
 	- The batch source can be a dataset for offline RL (like SFT) or, say, a **Rollout Engine** that is connected to a live **vLLM** server for online RL.
 - An **RL algorithm** is then just a strategy that neatly plugs into the trainer. It defines a **Credit Assigner** and a **Loss** – these two concepts are essentially all you need to define (almost) any RL algorithm.
@@ -82,6 +87,9 @@ Key points:
 - Provide a shared tokenizer per process to avoid duplicated init costs.
 - Tool calling uses a text parser (e.g., `HermesToolParser`) to extract tool calls
   from raw completions.
+- Tools have two scopes (see `ToolAgent`):
+  - `tools`: Internal tools executed by the agent (calculator, code interpreter).
+  - `external_tools`: Tools returned to the protocol for handling (delegation, sub-agents).
 - If you need explicit stop token IDs, set them via
   `VLLMExtensions.extra_body_overrides` (e.g., `{"stop_token_ids": [...]}`).
 
@@ -149,12 +157,18 @@ uv sync --extra examples
 
 - Implement the [findings](https://www.llmdata.com/blog/mismatch-praxis/) from the LLM Data co. regarding **importance sampling**:
 
+### Hierarchical Agents & Delegation
+- Implement `DelegatingProtocol` for hierarchical agent architectures
+  - Parent agents can delegate subtasks to sub-agents via external tools
+  - Both parent and child rollouts are collected for training
+  - Infrastructure is ready: `external_tools` + `external_tool_handler` (see `CONSIDERATIONS.md`)
+  - Inspired by [Context-Folding](https://context-folding.github.io/) but at protocol level
+
 ### Environments & Agents
 - Build agent harness & environment for Pokemon!
    - the agent harness and env are fused together in Claude Plays Pokemon: https://github.com/davidhershey/ClaudePlaysPokemonStarter.
    - we should disentangle them into a re-usable agent harness and the different Pokemon games as environments
 - create [Rustorio](https://github.com/albertsgarde/rustorio) env
-- add agent with context folding as described in [this paper](https://context-folding.github.io/)
 
 
 

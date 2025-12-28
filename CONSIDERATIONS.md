@@ -73,38 +73,147 @@ Not universally; it depends on what `truncated` means in the environment and the
 
 In Ludic (by default), these incomplete completions are rejected at the `Agent` level and treated like parse failures (see above), so they can be tracked and filtered separately from env/protocol truncation.
 
-## Tool Calls vs Env Actions (in progress)
+## Why AgentStep and EnvironmentStep?
 
-We now distinguish **AgentSteps** (model calls / internal loop) from **EnvironmentSteps**
-(state transitions). This fixes the “missing traces” issue: every model call gets its own
-`TokenTrace`, so ReAct-style internal tool loops are visible in rollouts.
+The core insight: **training needs visibility into the agent's reasoning process, not just its final actions.**
 
-Remaining design gap: we still need an explicit distinction between tool calls that
-*are* environment actions and tool calls that are *auxiliary* to reasoning.
+Consider a ReAct-style agent that:
+1. Thinks: "I should calculate 2+3 first"
+2. Calls calculator tool → gets "5"
+3. Thinks: "Now I can answer"
+4. Outputs: `<move>5</move>`
 
-Two categories:
-- **Env tools (state-changing):** the tool call itself is the env action. It triggers a
-  state transition and can emit reward. Protocols should treat this like an env action
-  (one EnvironmentStep per transition).
-- **Auxiliary tools (read-only):** the tool call is part of internal reasoning. Tool
-  results become prompt context for the next model call, but do not cause an env step
-  on their own (AgentSteps only).
+If we only logged the final action, we'd lose steps 1-3 entirely. But those steps contain:
+- Token traces we want to train on (the model's reasoning)
+- Tool call/result pairs that shaped the final decision
 
-Implications:
-- Tool result messages are prompt tokens (action_mask = 0). Only assistant completions
+**AgentStep** captures every model call:
+- Prompt tokens (state) + completion tokens (action) + TokenTrace
+- Tool calls made and results received
+- `action_target` indicating what happens next
+
+**EnvironmentStep** captures state transitions:
+- Previous observation, parsed action, next observation
+- Environment reward
+- References back to the AgentSteps that produced this action
+
+This separation means:
+- Rollouts contain the full reasoning trace
+- Training can concatenate all AgentSteps in a turn into one sample
+- Environments stay simple (they never see tool calls, just parsed actions)
+
+## Tool Scopes: Internal vs External
+
+Tools are divided by **who handles them**:
+
+**Internal tools** (`tools` parameter):
+- Agent executes them locally (calculator, code interpreter, etc.)
+- Results are added to agent's context
+- Agent continues reasoning with the new information
+- Recorded as AgentStep with `action_target="internal"`
+
+**External tools** (`external_tools` parameter):
+- Agent returns control to the protocol
+- Protocol decides how to handle (delegation, sub-agent calls, etc.)
+- Protocol feeds results back to agent context
+- Agent continues reasoning
+- Recorded as AgentStep with `action_target="external"`, `parse_result=None`
+
+**Final actions** (no tool call, or after tool loop completes):
+- Agent outputs text that the parser extracts an action from
+- Protocol calls `env.step()` with the parsed action
+- Recorded as AgentStep with `action_target="env"` + EnvironmentStep
+
+Key distinction: **external tools are NOT environment actions**. They're intermediate
+steps where the protocol does something (call a sub-agent, fetch data, etc.) and the
+agent continues. The environment only sees the final parsed action.
+
+## action_target Semantics
+
+Each AgentStep has an `action_target` indicating what the protocol should do:
+
+| action_target | parse_result | Protocol behavior |
+|---------------|--------------|-------------------|
+| `"internal"`  | set          | Nothing - agent handled internally, loop continues |
+| `"external"`  | `None`       | Call `external_tool_handler`, feed result to agent, call `act()` again |
+| `"env"`       | set          | Parse action, call `env.step()`, record EnvironmentStep |
+
+The `parse_result=None` for external tools is intentional: they're not final actions,
+so there's nothing to parse. The protocol handles them and the agent continues.
+
+## Training Implications
+
+- Tool result messages are prompt tokens (`action_mask=0`). Only assistant completions
   are action tokens.
-- Interleaved tool calling is multiple model calls between env steps. This is now
-  recorded as multiple AgentSteps with per-call `TokenTrace`.
-- Training now concatenates the full agent turn into one training sample by default,
-  so internal tool calls are included automatically.
-- Env tools still need a dedicated action contract/parser to mark tool calls as
-  `action_target="env"` and emit an EnvironmentStep directly from the tool call.
+- Turn concatenation stitches all AgentSteps together, so internal/external tool calls
+  are included in training automatically.
+- Credit/weight comes from the final step in the turn (EnvironmentStep if present,
+  otherwise last AgentStep for parse failures).
 
-Current behavior (ReActAgent):
-- `src/ludic/agents/react_agent.py` runs multiple model calls and returns per-call
-  AgentSteps with token traces, plus one final env-targeted step. Protocols log all
-  AgentSteps and one EnvironmentStep for the env transition, so intermediate tool
-  calls are visible and trained on via turn concatenation.
+Current behavior:
+- `ReActAgent` runs multiple model calls and returns per-call AgentSteps with token
+  traces, plus one final env-targeted step.
+- `SingleAgentSyncProtocol` handles external tools via `external_tool_handler` callback.
+- `MultiAgentSyncProtocol` logs AgentSteps but does not yet execute external tools.
+
+## Delegation: Sub-Agent Calls via External Tools
+
+External tools enable **hierarchical agent architectures** where a parent agent can
+delegate subtasks to child agents. The key insight: the agent doesn't know *how* an
+external tool is handled—it just gets a result back. The protocol decides whether to
+call an API, spawn a sub-agent, or do something else entirely.
+
+### How It Works
+
+1. Parent agent calls `delegate(task="solve this subproblem")` (an external tool)
+2. Protocol receives the tool call with `action_target="external"`
+3. Protocol spawns a sub-agent with its own context, runs it to completion
+4. Sub-agent produces its own rollout (with its own AgentSteps)
+5. Protocol extracts the result and feeds it back to parent agent's context
+6. Parent agent continues reasoning with the result
+7. Both rollouts are collected for training
+
+```
+Parent Agent                          Protocol                         Sub-Agent
+     |                                    |                                 |
+     |-- delegate(task) ----------------->|                                 |
+     |   [action_target="external"]       |                                 |
+     |                                    |-- spawn + run ---------------->|
+     |                                    |                                 |
+     |                                    |<-- sub_rollout + result -------|
+     |                                    |                                 |
+     |<-- result fed to context ---------|                                 |
+     |                                    |                                 |
+     |-- continue reasoning              |                                 |
+```
+
+### Why This Matters for Training
+
+Both the parent and child rollouts contain valuable signal:
+- **Parent rollout**: Learns *when* to delegate and *how* to use results
+- **Child rollout**: Learns *how* to solve the delegated subtask
+
+Credit assignment can flow through the hierarchy:
+- Child gets reward based on subtask success
+- Parent gets reward based on final task success (which depends on good delegation)
+
+This is inspired by "Context-Folding" (branch/return operations for long-horizon agents)
+but implemented at the protocol level rather than requiring special agent architectures.
+
+### Implementation Path
+
+The infrastructure is in place:
+- `external_tools` parameter on `ToolAgent`/`ReActAgent`
+- `external_tool_handler` callback on `SingleAgentSyncProtocol`
+- `action_target="external"` with `parse_result=None` for external tool calls
+
+What's needed for delegation:
+- A `DelegatingProtocol` that:
+  - Maintains a registry of sub-agent factories
+  - Spawns sub-agents when `delegate` tool is called
+  - Collects sub-rollouts alongside parent rollouts
+  - Returns aggregated rollouts for training
+- Credit assignment strategies that handle hierarchical rollouts
 
 ## Turn-Concatenated Training Samples (Default)
 

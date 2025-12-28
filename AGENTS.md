@@ -20,9 +20,10 @@ Instead, Ludic is closer to **classical RL** – specifically policy-gradient me
 
 - **Separate Agent vs Environment**
   - **Environment** = state transition function (+ optional scalar reward) with minimal assumptions; can be multi-agent by default.
-  - **Agent** = LLM *with state* (prompt harness + memory + parsing + optional auxiliary tools).
-    - auxiliary tools = tools that don't change the state of the environment
-  - Rationale: reuse environments across different “agent harnesses” (memory schemes, parsers, prompts, tools) and reuse harness pieces across environments.
+  - **Agent** = LLM *with state* (prompt harness + memory + parsing + optional tools).
+    - Internal tools = executed by agent (calculator, code interpreter); don't change env state
+    - External tools = returned to protocol for handling (delegation, sub-agents)
+  - Rationale: reuse environments across different "agent harnesses" (memory schemes, parsers, prompts, tools) and reuse harness pieces across environments.
 
 - **Make the interaction loop explicit**
   - Neither env nor agent “owns” rollout generation. An **InteractionProtocol** owns the agent<-->env loop and produces rollouts.
@@ -50,6 +51,11 @@ Instead, Ludic is closer to **classical RL** – specifically policy-gradient me
 ## Core Abstractions (Where + What)
 
 - **Shared types (rollouts, steps, truncation flags)**: `src/ludic/types.py`
+- **Steps (agent vs env)**: See `CONSIDERATIONS.md` for the full rationale. The short version:
+  - **AgentStep**: Every model call, including internal tool loops. Contains `TokenTrace` for training.
+  - **EnvironmentStep**: State transitions (`env.step()` outcomes). References the triggering AgentSteps.
+  - Why separate? Training needs the full reasoning trace, not just final actions. A ReAct agent might call 3 tools before outputting an action—all those calls have token traces we want to train on.
+  - Rollouts keep a single timeline of both kinds; online batching concatenates all AgentSteps in a turn into one `SAWItem`.
 
 - **Environment kernel (multi-agent by default)**: `src/ludic/envs/env.py`
   - `LudicEnv.reset() -> {agent_id: (obs, info)}`
@@ -62,8 +68,10 @@ Instead, Ludic is closer to **classical RL** – specifically policy-gradient me
   - Wraps a `ChatClient` (inference backend), a `ContextStrategy` (memory/prompt building), and a `Parser` (action decoding + intrinsic format rewards/penalties).
   - Handles incomplete completions (`finish_reason == "length"`) as parse failures (optional) to avoid training on truncated actions.
   - Extended agent types:
-    - `ToolAgent` (`src/ludic/agents/tool_agent.py`): OpenAI/vLLM-compatible tool calling with automatic schema generation from callables.
-    - `ReActAgent` (`src/ludic/agents/react_agent.py`): Multi-step ReAct pattern with configurable `max_react_steps` for tool loops.
+    - `ToolAgent` (`src/ludic/agents/tool_agent.py`): Base for tool-calling agents. Supports two tool scopes:
+      - `tools`: Internal tools executed by agent (calculator, code interpreter). Results go to context, agent continues.
+      - `external_tools`: Tools returned to protocol for handling (delegation, sub-agents). Protocol feeds results back.
+    - `ReActAgent` (`src/ludic/agents/react_agent.py`): Multi-step ReAct pattern [Think → Tool]* → Act. Returns `action_target` indicating what happens next: `"internal"` (handled), `"external"` (protocol handles), or `"env"` (final action).
 
 - **Context strategy (memory/prompt policy)**: `src/ludic/context/base.py`
   - Hooks: `on_env_reset`, `on_before_act`, `on_after_act`, `on_after_step`.
@@ -77,8 +85,12 @@ Instead, Ludic is closer to **classical RL** – specifically policy-gradient me
 
 - **Interaction protocols (own the loop)**: `src/ludic/interaction/base.py`
   - Single-agent synchronous loop: `src/ludic/interaction/single_agent.py`
+    - Supports `external_tool_handler` callback for handling external tool calls
   - Multi-agent loop (per-agent rollouts via `TraceCollector`): `src/ludic/interaction/multi_agent.py`, `src/ludic/interaction/step_collector.py`
-  - Key behavior: parser failures are handled *inside the protocol* (synthetic step, no `env.step()` call), so env stays parser-agnostic.
+  - Key behaviors:
+    - Parser failures are handled *inside the protocol* (synthetic step, no `env.step()` call), so env stays parser-agnostic.
+    - External tool calls (`action_target="external"`) are routed through `external_tool_handler`; results are fed back to agent context and the agent continues reasoning.
+  - **Delegation pattern**: External tools enable hierarchical agents where a parent can spawn sub-agents. The protocol handles the sub-agent's rollout and returns results to the parent. Both rollouts are collected for training. See `CONSIDERATIONS.md` for details.
   - Utility: `src/ludic/interaction/info.py` provides `merge_step_info()` for safely merging step metadata with collision detection on reserved keys.
 
 - **Rollout execution + collation**: `src/ludic/training/batching/rollout_engine.py`
@@ -86,7 +98,7 @@ Instead, Ludic is closer to **classical RL** – specifically policy-gradient me
   - Converts rollouts → `SAWItem`s using either:
     - exact token IDs returned by the inference backend (preferred), or
     - `retokenize=True` with a caller-provided tokenizer.
-  - Practical note: if you want drift-free RL on the *actual sampled tokens*, have your inference client return token IDs/logprobs (vLLM: `SamplingArgs["extras"]["extra_body"]["return_token_ids"]=True`).
+  - Practical note: Token-in mode (see README) ensures drift-free RL by using rollout-time token IDs directly. Use `ReturnSpec.for_rl()` or set `return_token_ids=True` in `InferenceSpec` to get token IDs from the backend.
 
 - **Batch sources (trainer talks to these, not the engine)**: `src/ludic/training/types.py`
   - Sync: `src/ludic/training/batching/synced_batching.py` (`RolloutBatchSource`)
