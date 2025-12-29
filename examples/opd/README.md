@@ -63,8 +63,8 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/opd/train_opd_gsm8k.p
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--student-model` | `Qwen/Qwen3-8B-Base` | Student model (must match vLLM server) |
-| `--teacher-model` | `Qwen/Qwen3-32B` | Teacher model (must share tokenizer with student) |
+| `--student-model` | `Qwen/Qwen2.5-0.5B-Instruct` | Student model (must match vLLM server) |
+| `--teacher-model` | `Qwen/Qwen2.5-7B-Instruct` | Teacher model (must share tokenizer with student) |
 | `--student-port` | 8000 | Student vLLM server port |
 | `--teacher-port` | 8001 | Teacher vLLM server port |
 | `--kl-coeff` | 1.0 | Coefficient for reverse KL loss |
@@ -72,6 +72,7 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/opd/train_opd_gsm8k.p
 | `--rollouts-per-update` | 64 | Rollouts per training step |
 | `--concurrency` | 32 | Parallel rollout generation |
 | `--limit` | None | Limit training samples (None = use all) |
+| `--logger` | `rich` | Loggers: rich, print, wandb, none (comma-separated) |
 
 ### Training logs
 

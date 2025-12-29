@@ -48,8 +48,12 @@ from ludic.training import (
     make_dataset_queue_requests_fn,
     make_opd,
     RequestsExhausted,
+    RolloutRequest,
+    EnvSpec,
+    ProtocolSpec,
 )
 from ludic.training import Reducer, PrintLogger, RichLiveLogger, TeeLogger, WandbLogger, default_reducers
+from ludic.eval import EngineEvaluator
 from ludic.training.scoring import make_vllm_teacher_scorer
 
 # Try to import environments
@@ -142,6 +146,17 @@ def main():
     parser.add_argument("--logger", type=str, default="rich",
                         help="Comma-separated loggers: rich, print, wandb, none.")
 
+    # Evaluation
+    parser.add_argument("--eval-every", type=int, default=10,
+                        help="Eval every N train steps.")
+    parser.add_argument("--eval-before-start", action="store_true", default=True,
+                        help="Run eval once before training begins.")
+    parser.add_argument("--eval-limit", type=int, default=1000,
+                        help="Number of test samples for eval.")
+    parser.add_argument("--eval-concurrency", type=int, default=64)
+    parser.add_argument("--eval-temperature", type=float, default=0.0,
+                        help="Sampling temperature for eval passes.")
+
     args = parser.parse_args()
 
     # Load training data
@@ -150,6 +165,11 @@ def main():
     if not train_samples:
         raise SystemExit("No GSM8K samples loaded.")
     print(f"Loaded {len(train_samples)} training samples")
+
+    # Load eval data
+    eval_samples = load_gsm8k("test", args.eval_limit) if args.eval_limit else []
+    if eval_samples:
+        print(f"Loaded {len(eval_samples)} eval samples")
 
     # Create sample queue
     samples_q: queue.Queue = queue.Queue()
@@ -264,6 +284,10 @@ def main():
         micro_token_budget=args.micro_token_budget,
         max_grad_norm=0.5,
         pad_token_id=tokenizer,
+        eval_at_start=bool(args.eval_before_start and eval_samples),
+        eval_every_n_steps=(args.eval_every if args.eval_every and args.eval_every > 0 and eval_samples else None),
+        eval_concurrency=args.eval_concurrency,
+        eval_max_steps=1,
     )
 
     # Reducers for logging
@@ -276,6 +300,13 @@ def main():
         ),
     }
 
+    # Eval reducers
+    eval_reducers = {
+        "accuracy": Reducer(kind="count_true", source="correct", normalize_by="samples", as_percent=True),
+        "parse_error_rate": Reducer(kind="count_true", source="parse_error", normalize_by="samples", as_percent=True),
+        "avg_completion_tokens": Reducer(kind="mean", source="completion_length"),
+    }
+
     # Logger
     logger_keys = [
         "train/loss",
@@ -284,6 +315,9 @@ def main():
         "train/correct_rate",
         "train/avg_completion_length",
         "train/num_samples",
+        "eval/accuracy",
+        "eval/parse_error_rate",
+        "eval/avg_completion_tokens",
     ]
 
     train_logger = None
@@ -331,6 +365,38 @@ def main():
         cfg=cfg,
         train_logger=train_logger,
         reducers=reducers,
+        evaluator=(
+            None
+            if not eval_samples
+            else EngineEvaluator(
+                engine=RolloutEngine(env_registry=env_registry, protocol_registry=protocol_registry),
+                requests_fn=lambda: [
+                    RolloutRequest(
+                        env=EnvSpec(
+                            kind="gsm8k",
+                            kwargs={"sample": sample},
+                        ),
+                        protocol=ProtocolSpec(kind="single_agent"),
+                        env_seed=idx,
+                        sampling_seed=idx,
+                        inference=InferenceSpec(
+                            sampling=SamplingParams(
+                                temperature=args.eval_temperature,
+                                max_tokens=args.max_completion_tokens,
+                            ),
+                            return_=ReturnSpec.for_eval(return_token_ids=True),
+                        ),
+                        num_episodes=1,
+                        meta={"eval_sample_index": idx, "question_id": sample.get("id", idx)},
+                    )
+                    for idx, sample in enumerate(eval_samples)
+                ],
+                reducers=eval_reducers,
+                max_steps=1,
+                timeout_s=cfg.eval_timeout_s,
+                concurrency=cfg.eval_concurrency,
+            )
+        ),
     )
 
     # Train
