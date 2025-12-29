@@ -339,7 +339,7 @@ class ClippedSurrogateLoss:
         L_clip = - E[ min(r * A, clip(r, 1 - eps_low, 1 + eps_high) * A) ]
 
     Expects:
-        - batch["weight"]:       A  (advantages)      [B]
+        - batch["weight"]:       A  (advantages)      [B] or token-level [B, T]
         - batch[old_logp_key]:   log π_old(a|s)      [B]
         - input_ids / attention_mask / action_mask for π_new.
 
@@ -365,7 +365,7 @@ class ClippedSurrogateLoss:
     def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
         input_ids = batch["input_ids"]
         action_mask = batch["action_mask"]
-        advantages = batch["weight"]              # [B]
+        advantages = batch["weight"]
         if self.old_logp_key not in batch:
             raise KeyError(f"ClippedSurrogateLoss requires '{self.old_logp_key}' in batch.")
 
@@ -387,13 +387,28 @@ class ClippedSurrogateLoss:
         if self.ratio_clip is not None:
             ratio = torch.clamp(ratio, max=self.ratio_clip)
 
-        unclipped = ratio * advantages
-        clipped = torch.clamp(
+        ratio_clipped = torch.clamp(
             ratio, 1.0 - self.clip_eps_low, 1.0 + self.clip_eps_high
-        ) * advantages
-
-        obj = torch.min(unclipped, clipped)
-        loss = -obj.mean()
+        )
+        if advantages.dim() == 2:
+            if advantages.shape != action_mask.shape:
+                raise ValueError(
+                    "ClippedSurrogateLoss expects token-level weights to match action_mask shape "
+                    f"{tuple(action_mask.shape)}, got {tuple(advantages.shape)}."
+                )
+            adv_mask = action_mask.to(advantages.dtype)
+            ratio_exp = ratio.unsqueeze(-1)
+            ratio_clipped_exp = ratio_clipped.unsqueeze(-1)
+            unclipped = ratio_exp * advantages
+            clipped = ratio_clipped_exp * advantages
+            obj = torch.min(unclipped, clipped) * adv_mask
+            adv_denom = adv_mask.sum().clamp(min=1.0)
+            loss = -obj.sum() / adv_denom
+        else:
+            unclipped = ratio * advantages
+            clipped = ratio_clipped * advantages
+            obj = torch.min(unclipped, clipped)
+            loss = -obj.mean()
 
         ppo_clip_frac = (
             (ratio > 1.0 + self.clip_eps_high) | (ratio < 1.0 - self.clip_eps_low)
@@ -403,6 +418,15 @@ class ClippedSurrogateLoss:
         else:
             ratio_clip_frac = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
 
+        if advantages.dim() == 2:
+            masked_adv = advantages * adv_mask
+            adv_mean = masked_adv.sum() / adv_denom
+            adv_var = ((masked_adv - adv_mean) * adv_mask).pow(2).sum() / adv_denom
+            adv_std = adv_var.sqrt()
+        else:
+            adv_mean = advantages.mean()
+            adv_std = advantages.std(unbiased=False)
+
         stats = {
             "loss": loss.detach(),
             "ratio_mean": ratio.mean().detach(),
@@ -410,8 +434,8 @@ class ClippedSurrogateLoss:
             "clip_frac": ppo_clip_frac.detach(),
             "ratio_clip_frac": ratio_clip_frac.detach(),
             "kl_actor_policy": mismatch_kl.mean().detach(),
-            "adv_mean": advantages.mean().detach(),
-            "adv_std": advantages.std(unbiased=False).detach(),
+            "adv_mean": adv_mean.detach(),
+            "adv_std": adv_std.detach(),
             "logp_mean": logp_action.mean().detach(),
         }
         return loss, stats

@@ -577,6 +577,7 @@ def make_gspo_opd(
     *,
     group_size: int,
     kl_coeff: float = 1.0,
+    kl_per_token: bool = True,
     group_normalize_adv: bool = True,
     positive_only: bool = False,
     clip_eps_low: float = 3e-4,
@@ -602,12 +603,14 @@ def make_gspo_opd(
 
     Pipeline:
         1. GroupNormalizedReturn computes task-based advantages
-        2. KLCreditModifier adds negative KL to advantages
+        2. KLCreditModifier adds negative KL to advantages (per-token if kl_per_token=True)
         3. ClippedSurrogateLoss computes policy gradient with modified advantages
 
     Args:
         group_size: Number of rollouts per group for advantage normalization.
         kl_coeff: Coefficient for KL penalty. Higher = stronger teacher matching.
+        kl_per_token: If True, apply KL penalty per action token by broadcasting
+            scalar advantages to token-level weights.
         group_normalize_adv: Normalize advantages within each group.
         positive_only: Clip negative advantages to zero.
         clip_eps_low: Lower PPO clipping epsilon.
@@ -646,7 +649,7 @@ def make_gspo_opd(
         positive_only=positive_only,
     )
 
-    credit_modifiers = [KLCreditModifier(coeff=kl_coeff)]
+    credit_modifiers = [KLCreditModifier(coeff=kl_coeff, broadcast_advantage=kl_per_token)]
 
     loss: Loss = ClippedSurrogateLoss(
         clip_eps_low=clip_eps_low,

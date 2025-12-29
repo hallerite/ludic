@@ -443,11 +443,11 @@ def test_kl_credit_modifier_zeroes_prompt_tokens():
 
 def test_kl_credit_modifier_turn_level_weight():
     """
-    Test that turn-level (1D) weights are broadcast to completion-only format.
+    Test that turn-level (1D) weights stay scalar per sample by default.
 
     Credit assigners produce one weight per turn/step, but KL is per-token.
-    The modifier broadcasts the turn weight and adds per-token KL, outputting
-    completion-only [B, max_completion_len] to match ratio shape in loss.
+    The modifier keeps the scalar shape and adds the summed per-token KL
+    over action tokens.
     """
     # Turn-level weight: one value per sample (shape [B])
     weight = torch.tensor([2.0, -1.0])  # two samples with advantages 2.0 and -1.0
@@ -476,16 +476,49 @@ def test_kl_credit_modifier_turn_level_weight():
     modifier = KLCreditModifier(coeff=1.0)
     modified_batch, _ = modifier.modify(batch)
 
-    # Output is completion-only [B, max_completion_len=3]
-    # Sample 0: weight=2.0 + kl_penalty=[-0.5, -0.5, -0.5] -> [1.5, 1.5, 1.5]
-    # Sample 1: weight=-1.0 + kl_penalty=[0.5, 0.5, 0.0] -> [-0.5, -0.5, 0.0]
-    #   (only 2 action tokens, so 3rd position is 0 padding)
-    expected_weight = torch.tensor([
-        [1.5, 1.5, 1.5],
-        [-0.5, -0.5, 0.0],  # 3rd is padding (no action token there)
+    # Output stays [B] with summed KL over action tokens.
+    # Sample 0: weight=2.0 + sum(kl_penalty=-0.5 * 3 tokens) = 0.5
+    # Sample 1: weight=-1.0 + sum(kl_penalty=0.5 * 2 tokens) = 0.0
+    expected_weight = torch.tensor([0.5, 0.0])
+
+    assert modified_batch["weight"].shape == (2,)
+    assert torch.allclose(modified_batch["weight"], expected_weight, atol=1e-6)
+
+
+def test_kl_credit_modifier_turn_level_weight_broadcast():
+    """
+    Test that turn-level (1D) weights can be broadcast to per-token advantages.
+    """
+    weight = torch.tensor([2.0, -1.0])
+    actor_logps = torch.tensor([
+        [-1.0, -1.0, -1.0, -1.0],
+        [-2.0, -2.0, -2.0, -2.0],
+    ])
+    teacher_logps = torch.tensor([
+        [-1.5, -1.5, -1.5, -1.5],
+        [-1.5, -1.5, -1.5, -1.5],
+    ])
+    action_mask = torch.tensor([
+        [0, 1, 1, 1],
+        [0, 0, 1, 1],
     ])
 
-    assert modified_batch["weight"].shape == (2, 3)  # completion-only
+    batch = {
+        "weight": weight,
+        "actor_logps": actor_logps,
+        "teacher_logps": teacher_logps,
+        "action_mask": action_mask,
+    }
+
+    modifier = KLCreditModifier(coeff=1.0, broadcast_advantage=True)
+    modified_batch, _ = modifier.modify(batch)
+
+    expected_weight = torch.tensor([
+        [0.0, 1.5, 1.5, 1.5],
+        [0.0, 0.0, -0.5, -0.5],
+    ])
+
+    assert modified_batch["weight"].shape == (2, 4)
     assert torch.allclose(modified_batch["weight"], expected_weight, atol=1e-6)
 
 

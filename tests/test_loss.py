@@ -257,6 +257,31 @@ def test_gspo_loss_length_normalize_affects_ratio():
     assert torch.allclose(loss_norm, expected_loss_norm, atol=1e-4)
 
 
+def test_gspo_loss_token_advantages_masked_mean():
+    logits = torch.tensor([[
+        [0.0, 0.0],  # predicts token at pos 1
+        [2.0, 0.0],  # predicts token at pos 2
+        [0.0, 0.0],  # unused
+    ]], dtype=torch.float32)
+    input_ids = torch.tensor([[0, 1, 0]], dtype=torch.long)
+    action_mask = torch.tensor([[0, 1, 1]], dtype=torch.float32)
+
+    logp_action = compute_logp_action(logits, input_ids, action_mask)
+    batch = {
+        "input_ids": input_ids,
+        "action_mask": action_mask,
+        "weight": torch.tensor([[0.0, 2.0, -1.0]], dtype=torch.float32),
+        "old_logp_action": logp_action,
+    }
+
+    loss_fn = ClippedSurrogateLoss(clip_eps_low=1.0, clip_eps_high=1.0, length_normalize=False)
+    loss, _ = loss_fn.compute(logits, batch)
+
+    # ratio = 1.0, so loss is the masked mean of advantages over action tokens.
+    # (2.0 + -1.0) / 2 = 0.5 => loss = -0.5
+    assert torch.allclose(loss, torch.tensor(-0.5), atol=1e-4)
+
+
 def test_gspo_loss_upper_clip_positive_advantage():
     logits = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
     input_ids = torch.tensor([[0, 1]], dtype=torch.long)

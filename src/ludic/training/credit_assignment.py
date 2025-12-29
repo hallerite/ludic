@@ -79,6 +79,8 @@ class KLCreditModifier:
     Args:
         coeff: Coefficient for KL penalty. Higher = stronger teacher matching.
         name: Modifier name for logging. Metrics appear as "{name}/kl_mean", etc.
+        broadcast_advantage: If True, expand scalar advantages to per-token
+            values over action tokens so KL is applied per token.
 
     Requires batch to have:
         - "actor_logps": [B, T] old policy logprobs from rollout
@@ -94,6 +96,7 @@ class KLCreditModifier:
 
     coeff: float = 1.0
     name: str = "kl"
+    broadcast_advantage: bool = False
 
     def modify(self, batch: Batch) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
         if "actor_logps" not in batch:
@@ -113,22 +116,28 @@ class KLCreditModifier:
         weight = batch["weight"]  # [B], [B, C], or [B, T]
 
         B, T = action_mask.shape
+        action_mask_f = action_mask.float()
 
         # Reverse KL: log π_student - log π_teacher (full sequence)
         # We want to minimize this, so we add NEGATIVE KL to advantages
         reverse_kl = actor_logps - teacher_logps  # [B, T]
         kl_penalty_full = -self.coeff * reverse_kl  # [B, T]
 
-        # Handle different weight shapes, keeping output in same format as input.
+        # Handle different weight shapes. By default we keep the input format,
+        # but can broadcast scalar weights to per-token advantages if requested.
         # The loss function expects weight to match ratio shape, which may be
         # completion-only [B, C] rather than full sequence [B, T].
         if weight.dim() == 1:
-            # Turn-level [B]: add completion KL summed over action tokens.
-            kl_penalty_scalar = (kl_penalty_full * action_mask.float()).sum(dim=-1)
-            modified_weight = weight + kl_penalty_scalar
+            # Turn-level [B]: either keep scalar or broadcast to per-token.
+            if self.broadcast_advantage:
+                base_adv = weight.unsqueeze(-1) * action_mask_f
+                modified_weight = (base_adv + kl_penalty_full) * action_mask_f
+            else:
+                kl_penalty_scalar = (kl_penalty_full * action_mask_f).sum(dim=-1)
+                modified_weight = weight + kl_penalty_scalar
         elif weight.shape[-1] == T:
             # Full sequence [B, T]: add KL directly, mask to action tokens.
-            modified_weight = (weight + kl_penalty_full) * action_mask.float()
+            modified_weight = (weight + kl_penalty_full) * action_mask_f
         else:
             # Completion-only [B, C]: extract KL for action tokens and align to completion positions.
             C = weight.shape[-1]
@@ -153,9 +162,9 @@ class KLCreditModifier:
         # Compute metrics (masked to action tokens)
         mask_sum = action_mask.sum()
         if mask_sum > 0:
-            masked_kl = reverse_kl * action_mask.float()
+            masked_kl = reverse_kl * action_mask_f
             kl_mean = masked_kl.sum() / mask_sum
-            kl_std = ((masked_kl - kl_mean * action_mask.float()) ** 2).sum() / mask_sum
+            kl_std = ((masked_kl - kl_mean * action_mask_f) ** 2).sum() / mask_sum
             kl_std = kl_std.sqrt()
         else:
             kl_mean = reverse_kl.new_zeros(())
@@ -164,7 +173,7 @@ class KLCreditModifier:
         metrics = {
             "kl_mean": kl_mean.detach(),
             "kl_std": kl_std.detach(),
-            "kl_penalty_mean": (kl_penalty_full * action_mask.float()).sum().detach() / mask_sum.clamp(min=1),
+            "kl_penalty_mean": (kl_penalty_full * action_mask_f).sum().detach() / mask_sum.clamp(min=1),
         }
 
         return modified_batch, metrics
