@@ -97,14 +97,22 @@ Rollouts are written to `opd_rollouts.jsonl`.
 
 ## How GSPO + OPD works
 
+This uses "Level 2: Advantage Modification" via CreditModifier (see `docs/composition.md`):
+
 1. **Student samples**: The student model generates completions for GSM8K problems
 2. **Environment rewards**: Each completion is graded for correctness (sparse reward)
 3. **Teacher scores**: The teacher model computes per-token logprobs on the student's samples
-4. **Composite loss**: Training uses two objectives:
-   - **GSPO**: Policy gradient with group-normalized advantages from task rewards
-   - **Reverse KL**: Minimizes `KL(student || teacher) = log π_student - log π_teacher`
+4. **Credit assignment**: GroupNormalizedReturn computes task-based advantages
+5. **Credit modification**: KLCreditModifier adds KL penalty to advantages:
+   ```
+   A_t = task_advantage + (-kl_coeff * (actor_logp_t - teacher_logp_t))
+   ```
+6. **Policy gradient**: ClippedSurrogateLoss with modified advantages
 
-This gives the student task-specific learning from environment feedback while also pushing it to match the teacher's token distribution.
+Key benefits of this approach (vs CompositeLoss):
+- KL goes through importance sampling (multiplied by ratio like task rewards)
+- KL uses old policy logprobs from rollout time (not current policy)
+- All signals interact through the same loss function
 
 ## Tips
 

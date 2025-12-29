@@ -2,11 +2,148 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Any, Dict, List, Mapping, Protocol, Tuple
 
 import torch
+from torch import Tensor
+
 from ludic.types import Rollout
 from ludic.training.types import RolloutStepKey
+
+
+Batch = Mapping[str, Tensor]
+
+
+# ---------------------------------------------------------------------------
+# Credit Modifiers (Level 2: Advantage Modification)
+# ---------------------------------------------------------------------------
+#
+# CreditModifiers operate on collated batches (after credit assignment) to
+# modify the per-token advantages/weights before loss computation.
+#
+# Key use case: OPD where KL penalty is added to advantages, causing it to
+# go through importance sampling like task rewards.
+#
+# See docs/composition.md for the full composition level documentation.
+# ---------------------------------------------------------------------------
+
+
+class CreditModifier(Protocol):
+    """
+    Modifies batch advantages after collation, before loss computation.
+
+    This is "Level 2: Advantage Modification" - adding per-token signals
+    (like KL penalty) to trajectory-level advantages from credit assignment.
+
+    Unlike CompositeLoss (Level 3: Loss Composition), signals added here:
+    - Go through importance sampling (multiplied by ratio)
+    - Use rollout-time (old policy) values, not current policy
+    - Interact with task rewards through the same loss function
+
+    Example:
+        >>> modifier = KLCreditModifier(coeff=1.0)
+        >>> batch, metrics = modifier.modify(batch)
+        >>> # batch["weight"] now includes KL penalty
+    """
+
+    name: str
+
+    def modify(self, batch: Batch) -> Tuple[Batch, Dict[str, Any]]:
+        """
+        Modify batch advantages and return metrics.
+
+        Args:
+            batch: Collated batch with at least:
+                - "weight": [B, T] per-token advantages from credit assignment
+                - Other fields depend on the modifier (e.g., "actor_logps", "teacher_logps")
+
+        Returns:
+            Tuple of (modified_batch, metrics_dict).
+            The batch should be modified in-place for efficiency.
+            Metrics are namespaced under self.name by the caller.
+        """
+        ...
+
+
+@dataclass
+class KLCreditModifier:
+    """
+    Add negative reverse KL to advantages for on-policy distillation.
+
+    Implements KL penalty for OPD:
+        kl_advantage_t = -coeff * (actor_logps_t - teacher_logps_t)
+
+    The KL is computed at rollout time (old policy), so it goes through
+    importance sampling when used with ratio-based losses like PPO/GSPO.
+
+    Args:
+        coeff: Coefficient for KL penalty. Higher = stronger teacher matching.
+        name: Modifier name for logging. Metrics appear as "{name}/kl_mean", etc.
+
+    Requires batch to have:
+        - "actor_logps": [B, T] old policy logprobs from rollout
+        - "teacher_logps": [B, T] teacher logprobs
+
+    Example:
+        >>> algo = RLAlgorithm(
+        ...     credit_assigner=GroupNormalizedReturn(group_size=8),
+        ...     credit_modifiers=[KLCreditModifier(coeff=1.0)],
+        ...     loss=ClippedSurrogateLoss(...),
+        ... )
+    """
+
+    coeff: float = 1.0
+    name: str = "kl"
+
+    def modify(self, batch: Batch) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
+        if "actor_logps" not in batch:
+            raise KeyError(
+                "KLCreditModifier requires batch['actor_logps']. "
+                "Ensure rollouts return actor logprobs (ReturnSpec.for_rl())."
+            )
+        if "teacher_logps" not in batch:
+            raise KeyError(
+                "KLCreditModifier requires batch['teacher_logps']. "
+                "Ensure agent has a teacher scorer (e.g., make_vllm_teacher_scorer())."
+            )
+
+        actor_logps = batch["actor_logps"]  # [B, T]
+        teacher_logps = batch["teacher_logps"]  # [B, T]
+        action_mask = batch["action_mask"]  # [B, T]
+        weight = batch["weight"]  # [B, T]
+
+        # Reverse KL: log π_student - log π_teacher
+        # We want to minimize this, so we add NEGATIVE KL to advantages
+        reverse_kl = actor_logps - teacher_logps  # [B, T]
+        kl_penalty = -self.coeff * reverse_kl  # [B, T]
+
+        # Add to weight (advantage), masked to action tokens only
+        # Note: action_mask should already be applied to weight, but we
+        # apply it to kl_penalty too for safety
+        modified_weight = weight + kl_penalty * action_mask.float()
+
+        # Create modified batch (shallow copy with updated weight)
+        modified_batch = dict(batch)
+        modified_batch["weight"] = modified_weight
+
+        # Compute metrics (masked to action tokens)
+        mask_sum = action_mask.sum()
+        if mask_sum > 0:
+            masked_kl = reverse_kl * action_mask.float()
+            kl_mean = masked_kl.sum() / mask_sum
+            kl_std = ((masked_kl - kl_mean * action_mask.float()) ** 2).sum() / mask_sum
+            kl_std = kl_std.sqrt()
+        else:
+            kl_mean = reverse_kl.new_zeros(())
+            kl_std = reverse_kl.new_zeros(())
+
+        metrics = {
+            "kl_mean": kl_mean.detach(),
+            "kl_std": kl_std.detach(),
+            "kl_penalty_mean": (kl_penalty * action_mask.float()).sum().detach() / max(mask_sum, 1),
+        }
+
+        return modified_batch, metrics
 
 
 # ---- Credit Assigners ----

@@ -27,6 +27,7 @@ from .algorithm import (
     make_cispo,
     make_sft,
     make_opd,
+    make_gspo_opd,
 )
 from .credit_assignment import (
     GroupNormalizedReturn,
@@ -34,6 +35,8 @@ from .credit_assignment import (
     PerStepReward,
     EpisodicReturn,
     ConstantCredit,
+    CreditModifier,
+    KLCreditModifier,
 )
 from .loss import (
     Loss,
@@ -87,12 +90,16 @@ __all__ = [
     "make_cispo",
     "make_sft",
     "make_opd",
+    "make_gspo_opd",
     # Credit assignment
     "GroupNormalizedReturn",
     "MonteCarloReturn",
     "PerStepReward",
     "EpisodicReturn",
     "ConstantCredit",
+    # Credit modifiers (Level 2: Advantage Modification)
+    "CreditModifier",
+    "KLCreditModifier",
     # Losses
     "Loss",
     "ReinforceLoss",

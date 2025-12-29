@@ -5,13 +5,17 @@ This example combines:
   - GSPO (Group-Sorted Policy Optimization): Task rewards from GSM8K correctness
   - OPD (On-Policy Distillation): Dense per-token supervision from teacher
 
-The hybrid approach uses a composite loss:
-  1. ClippedSurrogateLoss (GSPO): Policy gradient with group-normalized advantages
-  2. ReverseKLLoss (OPD): KL(student || teacher) = log π_student - log π_teacher
+The hybrid uses "Level 2: Advantage Modification" via CreditModifier:
+  1. GroupNormalizedReturn computes task-based advantages from correctness rewards
+  2. KLCreditModifier adds negative KL to advantages: A_t += -coeff * (actor_logp - teacher_logp)
+  3. ClippedSurrogateLoss computes policy gradient with modified advantages
 
-This gives you both:
-  - Task-specific learning from environment rewards (sparse but grounded)
-  - Distribution matching from teacher (dense per-token feedback)
+Key benefits of this approach (vs CompositeLoss):
+  - KL goes through importance sampling (like task rewards)
+  - KL uses old policy logprobs from rollout time
+  - All signals interact through the same loss function
+
+See docs/composition.md for the full composition level documentation.
 
 The key insight: teacher logprobs are an *intrinsic scorer* attached to the Agent.
 The scorer runs during Agent.act() and scores flow through to training.
@@ -58,13 +62,10 @@ from ludic.training import (
     RolloutRequest,
     EnvSpec,
     ProtocolSpec,
-    RLAlgorithm,
+    make_gspo_opd,
 )
 from ludic.training import Reducer, RichLiveLogger, PrintLogger, TeeLogger, WandbLogger, default_reducers
 from ludic.training.scoring import make_vllm_teacher_scorer
-from ludic.training.credit_assignment import GroupNormalizedReturn
-from ludic.training.loss import ClippedSurrogateLoss, ReverseKLLoss, CompositeLoss, LossTerm
-from ludic.training.algorithm import validate_actor_logps
 from environments.gsm8k import GSM8KEnv
 
 
@@ -225,38 +226,13 @@ def main():
 
     protocol_registry = {"single_agent": protocol_factory}
 
-    # Algorithm: GSPO (task rewards) + OPD (teacher KL) hybrid
-    # Credit assignment from GSPO: group-normalized returns
-    credit_assigner = GroupNormalizedReturn(
+    # Algorithm: GSPO + OPD hybrid (Advantage Composition)
+    # - GSPO: Task rewards with group-normalized advantages
+    # - OPD: KL penalty added to advantages via KLCreditModifier
+    # See docs/composition.md for composition level documentation
+    algo = make_gspo_opd(
         group_size=args.group_size,
-        normalize_adv=True,
-        positive_only=False,
-    )
-    # Composite loss: PPO-style clipped surrogate + reverse KL
-    loss = CompositeLoss(terms=[
-        LossTerm(
-            name="gspo",
-            loss=ClippedSurrogateLoss(
-                clip_eps_low=3e-4,
-                clip_eps_high=4e-4,
-                length_normalize=True,
-            ),
-            weight=1.0,
-        ),
-        LossTerm(
-            name="kl",
-            loss=ReverseKLLoss(
-                coeff=1.0,
-                length_normalize=True,
-            ),
-            weight=args.kl_coeff,
-        ),
-    ])
-    algo = RLAlgorithm(
-        name="gspo_opd",
-        credit_assigner=credit_assigner,
-        loss=loss,
-        preprocess=validate_actor_logps,
+        kl_coeff=args.kl_coeff,
     )
 
     # Engine + batch source
@@ -340,9 +316,8 @@ def main():
     # Logger keys
     logger_keys = [
         "train/loss",
-        "train/gspo/loss",
-        "train/kl/loss",
-        "train/kl/reverse_kl_mean",
+        "train/kl/kl_mean",  # KLCreditModifier: mean reverse KL per token
+        "train/kl/kl_penalty_mean",  # KLCreditModifier: mean penalty added to advantages
         "train/avg_total_reward",
         "train/correct_rate",
         "train/parse_err_rate",

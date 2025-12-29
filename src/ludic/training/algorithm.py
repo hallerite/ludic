@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Protocol
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Mapping, Optional, Protocol
 
 from jaxtyping import Float
 from torch import nn, Tensor
@@ -17,7 +17,13 @@ from ludic.training.loss import (
     MaskedCausalLMCrossEntropyLoss,
     ReverseKLLoss,
 )
-from ludic.training.credit_assignment import MonteCarloReturn, GroupNormalizedReturn, ConstantCredit
+from ludic.training.credit_assignment import (
+    MonteCarloReturn,
+    GroupNormalizedReturn,
+    ConstantCredit,
+    CreditModifier,
+    KLCreditModifier,
+)
 
 
 Batch = Mapping[str, Tensor]
@@ -30,18 +36,37 @@ class PreprocessFn(Protocol):
 @dataclass
 class RLAlgorithm:
     """
-    Full RL algorithm = credit assignment + loss.
+    Full RL algorithm = credit assignment + credit modifiers + loss.
 
-    - credit_assigner: maps Rollouts -> per-step scalar credits
-                 (e.g. discounted returns / advantages)
-    - loss:      consumes a collated batch (built from SAWBatch) and produces
-                 a scalar loss and stats.
-    - name:      identifier for logging / checkpoints
+    Pipeline:
+        Rollouts → CreditAssigner → SAWBatch → Collator → Batch
+                                                            ↓
+                                                    CreditModifiers
+                                                            ↓
+                                                      Modified Batch
+                                                            ↓
+                                                          Loss
+
+    Components:
+        - credit_assigner: Rollouts → per-step scalar credits (advantages)
+        - credit_modifiers: Batch → Modified Batch (add per-token signals to advantages)
+        - loss: Batch + Logits → scalar loss
+
+    CreditModifiers (Level 2: Advantage Modification):
+        Modify advantages AFTER collation, BEFORE loss. Signals added here:
+        - Go through importance sampling (multiplied by ratio)
+        - Use rollout-time values (old policy)
+        - Interact with task rewards through the same loss
+
+        Example: KLCreditModifier adds teacher KL penalty to advantages.
+
+    See docs/composition.md for the full composition level documentation.
     """
 
     name: str
     credit_assigner: CreditAssigner
     loss: Loss
+    credit_modifiers: List[CreditModifier] = field(default_factory=list)
     preprocess: Optional[PreprocessFn] = None
 
     def compute_loss(
@@ -50,8 +75,22 @@ class RLAlgorithm:
         batch: Batch,
     ) -> tuple[Tensor, Dict[str, Any]]:
         """
-        Runs the forward pass once and delegates to the Loss object.
+        Apply credit modifiers, run forward pass, compute loss.
+
+        Returns:
+            Tuple of (loss, stats_dict) where stats_dict includes:
+            - Modifier metrics namespaced as "{modifier.name}/{metric}"
+            - Loss metrics from self.loss.compute()
         """
+        all_stats: Dict[str, Any] = {}
+
+        # --- Apply credit modifiers (Level 2: Advantage Modification) ---
+        for modifier in self.credit_modifiers:
+            batch, modifier_stats = modifier.modify(batch)
+            # Namespace modifier metrics
+            for key, value in modifier_stats.items():
+                all_stats[f"{modifier.name}/{key}"] = value
+
         # --- Run the forward pass ---
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
@@ -61,8 +100,11 @@ class RLAlgorithm:
         )
         logits: Logits = outputs.logits
 
-        # Pass the resulting logits to the loss function
-        return self.loss.compute(logits, batch)
+        # --- Compute loss ---
+        loss, loss_stats = self.loss.compute(logits, batch)
+        all_stats.update(loss_stats)
+
+        return loss, all_stats
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +558,10 @@ def make_opd(
         ```
 
     Reference: https://thinkingmachines.ai/blog/on-policy-distillation
+
+    Note:
+        This uses Loss Composition (Level 3). For OPD where KL goes through
+        importance sampling (Level 2: Advantage Modification), use make_gspo_opd() instead.
     """
     credit_assigner: CreditAssigner = ConstantCredit(value=1.0)
     loss: Loss = ReverseKLLoss(coeff=kl_coeff, length_normalize=length_normalize)
@@ -524,4 +570,101 @@ def make_opd(
         name=name,
         credit_assigner=credit_assigner,
         loss=loss,
+    )
+
+
+def make_gspo_opd(
+    *,
+    group_size: int,
+    kl_coeff: float = 1.0,
+    group_normalize_adv: bool = True,
+    positive_only: bool = False,
+    clip_eps_low: float = 3e-4,
+    clip_eps_high: float = 4e-4,
+    length_normalize: bool = True,
+    ratio_clip: Optional[float] = None,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
+    name: str = "gspo_opd",
+) -> RLAlgorithm:
+    """
+    GSPO + OPD hybrid using advantage composition.
+
+    Combines:
+    - GSPO: Task rewards with group-normalized advantages
+    - OPD: Teacher KL penalty added to advantages (Level 2: Advantage Modification)
+
+    KL is computed at rollout time and added to advantages BEFORE the loss.
+    This means:
+    - KL goes through importance sampling (multiplied by ratio)
+    - KL uses old policy logprobs (from rollout), not current policy
+    - All signals interact through the same loss function
+
+    Pipeline:
+        1. GroupNormalizedReturn computes task-based advantages
+        2. KLCreditModifier adds negative KL to advantages
+        3. ClippedSurrogateLoss computes policy gradient with modified advantages
+
+    Args:
+        group_size: Number of rollouts per group for advantage normalization.
+        kl_coeff: Coefficient for KL penalty. Higher = stronger teacher matching.
+        group_normalize_adv: Normalize advantages within each group.
+        positive_only: Clip negative advantages to zero.
+        clip_eps_low: Lower PPO clipping epsilon.
+        clip_eps_high: Upper PPO clipping epsilon.
+        length_normalize: Normalize loss by number of action tokens.
+        ratio_clip: Optional upper bound for ratio truncation.
+        drop_zero_weight: Drop zero-advantage samples before collation.
+        drop_zero_weight_eps: Epsilon for zero-weight detection.
+        name: Algorithm name for logging.
+
+    Prerequisites:
+        - Rollouts must return actor logprobs (ReturnSpec.for_rl())
+        - Agent must have a teacher scorer (make_vllm_teacher_scorer())
+        - Rollouts must have group_id for GSPO advantage normalization
+
+    Example:
+        ```python
+        from ludic.training import make_gspo_opd
+        from ludic.training.scoring import make_vllm_teacher_scorer
+
+        teacher_scorer = make_vllm_teacher_scorer(
+            base_url="http://localhost:8001",
+            model="Qwen/Qwen3-32B",
+        )
+
+        agent = Agent(client=client, ..., scorers=[teacher_scorer])
+        algo = make_gspo_opd(group_size=8, kl_coeff=1.0)
+        trainer = Trainer(model=model, algo=algo, ...)
+        ```
+
+    Reference: https://thinkingmachines.ai/blog/on-policy-distillation
+    """
+    credit_assigner: CreditAssigner = GroupNormalizedReturn(
+        group_size=group_size,
+        normalize_adv=group_normalize_adv,
+        positive_only=positive_only,
+    )
+
+    credit_modifiers = [KLCreditModifier(coeff=kl_coeff)]
+
+    loss: Loss = ClippedSurrogateLoss(
+        clip_eps_low=clip_eps_low,
+        clip_eps_high=clip_eps_high,
+        length_normalize=length_normalize,
+        ratio_clip=ratio_clip,
+    )
+
+    preprocess_fns = []
+    if drop_zero_weight:
+        preprocess_fns.append(lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps))
+    preprocess_fns.append(validate_actor_logps)
+    preprocess = compose_preprocess(*preprocess_fns)
+
+    return RLAlgorithm(
+        name=name,
+        credit_assigner=credit_assigner,
+        credit_modifiers=credit_modifiers,
+        loss=loss,
+        preprocess=preprocess,
     )

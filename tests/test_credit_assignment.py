@@ -1,5 +1,6 @@
 import pytest
 import math
+import torch
 
 from ludic.types import Rollout, EnvironmentStep, TokenTrace
 from ludic.training.credit_assignment import (
@@ -7,6 +8,7 @@ from ludic.training.credit_assignment import (
     EpisodicReturn,
     PerStepReward,
     GroupNormalizedReturn,
+    KLCreditModifier,
 )
 
 # ---- Helper to build a simple rollout ----
@@ -243,3 +245,162 @@ def test_group_normalized_return_invalid_group_size():
 
     with pytest.raises(ValueError, match="group_size must be positive"):
         GroupNormalizedReturn(group_size=-1)
+
+
+# ---- KLCreditModifier Tests ----
+
+def _make_batch(
+    *,
+    weight: torch.Tensor,
+    actor_logps: torch.Tensor,
+    teacher_logps: torch.Tensor,
+    action_mask: torch.Tensor,
+) -> dict:
+    """Helper to create a batch dict for KLCreditModifier tests."""
+    return {
+        "weight": weight,
+        "actor_logps": actor_logps,
+        "teacher_logps": teacher_logps,
+        "action_mask": action_mask,
+    }
+
+
+def test_kl_credit_modifier_basic():
+    """Test basic KL penalty addition to advantages."""
+    # Batch of 2 samples, 4 tokens each
+    # actor_logps - teacher_logps = reverse KL
+    # KL penalty = -coeff * reverse_kl
+    weight = torch.zeros(2, 4)
+    actor_logps = torch.tensor([
+        [-1.0, -2.0, -1.5, -0.5],  # sample 0
+        [-2.0, -1.0, -3.0, -1.0],  # sample 1
+    ])
+    teacher_logps = torch.tensor([
+        [-1.5, -1.5, -1.5, -1.5],  # sample 0: teacher
+        [-1.5, -1.5, -1.5, -1.5],  # sample 1: teacher
+    ])
+    action_mask = torch.tensor([
+        [0, 1, 1, 1],  # sample 0: first token is prompt
+        [0, 0, 1, 1],  # sample 1: first two tokens are prompt
+    ])
+
+    batch = _make_batch(
+        weight=weight,
+        actor_logps=actor_logps,
+        teacher_logps=teacher_logps,
+        action_mask=action_mask,
+    )
+
+    modifier = KLCreditModifier(coeff=1.0)
+    modified_batch, metrics = modifier.modify(batch)
+
+    # reverse_kl = actor - teacher
+    # sample 0: [-1.0 - (-1.5), -2.0 - (-1.5), -1.5 - (-1.5), -0.5 - (-1.5)]
+    #         = [0.5, -0.5, 0.0, 1.0]
+    # sample 1: [-2.0 - (-1.5), -1.0 - (-1.5), -3.0 - (-1.5), -1.0 - (-1.5)]
+    #         = [-0.5, 0.5, -1.5, 0.5]
+    # kl_penalty = -1.0 * reverse_kl (masked)
+    # sample 0: [0, 0.5, 0.0, -1.0]  (first token masked)
+    # sample 1: [0, 0, 1.5, -0.5]    (first two masked)
+
+    expected_weight = torch.tensor([
+        [0.0, 0.5, 0.0, -1.0],
+        [0.0, 0.0, 1.5, -0.5],
+    ])
+
+    assert torch.allclose(modified_batch["weight"], expected_weight, atol=1e-6)
+
+    # Check metrics
+    assert "kl_mean" in metrics
+    assert "kl_std" in metrics
+    assert "kl_penalty_mean" in metrics
+
+
+def test_kl_credit_modifier_with_existing_advantage():
+    """Test that KL penalty is added to existing advantages."""
+    # Start with non-zero advantages
+    weight = torch.tensor([
+        [0.0, 1.0, 1.0, 1.0],  # sample 0
+        [0.0, 0.0, 2.0, 2.0],  # sample 1
+    ])
+    actor_logps = torch.tensor([
+        [-1.0, -1.0, -1.0, -1.0],
+        [-1.0, -1.0, -1.0, -1.0],
+    ])
+    teacher_logps = torch.tensor([
+        [-2.0, -2.0, -2.0, -2.0],  # actor closer to 0 = higher prob
+        [-2.0, -2.0, -2.0, -2.0],
+    ])
+    action_mask = torch.tensor([
+        [0, 1, 1, 1],
+        [0, 0, 1, 1],
+    ])
+
+    batch = _make_batch(
+        weight=weight,
+        actor_logps=actor_logps,
+        teacher_logps=teacher_logps,
+        action_mask=action_mask,
+    )
+
+    modifier = KLCreditModifier(coeff=1.0)
+    modified_batch, _ = modifier.modify(batch)
+
+    # reverse_kl = -1.0 - (-2.0) = 1.0 everywhere
+    # kl_penalty = -1.0 * 1.0 = -1.0 (penalty for being overconfident vs teacher)
+    # Modified weight = original + penalty (masked)
+    expected_weight = torch.tensor([
+        [0.0, 1.0 - 1.0, 1.0 - 1.0, 1.0 - 1.0],  # [0, 0, 0, 0]
+        [0.0, 0.0, 2.0 - 1.0, 2.0 - 1.0],        # [0, 0, 1, 1]
+    ])
+
+    assert torch.allclose(modified_batch["weight"], expected_weight, atol=1e-6)
+
+
+def test_kl_credit_modifier_coeff():
+    """Test that coeff scales the KL penalty."""
+    weight = torch.zeros(1, 3)
+    actor_logps = torch.tensor([[-1.0, -1.0, -1.0]])
+    teacher_logps = torch.tensor([[-2.0, -2.0, -2.0]])
+    action_mask = torch.tensor([[1, 1, 1]])
+
+    batch = _make_batch(
+        weight=weight,
+        actor_logps=actor_logps,
+        teacher_logps=teacher_logps,
+        action_mask=action_mask,
+    )
+
+    # With coeff=2.0, penalty should be doubled
+    modifier = KLCreditModifier(coeff=2.0)
+    modified_batch, _ = modifier.modify(batch)
+
+    # reverse_kl = 1.0, penalty = -2.0 * 1.0 = -2.0
+    expected_weight = torch.tensor([[-2.0, -2.0, -2.0]])
+    assert torch.allclose(modified_batch["weight"], expected_weight, atol=1e-6)
+
+
+def test_kl_credit_modifier_missing_actor_logps():
+    """Test that missing actor_logps raises KeyError."""
+    batch = {
+        "weight": torch.zeros(1, 3),
+        "teacher_logps": torch.zeros(1, 3),
+        "action_mask": torch.ones(1, 3),
+    }
+
+    modifier = KLCreditModifier()
+    with pytest.raises(KeyError, match="actor_logps"):
+        modifier.modify(batch)
+
+
+def test_kl_credit_modifier_missing_teacher_logps():
+    """Test that missing teacher_logps raises KeyError."""
+    batch = {
+        "weight": torch.zeros(1, 3),
+        "actor_logps": torch.zeros(1, 3),
+        "action_mask": torch.ones(1, 3),
+    }
+
+    modifier = KLCreditModifier()
+    with pytest.raises(KeyError, match="teacher_logps"):
+        modifier.modify(batch)
