@@ -73,6 +73,9 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/opd/train_opd_gsm8k.p
 | `--concurrency` | 32 | Parallel rollout generation |
 | `--limit` | None | Limit training samples (None = use all) |
 | `--logger` | `rich` | Loggers: rich, print, wandb, none (comma-separated) |
+| `--eval-every` | 10 | Eval every N train steps |
+| `--eval-limit` | 1000 | Number of test samples for eval |
+| `--eval-temperature` | 0.0 | Sampling temperature for eval (greedy) |
 
 ### Training logs
 
@@ -81,6 +84,8 @@ Output includes:
 - `train/reverse_kl_mean`: Mean per-token KL divergence
 - `train/correct_rate`: GSM8K accuracy on training samples
 - `train/avg_completion_length`: Average tokens per completion
+- `eval/accuracy`: GSM8K accuracy on test set
+- `eval/parse_error_rate`: Parse error rate on test set
 
 Rollouts are written to `opd_rollouts.jsonl`.
 

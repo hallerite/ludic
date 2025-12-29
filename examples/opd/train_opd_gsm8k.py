@@ -17,8 +17,8 @@ Reference: https://thinkingmachines.ai/blog/on-policy-distillation
 
 Usage:
     python train_opd_gsm8k.py \
-        --student-model Qwen/Qwen3-8B-Base \
-        --teacher-model Qwen/Qwen3-32B \
+        --student-model Qwen/Qwen2.5-0.5B-Instruct \
+        --teacher-model Qwen/Qwen2.5-7B-Instruct \
         --limit 1000
 
 Requirements:
@@ -28,6 +28,8 @@ Requirements:
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 import queue
 from typing import List, Dict, Any
 
@@ -37,14 +39,17 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ludic.agent import Agent
 from ludic.context import FullDialog
-from ludic.inference import InferenceSpec, SamplingParams, ReturnSpec, HFChatTemplate
+from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec, HFChatTemplate
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import boxed_parser
+from ludic.distributed.adapters import create_vllm_publisher
+from ludic.eval import EngineEvaluator
 from ludic.training import (
     RolloutEngine,
     RolloutBatchSource,
     Trainer,
     TrainerConfig,
+    CheckpointConfig,
     make_dataset_queue_requests_fn,
     make_opd,
     RequestsExhausted,
@@ -52,31 +57,9 @@ from ludic.training import (
     EnvSpec,
     ProtocolSpec,
 )
-from ludic.training import Reducer, PrintLogger, RichLiveLogger, TeeLogger, WandbLogger, default_reducers
-from ludic.eval import EngineEvaluator
+from ludic.training import Reducer, RichLiveLogger, PrintLogger, TeeLogger, WandbLogger, default_reducers
 from ludic.training.scoring import make_vllm_teacher_scorer
-
-# Try to import environments
-try:
-    from environments.gsm8k import GSM8KEnv
-except ImportError:
-    # Fallback: define a minimal GSM8K env
-    from ludic.envs import DatasetQAEnv
-
-    class GSM8KEnv(DatasetQAEnv):
-        def __init__(self, sample: Dict[str, Any], system_prompt: str = ""):
-            super().__init__(
-                question=sample["question"],
-                ground_truth=self._extract_answer(sample["answer"]),
-                system_prompt=system_prompt or "Solve the following problem step by step. Put your final answer in \\boxed{}.",
-            )
-
-        @staticmethod
-        def _extract_answer(answer_text: str) -> str:
-            # GSM8K answers have format "...\n#### answer"
-            if "####" in answer_text:
-                return answer_text.split("####")[-1].strip()
-            return answer_text.strip()
+from environments.gsm8k import GSM8KEnv
 
 
 def load_gsm8k(split: str, limit: int | None) -> List[Dict[str, Any]]:
@@ -120,16 +103,16 @@ def main():
     parser.add_argument("--rollouts-per-update", type=int, default=64,
                         help="Number of rollouts per training step")
     parser.add_argument("--train-steps", type=int, default=100,
-                        help="Number of training steps")
-    parser.add_argument("--max-seq-len", type=int, default=2048,
-                        help="Max sequence length")
-    parser.add_argument("--micro-token-budget", type=int, default=32768,
+                        help="Number of training steps; 0 = run until samples exhausted")
+    parser.add_argument("--max-seq-len", type=int, default=1024,
+                        help="Max tokens per sample")
+    parser.add_argument("--micro-token-budget", type=int, default=16384,
                         help="Max padded tokens per micro-batch")
-    parser.add_argument("--max-completion-tokens", type=int, default=1024,
+    parser.add_argument("--max-completion-tokens", type=int, default=512,
                         help="Max completion tokens per rollout")
     parser.add_argument("--temperature", type=float, default=1.0,
-                        help="Sampling temperature")
-    parser.add_argument("--concurrency", type=int, default=32,
+                        help="Sampling temperature for training rollouts")
+    parser.add_argument("--concurrency", type=int, default=64,
                         help="Rollout concurrency")
 
     # OPD-specific configuration
@@ -140,9 +123,11 @@ def main():
 
     # System prompt
     parser.add_argument("--system-prompt", type=str,
-                        default="First, think step by step. Then put your final answer inside \\boxed{...}.")
+                        default="First, think step by step. Then put your final answer inside \\boxed{...}.",
+                        help="System prompt for GSM8K env; set to '' to use the model default.")
 
     # Logging
+    parser.add_argument("--rollout-log", type=str, default="opd_rollouts.jsonl")
     parser.add_argument("--logger", type=str, default="rich",
                         help="Comma-separated loggers: rich, print, wandb, none.")
 
@@ -157,7 +142,23 @@ def main():
     parser.add_argument("--eval-temperature", type=float, default=0.0,
                         help="Sampling temperature for eval passes.")
 
+    # Checkpointing
+    parser.add_argument("--final-save", action="store_true",
+                        help="Save a final checkpoint after training completes.")
+
     args = parser.parse_args()
+
+    # Validation
+    if args.rollouts_per_update <= 0:
+        raise ValueError("--rollouts-per-update must be > 0.")
+    if args.max_completion_tokens > args.max_seq_len:
+        raise ValueError("--max-completion-tokens must be <= --max-seq-len.")
+
+    # Setup rollout log path
+    rollout_log_path = os.path.abspath(args.rollout_log)
+    os.makedirs(os.path.dirname(rollout_log_path) or ".", exist_ok=True)
+    # Touch the file so tailing works even before the first rollout is written
+    open(rollout_log_path, "a", encoding="utf-8").close()
 
     # Load training data
     print(f"Loading GSM8K {args.split} split...")
@@ -179,24 +180,17 @@ def main():
     # Load tokenizer and model
     print(f"Loading student model: {args.student_model}")
     tokenizer = AutoTokenizer.from_pretrained(args.student_model)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.student_model,
-        torch_dtype=torch.bfloat16,
-    )
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
+    model = AutoModelForCausalLM.from_pretrained(args.student_model, dtype=torch.bfloat16)
+    model.to("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Create vLLM clients
-    from ludic.inference import VLLMChatClient
-    from ludic.distributed.adapters import create_vllm_publisher
-
-    # Student client for sampling
+    # Create vLLM client for student
     client = VLLMChatClient(
         host=args.student_host,
         port=args.student_port,
         enable_weight_updates=True,
     )
     publisher = create_vllm_publisher(client)
+    chat_template = HFChatTemplate(tokenizer)
 
     # Teacher scorer - computes per-token logprobs during Agent.act()
     teacher_scorer = make_vllm_teacher_scorer(
@@ -204,17 +198,11 @@ def main():
         model=args.teacher_model,
     )
 
-    chat_template = HFChatTemplate(tokenizer)
-
-    # Environment and protocol registries
+    # Registries
     env_registry = {
-        "gsm8k": lambda sample: GSM8KEnv(
-            sample=sample,
-            system_prompt=args.system_prompt,
-        )
+        "gsm8k": lambda sample: GSM8KEnv(sample=sample, system_prompt=args.system_prompt)
     }
 
-    # Agent with teacher scorer - scores flow through to training
     def protocol_factory():
         return SingleAgentSyncProtocol(
             agent=Agent(
@@ -229,21 +217,19 @@ def main():
 
     protocol_registry = {"single_agent": protocol_factory}
 
-    # Create OPD algorithm
+    # Algorithm (OPD: reverse KL loss with constant credit)
     algo = make_opd(
         kl_coeff=args.kl_coeff,
         length_normalize=args.length_normalize,
         name="opd",
     )
 
-    # Create rollout engine
+    # Engine + batch source
     engine = RolloutEngine(
         env_registry=env_registry,
         protocol_registry=protocol_registry,
-        jsonl_path="opd_rollouts.jsonl",
+        jsonl_path=rollout_log_path,
     )
-
-    # Create inference spec
     train_inference = InferenceSpec(
         sampling=SamplingParams(
             temperature=args.temperature,
@@ -251,8 +237,6 @@ def main():
         ),
         return_=ReturnSpec.for_rl(top_logprobs_k=1),
     )
-
-    # Create requests function
     requests_fn = make_dataset_queue_requests_fn(
         samples_q,
         batch_size=args.rollouts_per_update,
@@ -267,8 +251,6 @@ def main():
         env_seed_fn=lambda idx, _sample: idx,
         sampling_seed_fn=lambda idx, _sample: idx,
     )
-
-    # Create batch source (no teacher_client needed - it's in the Agent!)
     batch_source = RolloutBatchSource(
         orchestrator=engine,
         credit_assigner=algo.credit_assigner,
@@ -279,7 +261,7 @@ def main():
 
     # Trainer config
     cfg = TrainerConfig(
-        model_device=device,
+        model_device="cuda" if torch.cuda.is_available() else "cpu",
         max_seq_len=args.max_seq_len,
         micro_token_budget=args.micro_token_budget,
         max_grad_norm=0.5,
@@ -290,34 +272,47 @@ def main():
         eval_max_steps=1,
     )
 
-    # Reducers for logging
+    # Checkpoint config
+    checkpoint_cfg = CheckpointConfig(
+        output_dir="checkpoints_opd",
+        every_n_steps=25,
+        max_to_keep=2,
+        save_optimizer=True,
+    )
+
+    # Reducers
     reducers = {
-        **default_reducers(),
         "correct_rate": Reducer(
             kind="count_true",
             source="correct",
             normalize_by="rollouts",
         ),
+        "parse_err_rate": Reducer(
+            kind="count_true",
+            source="parse_error",
+            normalize_by="samples",
+        ),
+        "total_completion_tokens": Reducer(
+            kind="sum",
+            source="completion_length",
+        ),
     }
+    reducers = {**default_reducers(), **reducers}
 
-    # Eval reducers
-    eval_reducers = {
-        "accuracy": Reducer(kind="count_true", source="correct", normalize_by="samples", as_percent=True),
-        "parse_error_rate": Reducer(kind="count_true", source="parse_error", normalize_by="samples", as_percent=True),
-        "avg_completion_tokens": Reducer(kind="mean", source="completion_length"),
-    }
-
-    # Logger
+    # Logger keys
     logger_keys = [
         "train/loss",
         "train/reverse_kl_mean",
         "train/avg_total_reward",
         "train/correct_rate",
+        "train/parse_err_rate",
         "train/avg_completion_length",
-        "train/num_samples",
+        "train/total_completion_tokens",
         "eval/accuracy",
         "eval/parse_error_rate",
         "eval/avg_completion_tokens",
+        "train/target_rollouts",
+        "train/num_samples",
     ]
 
     train_logger = None
@@ -334,13 +329,12 @@ def main():
     if "print" in logger_tokens:
         console_logger = PrintLogger(prefix="[opd]", keys=logger_keys, precision=4)
     elif "rich" in logger_tokens:
-        import sys
         if not sys.stdout.isatty():
             console_logger = PrintLogger(prefix="[opd]", keys=logger_keys, precision=4)
         else:
             console_logger = RichLiveLogger(
                 keys=logger_keys,
-                spark_key="train/reverse_kl_mean",
+                spark_key="train/avg_total_reward",
                 history=100,
                 precision=4,
             )
@@ -355,6 +349,13 @@ def main():
         else:
             train_logger = console_logger or wandb_logger
 
+    # Eval reducers
+    eval_reducers = {
+        "accuracy": Reducer(kind="count_true", source="correct", normalize_by="samples", as_percent=True),
+        "parse_error_rate": Reducer(kind="count_true", source="parse_error", normalize_by="samples", as_percent=True),
+        "avg_completion_tokens": Reducer(kind="mean", source="completion_length"),
+    }
+
     # Create trainer
     trainer = Trainer(
         model=model,
@@ -363,6 +364,7 @@ def main():
         publisher=publisher,
         enable_gradient_checkpointing=True,
         cfg=cfg,
+        checkpoint_config=checkpoint_cfg,
         train_logger=train_logger,
         reducers=reducers,
         evaluator=(
@@ -410,6 +412,13 @@ def main():
         trainer.train_sync(args.train_steps)
     except RequestsExhausted:
         print("No more training samples; stopping.")
+
+    if args.final_save:
+        try:
+            ckpt_path = trainer.save_checkpoint(metadata={"final": True})
+            print(f"Final checkpoint saved to: {ckpt_path}")
+        except RuntimeError:
+            pass  # No checkpointer configured
 
     print("\nTraining complete!")
 
