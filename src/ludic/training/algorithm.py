@@ -461,7 +461,7 @@ def make_sft(
 def make_opd(
     *,
     kl_coeff: float = 1.0,
-    length_normalize: bool = False,
+    length_normalize: bool = True,
     name: str = "opd",
 ) -> RLAlgorithm:
     """
@@ -488,8 +488,8 @@ def make_opd(
     Args:
         kl_coeff: Coefficient for KL loss. Higher values push the student
             harder towards the teacher's distribution. Default 1.0.
-        length_normalize: If True, divide per-sample loss by number of
-            action tokens. Useful when sequences have varying lengths.
+        length_normalize: If True (default), divide per-sample loss by number
+            of action tokens. This keeps gradients stable across sequence lengths.
         name: Algorithm name for logging/metrics.
 
     Example:

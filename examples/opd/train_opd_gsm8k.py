@@ -1,14 +1,17 @@
 """
-On-Policy Distillation (OPD) training on GSM8K using vLLM.
+GSPO + OPD hybrid training on GSM8K using vLLM.
 
-This example demonstrates on-policy distillation where:
-  - A student model samples trajectories
-  - A teacher model provides per-token logprobs as dense supervision
-  - Training minimizes reverse KL divergence: KL(student || teacher)
+This example combines:
+  - GSPO (Group-Sorted Policy Optimization): Task rewards from GSM8K correctness
+  - OPD (On-Policy Distillation): Dense per-token supervision from teacher
 
-This combines the benefits of:
-  - On-policy learning (student samples from itself)
-  - Dense supervision (per-token feedback, not sparse rewards)
+The hybrid approach uses a composite loss:
+  1. ClippedSurrogateLoss (GSPO): Policy gradient with group-normalized advantages
+  2. ReverseKLLoss (OPD): KL(student || teacher) = log π_student - log π_teacher
+
+This gives you both:
+  - Task-specific learning from environment rewards (sparse but grounded)
+  - Distribution matching from teacher (dense per-token feedback)
 
 The key insight: teacher logprobs are an *intrinsic scorer* attached to the Agent.
 The scorer runs during Agent.act() and scores flow through to training.
@@ -51,14 +54,17 @@ from ludic.training import (
     TrainerConfig,
     CheckpointConfig,
     make_dataset_queue_requests_fn,
-    make_opd,
     RequestsExhausted,
     RolloutRequest,
     EnvSpec,
     ProtocolSpec,
+    RLAlgorithm,
 )
 from ludic.training import Reducer, RichLiveLogger, PrintLogger, TeeLogger, WandbLogger, default_reducers
 from ludic.training.scoring import make_vllm_teacher_scorer
+from ludic.training.credit_assignment import GroupNormalizedReturn
+from ludic.training.loss import ClippedSurrogateLoss, ReverseKLLoss, CompositeLoss, LossTerm
+from ludic.training.algorithm import validate_actor_logps
 from environments.gsm8k import GSM8KEnv
 
 
@@ -100,9 +106,11 @@ def main():
                         help="Limit training samples (None = use all)")
 
     # Training configuration
-    parser.add_argument("--rollouts-per-update", type=int, default=64,
-                        help="Number of rollouts per training step")
-    parser.add_argument("--train-steps", type=int, default=100,
+    parser.add_argument("--rollouts-per-update", type=int, default=256,
+                        help="Total rollouts per update (must be divisible by --group-size)")
+    parser.add_argument("--group-size", type=int, default=8,
+                        help="Group size for grouped advantages")
+    parser.add_argument("--train-steps", type=int, default=20,
                         help="Number of training steps; 0 = run until samples exhausted")
     parser.add_argument("--max-seq-len", type=int, default=1024,
                         help="Max tokens per sample")
@@ -110,16 +118,14 @@ def main():
                         help="Max padded tokens per micro-batch")
     parser.add_argument("--max-completion-tokens", type=int, default=512,
                         help="Max completion tokens per rollout")
-    parser.add_argument("--temperature", type=float, default=1.0,
+    parser.add_argument("--train-temperature", type=float, default=1.0,
                         help="Sampling temperature for training rollouts")
     parser.add_argument("--concurrency", type=int, default=64,
                         help="Rollout concurrency")
 
-    # OPD-specific configuration
+    # OPD-specific configuration (hybrid GSPO + KL)
     parser.add_argument("--kl-coeff", type=float, default=1.0,
-                        help="Coefficient for reverse KL loss")
-    parser.add_argument("--length-normalize", action="store_true",
-                        help="Normalize loss by sequence length")
+                        help="Coefficient for reverse KL loss term")
 
     # System prompt
     parser.add_argument("--system-prompt", type=str,
@@ -151,6 +157,8 @@ def main():
     # Validation
     if args.rollouts_per_update <= 0:
         raise ValueError("--rollouts-per-update must be > 0.")
+    if args.rollouts_per_update % args.group_size != 0:
+        raise ValueError("--rollouts-per-update must be divisible by --group-size.")
     if args.max_completion_tokens > args.max_seq_len:
         raise ValueError("--max-completion-tokens must be <= --max-seq-len.")
 
@@ -217,11 +225,38 @@ def main():
 
     protocol_registry = {"single_agent": protocol_factory}
 
-    # Algorithm (OPD: reverse KL loss with constant credit)
-    algo = make_opd(
-        kl_coeff=args.kl_coeff,
-        length_normalize=args.length_normalize,
-        name="opd",
+    # Algorithm: GSPO (task rewards) + OPD (teacher KL) hybrid
+    # Credit assignment from GSPO: group-normalized returns
+    credit_assigner = GroupNormalizedReturn(
+        group_size=args.group_size,
+        normalize_adv=True,
+        positive_only=False,
+    )
+    # Composite loss: PPO-style clipped surrogate + reverse KL
+    loss = CompositeLoss(terms=[
+        LossTerm(
+            name="gspo",
+            loss=ClippedSurrogateLoss(
+                clip_eps_low=3e-4,
+                clip_eps_high=4e-4,
+                length_normalize=True,
+            ),
+            weight=1.0,
+        ),
+        LossTerm(
+            name="kl",
+            loss=ReverseKLLoss(
+                coeff=1.0,
+                length_normalize=True,
+            ),
+            weight=args.kl_coeff,
+        ),
+    ])
+    algo = RLAlgorithm(
+        name="gspo_opd",
+        credit_assigner=credit_assigner,
+        loss=loss,
+        preprocess=validate_actor_logps,
     )
 
     # Engine + batch source
@@ -232,14 +267,16 @@ def main():
     )
     train_inference = InferenceSpec(
         sampling=SamplingParams(
-            temperature=args.temperature,
+            temperature=args.train_temperature,
             max_tokens=args.max_completion_tokens,
         ),
+        # Ask vLLM for token IDs + chosen-token logprobs for importance sampling
         return_=ReturnSpec.for_rl(top_logprobs_k=1),
     )
+    base_requests = args.rollouts_per_update // args.group_size
     requests_fn = make_dataset_queue_requests_fn(
         samples_q,
-        batch_size=args.rollouts_per_update,
+        batch_size=base_requests,
         env_kind="gsm8k",
         protocol_kind="single_agent",
         inference=train_inference,
@@ -250,6 +287,7 @@ def main():
         },
         env_seed_fn=lambda idx, _sample: idx,
         sampling_seed_fn=lambda idx, _sample: idx,
+        group_size=args.group_size,
     )
     batch_source = RolloutBatchSource(
         orchestrator=engine,
@@ -302,7 +340,9 @@ def main():
     # Logger keys
     logger_keys = [
         "train/loss",
-        "train/reverse_kl_mean",
+        "train/gspo/loss",
+        "train/kl/loss",
+        "train/kl/reverse_kl_mean",
         "train/avg_total_reward",
         "train/correct_rate",
         "train/parse_err_rate",

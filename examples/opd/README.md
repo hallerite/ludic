@@ -1,10 +1,14 @@
-# On-Policy Distillation (OPD) Training on GSM8K
+# GSPO + OPD Hybrid Training on GSM8K
 
-Train a smaller student model using dense per-token supervision from a larger teacher model.
+Train a smaller student model using both task rewards and dense per-token supervision from a larger teacher model.
 
-OPD combines the benefits of:
-- **On-policy learning**: Student samples from itself (not teacher demonstrations)
-- **Dense supervision**: Per-token feedback via reverse KL divergence (not sparse rewards)
+This hybrid approach combines:
+- **GSPO (Group-Sorted Policy Optimization)**: Task rewards from GSM8K correctness with group-normalized advantages
+- **OPD (On-Policy Distillation)**: Dense per-token feedback via reverse KL divergence from teacher
+
+The composite loss balances:
+1. **Task-specific learning**: Sparse but grounded rewards from environment
+2. **Distribution matching**: Dense per-token guidance from teacher
 
 Reference: https://thinkingmachines.ai/blog/on-policy-distillation
 
@@ -67,9 +71,9 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/opd/train_opd_gsm8k.p
 | `--teacher-model` | `Qwen/Qwen2.5-7B-Instruct` | Teacher model (must share tokenizer with student) |
 | `--student-port` | 8000 | Student vLLM server port |
 | `--teacher-port` | 8001 | Teacher vLLM server port |
-| `--kl-coeff` | 1.0 | Coefficient for reverse KL loss |
-| `--length-normalize` | False | Normalize loss by sequence length |
-| `--rollouts-per-update` | 64 | Rollouts per training step |
+| `--kl-coeff` | 1.0 | Coefficient for reverse KL loss term |
+| `--rollouts-per-update` | 256 | Total rollouts per training step |
+| `--group-size` | 8 | Group size for GSPO advantages |
 | `--concurrency` | 32 | Parallel rollout generation |
 | `--limit` | None | Limit training samples (None = use all) |
 | `--logger` | `rich` | Loggers: rich, print, wandb, none (comma-separated) |
@@ -80,8 +84,10 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/opd/train_opd_gsm8k.p
 ### Training logs
 
 Output includes:
-- `train/loss`: Reverse KL loss
-- `train/reverse_kl_mean`: Mean per-token KL divergence
+- `train/loss`: Combined loss (GSPO + KL)
+- `train/gspo/loss`: GSPO policy gradient loss
+- `train/kl/loss`: Reverse KL loss
+- `train/kl/reverse_kl_mean`: Mean per-token KL divergence
 - `train/correct_rate`: GSM8K accuracy on training samples
 - `train/avg_completion_length`: Average tokens per completion
 - `eval/accuracy`: GSM8K accuracy on test set
@@ -89,13 +95,16 @@ Output includes:
 
 Rollouts are written to `opd_rollouts.jsonl`.
 
-## How OPD works
+## How GSPO + OPD works
 
 1. **Student samples**: The student model generates completions for GSM8K problems
-2. **Teacher scores**: The teacher model computes per-token logprobs on the student's samples
-3. **Reverse KL loss**: Training minimizes `KL(student || teacher) = log π_student - log π_teacher`
+2. **Environment rewards**: Each completion is graded for correctness (sparse reward)
+3. **Teacher scores**: The teacher model computes per-token logprobs on the student's samples
+4. **Composite loss**: Training uses two objectives:
+   - **GSPO**: Policy gradient with group-normalized advantages from task rewards
+   - **Reverse KL**: Minimizes `KL(student || teacher) = log π_student - log π_teacher`
 
-This pushes the student to assign high probability to tokens the teacher prefers, while staying on-policy (sampling from itself).
+This gives the student task-specific learning from environment feedback while also pushing it to match the teacher's token distribution.
 
 ## Tips
 
