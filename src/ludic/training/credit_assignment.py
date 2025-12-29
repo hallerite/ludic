@@ -107,42 +107,55 @@ class KLCreditModifier:
                 "Ensure agent has a teacher scorer (e.g., make_vllm_teacher_scorer())."
             )
 
-        actor_logps = batch["actor_logps"]  # [B, T]
-        teacher_logps = batch["teacher_logps"]  # [B, T]
-        action_mask = batch["action_mask"]  # [B, T]
+        actor_logps = batch["actor_logps"]  # [B, T] full sequence
+        teacher_logps = batch["teacher_logps"]  # [B, T] full sequence
+        action_mask = batch["action_mask"]  # [B, T] full sequence
         weight = batch["weight"]  # [B], [B, C], or [B, T]
 
         B, T = action_mask.shape
 
-        # Handle different weight shapes:
-        # - [B]: turn-level weight (one per sample) -> broadcast to [B, 1]
-        # - [B, C]: completion-only weight (C < T) -> expand to [B, T]
-        # - [B, T]: already token-level -> use as-is
-        if weight.dim() == 1:
-            # Turn-level: broadcast to all tokens
-            weight = weight.unsqueeze(-1)  # [B] -> [B, 1] for broadcasting
-        elif weight.shape[-1] != T:
-            # Completion-only: expand to full sequence using action_mask positions.
-            # weight[b, :n_actions] goes to positions where action_mask[b] == 1.
-            # We handle each sample separately since they may have different
-            # numbers of action tokens (variable completion lengths).
-            expanded_weight = torch.zeros(B, T, device=weight.device, dtype=weight.dtype)
+        # Reverse KL: log π_student - log π_teacher (full sequence)
+        # We want to minimize this, so we add NEGATIVE KL to advantages
+        reverse_kl = actor_logps - teacher_logps  # [B, T]
+        kl_penalty_full = -self.coeff * reverse_kl  # [B, T]
+
+        # Handle different weight shapes, keeping output in same format as input.
+        # The loss function expects weight to match ratio shape, which may be
+        # completion-only [B, C] rather than full sequence [B, T].
+        if weight.shape[-1] == T:
+            # Full sequence [B, T]: add KL directly, mask to action tokens.
+            modified_weight = (weight + kl_penalty_full) * action_mask.float()
+        else:
+            # Turn-level [B] or completion-only [B, C]: extract KL for action tokens.
+            # We need completion-only KL penalty to match the weight format.
+            # Determine max completion length from action_mask.
+            completion_lens = action_mask.sum(dim=-1).long()  # [B]
+            max_completion_len = int(completion_lens.max().item())
+
+            # Extract KL penalty for action tokens only -> [B, max_completion_len]
+            kl_penalty_completion = torch.zeros(
+                B, max_completion_len, device=weight.device, dtype=weight.dtype
+            )
+            # Also build completion-only mask for padding positions
+            completion_mask = torch.zeros(
+                B, max_completion_len, device=weight.device, dtype=weight.dtype
+            )
             for b in range(B):
                 action_indices = action_mask[b].nonzero(as_tuple=True)[0]
                 n_actions = len(action_indices)
-                expanded_weight[b, action_indices] = weight[b, :n_actions]
-            weight = expanded_weight
+                kl_penalty_completion[b, :n_actions] = kl_penalty_full[b, action_indices]
+                completion_mask[b, :n_actions] = 1.0
 
-        # Reverse KL: log π_student - log π_teacher
-        # We want to minimize this, so we add NEGATIVE KL to advantages
-        reverse_kl = actor_logps - teacher_logps  # [B, T]
-        kl_penalty = -self.coeff * reverse_kl  # [B, T]
-
-        # Add KL penalty to weight (advantage), then mask to action tokens only.
-        # We apply action_mask to the entire sum to ensure prompt tokens have
-        # zero weight, regardless of how the upstream credit assigner populated
-        # the weight tensor. This prevents prompt-length-dependent loss scaling.
-        modified_weight = (weight + kl_penalty) * action_mask.float()  # [B, T]
+            if weight.dim() == 1:
+                # Turn-level [B]: broadcast to completion-only, add per-token KL.
+                # Output is [B, max_completion_len] to match ratio shape.
+                # Zero out padding positions.
+                modified_weight = (weight.unsqueeze(-1) + kl_penalty_completion) * completion_mask
+            else:
+                # Completion-only [B, C]: add KL directly.
+                # C should equal max_completion_len (or be padded similarly).
+                C = weight.shape[-1]
+                modified_weight = weight + kl_penalty_completion[:, :C]
 
         # Create modified batch (shallow copy with updated weight)
         modified_batch = dict(batch)
@@ -162,7 +175,7 @@ class KLCreditModifier:
         metrics = {
             "kl_mean": kl_mean.detach(),
             "kl_std": kl_std.detach(),
-            "kl_penalty_mean": (kl_penalty * action_mask.float()).sum().detach() / mask_sum.clamp(min=1),
+            "kl_penalty_mean": (kl_penalty_full * action_mask.float()).sum().detach() / mask_sum.clamp(min=1),
         }
 
         return modified_batch, metrics

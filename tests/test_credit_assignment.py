@@ -443,10 +443,11 @@ def test_kl_credit_modifier_zeroes_prompt_tokens():
 
 def test_kl_credit_modifier_turn_level_weight():
     """
-    Test that turn-level (1D) weights are broadcast to token-level.
+    Test that turn-level (1D) weights are broadcast to completion-only format.
 
     Credit assigners produce one weight per turn/step, but KL is per-token.
-    The modifier should broadcast the turn weight to all action tokens.
+    The modifier broadcasts the turn weight and adds per-token KL, outputting
+    completion-only [B, max_completion_len] to match ratio shape in loss.
     """
     # Turn-level weight: one value per sample (shape [B])
     weight = torch.tensor([2.0, -1.0])  # two samples with advantages 2.0 and -1.0
@@ -457,12 +458,12 @@ def test_kl_credit_modifier_turn_level_weight():
         [-2.0, -2.0, -2.0, -2.0],
     ])
     teacher_logps = torch.tensor([
-        [-1.5, -1.5, -1.5, -1.5],  # KL = -1.0 - (-1.5) = 0.5
-        [-1.5, -1.5, -1.5, -1.5],  # KL = -2.0 - (-1.5) = -0.5
+        [-1.5, -1.5, -1.5, -1.5],  # KL = -1.0 - (-1.5) = 0.5, penalty = -0.5
+        [-1.5, -1.5, -1.5, -1.5],  # KL = -2.0 - (-1.5) = -0.5, penalty = 0.5
     ])
     action_mask = torch.tensor([
-        [0, 1, 1, 1],  # sample 0: 3 action tokens
-        [0, 0, 1, 1],  # sample 1: 2 action tokens
+        [0, 1, 1, 1],  # sample 0: 3 action tokens (positions 1,2,3)
+        [0, 0, 1, 1],  # sample 1: 2 action tokens (positions 2,3)
     ])
 
     batch = {
@@ -475,25 +476,25 @@ def test_kl_credit_modifier_turn_level_weight():
     modifier = KLCreditModifier(coeff=1.0)
     modified_batch, _ = modifier.modify(batch)
 
-    # Sample 0: turn_weight=2.0, kl_penalty=-0.5 per token
-    #   modified = (2.0 + (-0.5)) * mask = 1.5 on action tokens
-    # Sample 1: turn_weight=-1.0, kl_penalty=0.5 per token
-    #   modified = (-1.0 + 0.5) * mask = -0.5 on action tokens
+    # Output is completion-only [B, max_completion_len=3]
+    # Sample 0: weight=2.0 + kl_penalty=[-0.5, -0.5, -0.5] -> [1.5, 1.5, 1.5]
+    # Sample 1: weight=-1.0 + kl_penalty=[0.5, 0.5, 0.0] -> [-0.5, -0.5, 0.0]
+    #   (only 2 action tokens, so 3rd position is 0 padding)
     expected_weight = torch.tensor([
-        [0.0, 1.5, 1.5, 1.5],
-        [0.0, 0.0, -0.5, -0.5],
+        [1.5, 1.5, 1.5],
+        [-0.5, -0.5, 0.0],  # 3rd is padding (no action token there)
     ])
 
-    assert modified_batch["weight"].shape == (2, 4)  # now token-level
+    assert modified_batch["weight"].shape == (2, 3)  # completion-only
     assert torch.allclose(modified_batch["weight"], expected_weight, atol=1e-6)
 
 
 def test_kl_credit_modifier_completion_only_weight():
     """
-    Test that completion-only weights [B, C] are expanded to full sequence [B, T].
+    Test that completion-only weights [B, C] stay in completion-only format.
 
     When weight is stored compactly for just completion tokens (C < T),
-    the modifier expands it to full sequence length using action_mask positions.
+    the modifier extracts KL for those positions and adds it, keeping [B, C] shape.
     """
     # Completion-only weight: [B, C] where C is number of completion tokens
     # Sample 0 has 3 completion tokens, sample 1 has 2
@@ -527,13 +528,12 @@ def test_kl_credit_modifier_completion_only_weight():
     modifier = KLCreditModifier(coeff=1.0)
     modified_batch, _ = modifier.modify(batch)
 
-    # With KL=0, modified_weight = weight * action_mask
-    # Sample 0: weights [1, 2, 3] placed at positions [3, 4, 5]
-    # Sample 1: weights [4, 5] placed at positions [4, 5] (the 0.0 padding is ignored)
+    # With KL=0, modified_weight = weight (unchanged since kl_penalty is 0)
+    # Output stays in completion-only format [B, C]
     expected_weight = torch.tensor([
-        [0.0, 0.0, 0.0, 1.0, 2.0, 3.0],
-        [0.0, 0.0, 0.0, 0.0, 4.0, 5.0],
+        [1.0, 2.0, 3.0],  # sample 0: unchanged
+        [4.0, 5.0, 0.0],  # sample 1: unchanged (padding preserved)
     ])
 
-    assert modified_batch["weight"].shape == (2, 6)
+    assert modified_batch["weight"].shape == (2, 3)  # stays completion-only
     assert torch.allclose(modified_batch["weight"], expected_weight, atol=1e-6)
