@@ -79,8 +79,6 @@ class KLCreditModifier:
     Args:
         coeff: Coefficient for KL penalty. Higher = stronger teacher matching.
         name: Modifier name for logging. Metrics appear as "{name}/kl_mean", etc.
-        broadcast_advantage: If True, expand scalar advantages to per-token
-            values over action tokens so KL is applied per token.
 
     Requires batch to have:
         - "actor_logps": [B, T] old policy logprobs from rollout
@@ -96,7 +94,6 @@ class KLCreditModifier:
 
     coeff: float = 1.0
     name: str = "kl"
-    broadcast_advantage: bool = False
 
     def modify(self, batch: Batch) -> Tuple[Dict[str, Tensor], Dict[str, Any]]:
         if "actor_logps" not in batch:
@@ -123,18 +120,14 @@ class KLCreditModifier:
         reverse_kl = actor_logps - teacher_logps  # [B, T]
         kl_penalty_full = -self.coeff * reverse_kl  # [B, T]
 
-        # Handle different weight shapes. By default we keep the input format,
-        # but can broadcast scalar weights to per-token advantages if requested.
+        # Handle different weight shapes. Scalar weights are broadcast to
+        # per-token advantages so KL is applied per action token.
         # The loss function expects weight to match ratio shape, which may be
         # completion-only [B, C] rather than full sequence [B, T].
         if weight.dim() == 1:
-            # Turn-level [B]: either keep scalar or broadcast to per-token.
-            if self.broadcast_advantage:
-                base_adv = weight.unsqueeze(-1) * action_mask_f
-                modified_weight = (base_adv + kl_penalty_full) * action_mask_f
-            else:
-                kl_penalty_scalar = (kl_penalty_full * action_mask_f).sum(dim=-1)
-                modified_weight = weight + kl_penalty_scalar
+            # Turn-level [B]: broadcast to per-token advantages.
+            base_adv = weight.unsqueeze(-1) * action_mask_f
+            modified_weight = (base_adv + kl_penalty_full) * action_mask_f
         elif weight.shape[-1] == T:
             # Full sequence [B, T]: add KL directly, mask to action tokens.
             modified_weight = (weight + kl_penalty_full) * action_mask_f

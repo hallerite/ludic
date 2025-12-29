@@ -6,9 +6,9 @@ This hybrid approach combines:
 - **GSPO (Group-Sorted Policy Optimization)**: Task rewards from GSM8K correctness with group-normalized advantages
 - **OPD (On-Policy Distillation)**: Dense per-token feedback via reverse KL divergence from teacher
 
-The composite loss balances:
-1. **Task-specific learning**: Sparse but grounded rewards from environment
-2. **Distribution matching**: Dense per-token guidance from teacher
+The hybrid adds KL penalty directly to advantages (Level 2: Advantage Modification):
+1. **Task-specific learning**: Sparse but grounded rewards from environment → group-normalized advantages
+2. **Distribution matching**: Dense per-token KL penalty added to advantages
 
 Reference: https://thinkingmachines.ai/blog/on-policy-distillation
 
@@ -84,10 +84,9 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/opd/train_opd_gsm8k.p
 ### Training logs
 
 Output includes:
-- `train/loss`: Combined loss (GSPO + KL)
-- `train/gspo/loss`: GSPO policy gradient loss
-- `train/kl/loss`: Reverse KL loss
-- `train/kl/reverse_kl_mean`: Mean per-token KL divergence
+- `train/loss`: Policy gradient loss with KL-modified advantages
+- `train/kl/kl_mean`: Mean per-token reverse KL (actor - teacher logprobs)
+- `train/kl/kl_penalty_mean`: Mean KL penalty added to advantages
 - `train/correct_rate`: GSM8K accuracy on training samples
 - `train/avg_completion_length`: Average tokens per completion
 - `eval/accuracy`: GSM8K accuracy on test set
