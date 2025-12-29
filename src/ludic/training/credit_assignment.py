@@ -110,7 +110,28 @@ class KLCreditModifier:
         actor_logps = batch["actor_logps"]  # [B, T]
         teacher_logps = batch["teacher_logps"]  # [B, T]
         action_mask = batch["action_mask"]  # [B, T]
-        weight = batch["weight"]  # [B, T]
+        weight = batch["weight"]  # [B], [B, C], or [B, T]
+
+        B, T = action_mask.shape
+
+        # Handle different weight shapes:
+        # - [B]: turn-level weight (one per sample) -> broadcast to [B, 1]
+        # - [B, C]: completion-only weight (C < T) -> expand to [B, T]
+        # - [B, T]: already token-level -> use as-is
+        if weight.dim() == 1:
+            # Turn-level: broadcast to all tokens
+            weight = weight.unsqueeze(-1)  # [B] -> [B, 1] for broadcasting
+        elif weight.shape[-1] != T:
+            # Completion-only: expand to full sequence using action_mask positions.
+            # weight[b, :n_actions] goes to positions where action_mask[b] == 1.
+            # We handle each sample separately since they may have different
+            # numbers of action tokens (variable completion lengths).
+            expanded_weight = torch.zeros(B, T, device=weight.device, dtype=weight.dtype)
+            for b in range(B):
+                action_indices = action_mask[b].nonzero(as_tuple=True)[0]
+                n_actions = len(action_indices)
+                expanded_weight[b, action_indices] = weight[b, :n_actions]
+            weight = expanded_weight
 
         # Reverse KL: log π_student - log π_teacher
         # We want to minimize this, so we add NEGATIVE KL to advantages
@@ -121,7 +142,7 @@ class KLCreditModifier:
         # We apply action_mask to the entire sum to ensure prompt tokens have
         # zero weight, regardless of how the upstream credit assigner populated
         # the weight tensor. This prevents prompt-length-dependent loss scaling.
-        modified_weight = (weight + kl_penalty) * action_mask.float()
+        modified_weight = (weight + kl_penalty) * action_mask.float()  # [B, T]
 
         # Create modified batch (shallow copy with updated weight)
         modified_batch = dict(batch)
