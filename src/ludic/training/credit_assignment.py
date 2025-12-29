@@ -117,10 +117,11 @@ class KLCreditModifier:
         reverse_kl = actor_logps - teacher_logps  # [B, T]
         kl_penalty = -self.coeff * reverse_kl  # [B, T]
 
-        # Add to weight (advantage), masked to action tokens only
-        # Note: action_mask should already be applied to weight, but we
-        # apply it to kl_penalty too for safety
-        modified_weight = weight + kl_penalty * action_mask.float()
+        # Add KL penalty to weight (advantage), then mask to action tokens only.
+        # We apply action_mask to the entire sum to ensure prompt tokens have
+        # zero weight, regardless of how the upstream credit assigner populated
+        # the weight tensor. This prevents prompt-length-dependent loss scaling.
+        modified_weight = (weight + kl_penalty) * action_mask.float()
 
         # Create modified batch (shallow copy with updated weight)
         modified_batch = dict(batch)
@@ -140,7 +141,7 @@ class KLCreditModifier:
         metrics = {
             "kl_mean": kl_mean.detach(),
             "kl_std": kl_std.detach(),
-            "kl_penalty_mean": (kl_penalty * action_mask.float()).sum().detach() / max(mask_sum, 1),
+            "kl_penalty_mean": (kl_penalty * action_mask.float()).sum().detach() / mask_sum.clamp(min=1),
         }
 
         return modified_batch, metrics

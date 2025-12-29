@@ -404,3 +404,38 @@ def test_kl_credit_modifier_missing_teacher_logps():
     modifier = KLCreditModifier()
     with pytest.raises(KeyError, match="teacher_logps"):
         modifier.modify(batch)
+
+
+def test_kl_credit_modifier_zeroes_prompt_tokens():
+    """
+    Test that prompt tokens (action_mask=0) always have zero weight,
+    even if the input weight tensor had non-zero values there.
+
+    This prevents prompt-length-dependent loss scaling.
+    """
+    # Input weight has non-zero values on ALL tokens (as might happen
+    # if trajectory-level advantages were broadcast without masking)
+    weight = torch.tensor([
+        [5.0, 5.0, 5.0, 5.0],  # advantage of 5.0 broadcast to all tokens
+    ])
+    actor_logps = torch.tensor([[-1.0, -1.0, -1.0, -1.0]])
+    teacher_logps = torch.tensor([[-1.0, -1.0, -1.0, -1.0]])  # identical, so KL=0
+    action_mask = torch.tensor([
+        [0, 0, 1, 1],  # first two tokens are prompt
+    ])
+
+    batch = _make_batch(
+        weight=weight,
+        actor_logps=actor_logps,
+        teacher_logps=teacher_logps,
+        action_mask=action_mask,
+    )
+
+    modifier = KLCreditModifier(coeff=1.0)
+    modified_batch, _ = modifier.modify(batch)
+
+    # Key assertion: prompt tokens (positions 0, 1) must have zero weight,
+    # even though input weight was 5.0 there
+    # Action tokens (positions 2, 3) should have weight=5.0 (advantage + 0 KL penalty)
+    expected_weight = torch.tensor([[0.0, 0.0, 5.0, 5.0]])
+    assert torch.allclose(modified_batch["weight"], expected_weight, atol=1e-6)
