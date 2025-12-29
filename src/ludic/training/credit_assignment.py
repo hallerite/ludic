@@ -122,40 +122,29 @@ class KLCreditModifier:
         # Handle different weight shapes, keeping output in same format as input.
         # The loss function expects weight to match ratio shape, which may be
         # completion-only [B, C] rather than full sequence [B, T].
-        if weight.shape[-1] == T:
+        if weight.dim() == 1:
+            # Turn-level [B]: add completion KL summed over action tokens.
+            kl_penalty_scalar = (kl_penalty_full * action_mask.float()).sum(dim=-1)
+            modified_weight = weight + kl_penalty_scalar
+        elif weight.shape[-1] == T:
             # Full sequence [B, T]: add KL directly, mask to action tokens.
             modified_weight = (weight + kl_penalty_full) * action_mask.float()
         else:
-            # Turn-level [B] or completion-only [B, C]: extract KL for action tokens.
-            # We need completion-only KL penalty to match the weight format.
-            # Determine max completion length from action_mask.
-            completion_lens = action_mask.sum(dim=-1).long()  # [B]
-            max_completion_len = int(completion_lens.max().item())
-
-            # Extract KL penalty for action tokens only -> [B, max_completion_len]
+            # Completion-only [B, C]: extract KL for action tokens and align to completion positions.
+            C = weight.shape[-1]
             kl_penalty_completion = torch.zeros(
-                B, max_completion_len, device=weight.device, dtype=weight.dtype
+                B, C, device=weight.device, dtype=weight.dtype
             )
-            # Also build completion-only mask for padding positions
             completion_mask = torch.zeros(
-                B, max_completion_len, device=weight.device, dtype=weight.dtype
+                B, C, device=weight.device, dtype=weight.dtype
             )
             for b in range(B):
                 action_indices = action_mask[b].nonzero(as_tuple=True)[0]
-                n_actions = len(action_indices)
-                kl_penalty_completion[b, :n_actions] = kl_penalty_full[b, action_indices]
-                completion_mask[b, :n_actions] = 1.0
-
-            if weight.dim() == 1:
-                # Turn-level [B]: broadcast to completion-only, add per-token KL.
-                # Output is [B, max_completion_len] to match ratio shape.
-                # Zero out padding positions.
-                modified_weight = (weight.unsqueeze(-1) + kl_penalty_completion) * completion_mask
-            else:
-                # Completion-only [B, C]: add KL directly.
-                # C should equal max_completion_len (or be padded similarly).
-                C = weight.shape[-1]
-                modified_weight = weight + kl_penalty_completion[:, :C]
+                n_actions = min(action_indices.numel(), C)
+                if n_actions > 0:
+                    kl_penalty_completion[b, :n_actions] = kl_penalty_full[b, action_indices[:n_actions]]
+                    completion_mask[b, :n_actions] = 1.0
+            modified_weight = (weight + kl_penalty_completion) * completion_mask
 
         # Create modified batch (shallow copy with updated weight)
         modified_batch = dict(batch)
