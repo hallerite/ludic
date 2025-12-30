@@ -2,6 +2,8 @@ import asyncio
 import shutil
 from pathlib import Path
 from typing import List, Optional
+
+import tomli_w
 from pydantic import Field
 
 # --- Prime-RL Imports ---
@@ -156,6 +158,8 @@ class PrimeOrchestrator:
             raise ValueError("PrimeOrchestrator requires a BatchSource instance.")
         self.batch_source = batch_source
 
+        self._write_orchestrator_config()
+
         # 1. Setup admin clients for health checks + weight updates
         self.admin_clients = setup_admin_clients(config.client)
 
@@ -169,6 +173,12 @@ class PrimeOrchestrator:
         # 3. State
         self.step = 0
         self.ckpt_step = 0
+
+    def _write_orchestrator_config(self) -> None:
+        config_dir = self.config.output_dir / "configs"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        with open(config_dir / "orch.toml", "wb") as f:
+            tomli_w.dump(self.config.model_dump(exclude_none=True, mode="json"), f)
 
     async def setup(self):
         """Initialize infrastructure connectivity."""

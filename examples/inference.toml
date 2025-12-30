@@ -1,7 +1,7 @@
-# inference.toml
-
 # --- Top-level Backend Settings ---
 gpu_memory_utilization = 0.4
+enable_lora = true
+max_lora_rank = 8
 
 # --- Server Configuration ---
 [server]
@@ -11,7 +11,7 @@ host = "127.0.0.1"
 # --- Model Configuration ---
 [model]
 name = "hallerite/Qwen2.5-7B-TTT"
-max_model_len = 1024
+max_model_len = 2048
 enforce_eager = true
 trust_remote_code = true
 

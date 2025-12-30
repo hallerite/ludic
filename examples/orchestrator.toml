@@ -1,10 +1,9 @@
-# orchestrator.toml
-
 # --- General Settings ---
 # IMPORTANT: keep this output_dir in sync with trainer.toml and inference.toml
-output_dir = "checkpoints_tictactoe"
+output_dir = "/home/stranger/checkpoints_tictactoe/run_default"
 num_train_workers = 1
-max_steps = 30
+max_steps = 100
+lora_name = "r8-a16"
 
 # --- Ludic Specifics ---
 env_kind = "tictactoe_agent_starts"
