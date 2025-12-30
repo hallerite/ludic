@@ -195,8 +195,11 @@ class PrimeOrchestrator:
             )
 
         # Reset to base model
-        self.logger.info("Resetting to base model...")
-        await reload_weights(self.admin_clients)
+        self.logger.info("Try resetting to base model...")
+        try:
+            await reload_weights(self.admin_clients)
+        except Exception as e:
+            self.logger.warning(f"Skipping reload_weights: {e}")
 
         # Clean rollout directories at the beginning (filesystem transport only)
         if (
