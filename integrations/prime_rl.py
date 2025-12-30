@@ -284,6 +284,15 @@ class PrimeOrchestrator:
         )
 
         # 3. Send TrainingBatch for Trainer packer
+
+        weights = [item.weight for item in saw_batch.items]
+        self.logger.info(
+            f"weight min/mean/max: {min(weights):.3f}/"
+            f"{sum(weights)/len(weights):.3f}/"
+            f"{max(weights):.3f}"
+        )
+        self.logger.info(f"group_id sample: {saw_batch.items[0].meta.get('group_id')}")
+        self.logger.info(f"reward sample: {saw_batch.items[0].meta.get('total_reward')}")
         self.sink.send_step(saw_batch, self.step)
 
         self.step += 1
