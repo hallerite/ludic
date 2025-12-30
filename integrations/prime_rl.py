@@ -175,10 +175,15 @@ class PrimeOrchestrator:
         self.ckpt_step = 0
 
     def _write_orchestrator_config(self) -> None:
-        config_dir = self.config.output_dir / "configs"
-        config_dir.mkdir(parents=True, exist_ok=True)
-        with open(config_dir / "orch.toml", "wb") as f:
-            tomli_w.dump(self.config.model_dump(exclude_none=True, mode="json"), f)
+      config_dir = self.config.output_dir / "configs"
+      config_dir.mkdir(parents=True, exist_ok=True)
+
+      data = self.config.model_dump(exclude_none=True, mode="json")
+      allowed = set(PrimeOrchestratorConfig.model_fields)
+      data = {k: v for k, v in data.items() if k in allowed}
+
+      with open(config_dir / "orch.toml", "wb") as f:
+          tomli_w.dump(data, f)
 
     async def setup(self):
         """Initialize infrastructure connectivity."""
