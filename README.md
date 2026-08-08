@@ -1,5 +1,17 @@
 # Ludic - an LLM-RL library for the era of experience
 
+## Archival note
+
+Ludic has fulfilled its purpose.
+
+I built Ludic as an attempt to imagine the primitives necessary for expressive LLM-RL. It was never a production-ready codebase; it served as a personal north star for the abstractions I wanted from an RL library.
+
+As of August 9, 2026, the questions that motivated Ludic now have answers that I am happy with in an open-source system that is both expressive and trainable: the Prime Intellect RL stack ([verifiers](https://github.com/PrimeIntellect-ai/verifiers), [prime-rl](https://github.com/PrimeIntellect-ai/prime-rl)).
+
+With the release of [multi-agent systems](https://www.primeintellect.ai/blog/multi-agent-systems), I am happy to close this chapter and leave this repository as a record of the exploration.
+
+---
+
 This repo is the result of an ongoing frustration I have had for months with the state of LLM-RL. It is essentially what I wanted during a research project earlier this year, but did not have – a codebase to post-train LLMs with RL built principally with **agentic behavior** in mind, not single-step LLM reasoning. While there are, as of Dec. 2025, many other great codebases for this purpose, I still wanted to share what I have worked on in the last few months, because I believe it to be conceptually quite unique.
 
 This year, I spent a lot of time thinking about LLM-RL library design, and how the architecture would have to look like to prototype new ideas quickly and iterate on research. 
@@ -99,107 +111,3 @@ algo = make_gmpo(group_size=4)
 # Use with GRPO request expansion
 request_strategy = GRPORequestStrategy(group_size=4)
 ```
-
-## Token-in Inference (Drift-Free)
-
-Ludic applies chat templates locally and sends pre-tokenized prompts to the
-vLLM `/v1/completions` endpoint. This keeps training aligned to the exact tokens
-sampled by the model, eliminating drift between training and inference.
-
-Key points:
-- Agents require a `ChatTemplate` (see `ludic.inference.HFChatTemplate`).
-- Provide a shared tokenizer per process to avoid duplicated init costs.
-- Tool calling uses a text parser (e.g., `HermesToolParser`) to extract tool calls
-  from raw completions.
-- Tools have two scopes (see `ToolAgent`):
-  - `tools`: Internal tools executed by the agent (calculator, code interpreter).
-  - `external_tools`: Tools returned to the protocol for handling (delegation, sub-agents).
-- If you need explicit stop token IDs, set them via
-  `VLLMExtensions.extra_body_overrides` (e.g., `{"stop_token_ids": [...]}`).
-
-### Migration from chat completions API
-
-The library previously used vLLM's `/v1/chat/completions` endpoint. The new
-token-in API has breaking changes:
-
-| Old API | New API |
-|---------|---------|
-| `ChatClient.complete(ChatCompletionRequest)` | `ChatClient.complete_tokens(TokenCompletionRequest)` |
-| `ChatCompletionRequest(messages=...)` | `TokenCompletionRequest(prompt_token_ids=...)` |
-| `Agent(client, model, ctx, parser)` | `Agent(client, model, ctx, parser, chat_template)` |
-| `ToolRequest(tools, tool_choice="auto")` | `ToolRequest(tools)` - tool_choice removed |
-
-The `chat_template` parameter is now **required** on all agents. Create one with:
-
-```python
-from transformers import AutoTokenizer
-from ludic.inference import HFChatTemplate, HermesToolParser
-
-tokenizer = AutoTokenizer.from_pretrained("your-model")
-chat_template = HFChatTemplate(tokenizer)
-
-# For tool-calling agents:
-chat_template = HFChatTemplate(tokenizer, tool_parser=HermesToolParser())
-```
-
-## Requirements
-
-- Python 3.12+
-
-- PyTorch >= 2.8.0 with CUDA for training examples
-
-- vLLM server exposing the OpenAI API; NCCL available if you want live weight pushes
-
-- Redis for the pipeline RL actor/trainer example
-
-## Installation
-
-Using [uv](https://github.com/astral-sh/uv):
-
-```bash
-uv sync
-```
-
-For running example code use:
-
-```bash
-uv sync --extra examples
-```
-
-## TODO
-
-### High Priority
-- Add on-policy distillation
-	- plus a script for the MOPD variant introduced in [MiMo-V2-Flash](https://github.com/XiaomiMiMo/MiMo-V2-Flash/blob/main/paper.pdf)
-- Add a classic Gym-style registry for agent harnesses, environments, and interaction protocols (so they don’t have to be built on the fly).
-   - this will also allow us to create general eval and training scripts instead of hand-crafted ones
-- Use proper FSDP2 wrapping in the training scripts
-
-### Medium Priority
-
-- Add Single Stream Policy Optimization (as described in [this paper](https://arxiv.org/abs/2509.13232v2)).
-
-- Implement the [findings](https://www.llmdata.com/blog/mismatch-praxis/) from the LLM Data co. regarding **importance sampling**:
-
-### Hierarchical Agents & Delegation
-- Implement `DelegatingProtocol` for hierarchical agent architectures
-  - Parent agents can delegate subtasks to sub-agents via external tools
-  - Both parent and child rollouts are collected for training
-  - Infrastructure is ready: `external_tools` + `external_tool_handler` (see `CONSIDERATIONS.md`)
-  - Inspired by [Context-Folding](https://context-folding.github.io/) but at protocol level
-
-### Environments & Agents
-- Build agent harness & environment for Pokemon!
-   - the agent harness and env are fused together in Claude Plays Pokemon: https://github.com/davidhershey/ClaudePlaysPokemonStarter.
-   - we should disentangle them into a re-usable agent harness and the different Pokemon games as environments
-- create [Rustorio](https://github.com/albertsgarde/rustorio) env
-
-
-
-### Low Priority
-- Make `scripts/push_to_hub.py` work with `--revision` for uploading different checkpoints.
-- Add a progress bar to eval.
-
-### Package changes (very breaking, do only after everything else is done)
-- Improve packaging:
-	- `eval`, `training`, and `batch_gen` should be distinct modules.
